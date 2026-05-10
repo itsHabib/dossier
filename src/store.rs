@@ -178,7 +178,36 @@ fn load_task_with_notes(path: &Path) -> Result<(Task, Vec<String>)> {
         .with_context(|| format!("parse task frontmatter {}", path.display()))?;
     let (spec, notes_lines) = split_task_body(&body);
     t.body = spec;
+    t.notes = notes_lines
+        .iter()
+        .filter_map(|l| parse_note_line(l))
+        .collect();
     Ok((t, notes_lines))
+}
+
+/// Parse a single `## Notes` line into a structured `Note`. Accepts the
+/// canonical `- <timestamp> — <actor>: <body>` shape; timestamps may be
+/// RFC3339 (what we write) or `YYYY-MM-DD` (legacy dogfood format).
+/// Returns `None` if the line doesn't match — the raw line is still
+/// preserved in the file body, so this is lossless on round-trip.
+fn parse_note_line(line: &str) -> Option<crate::domain::Note> {
+    use chrono::{NaiveDate, NaiveTime};
+    let rest = line.trim_start().strip_prefix('-')?.trim_start();
+    let (ts, after_ts) = rest.split_once(" — ")?;
+    let (actor, body) = after_ts.split_once(": ")?;
+    let posted_at = DateTime::parse_from_rfc3339(ts.trim())
+        .map(|dt| dt.with_timezone(&Utc))
+        .ok()
+        .or_else(|| {
+            NaiveDate::parse_from_str(ts.trim(), "%Y-%m-%d")
+                .ok()
+                .and_then(|d| d.and_time(NaiveTime::MIN).and_local_timezone(Utc).single())
+        })?;
+    Some(crate::domain::Note {
+        actor: actor.trim().to_owned(),
+        body: body.trim().to_owned(),
+        posted_at,
+    })
 }
 
 /// Split a task markdown body into the spec section (lines above the
@@ -528,6 +557,17 @@ impl FsStore {
     /// project, or unknown phase. Server-stamps id, timestamps, and
     /// `Todo` status.
     pub fn create_task(&self, args: NewTask) -> Result<Task> {
+        if !is_valid_slug(&args.project) {
+            bail!(
+                "project slug must be lowercase ascii (a-z, 0-9, -, _): {}",
+                args.project
+            );
+        }
+        if let Some(phase) = &args.phase {
+            if !is_valid_slug(phase) {
+                bail!("phase slug must be lowercase ascii (a-z, 0-9, -, _): {phase}");
+            }
+        }
         if !is_valid_slug(&args.slug) {
             bail!(
                 "slug must be lowercase ascii (a-z, 0-9, -, _): {}",
@@ -761,14 +801,18 @@ const fn task_status_str(s: TaskStatus) -> &'static str {
 /// `claimed` and `done` targets are sole-property of `task.claim` and
 /// `task.complete` respectively; terminal states accept nothing.
 fn validate_task_update_transition(from: TaskStatus, to: TaskStatus) -> Result<()> {
-    if from == to {
-        return Ok(());
-    }
+    // Reject claimed/done targets first — even when `from == to`. The
+    // dedicated verbs (`task.claim` / `task.complete`) own those targets;
+    // letting an update through on a same-status no-op would still bump
+    // `updated_at` and weaken the guard.
     if matches!(to, TaskStatus::Claimed) {
         bail!("use task.claim to transition into claimed");
     }
     if matches!(to, TaskStatus::Done) {
         bail!("use task.complete to transition into done");
+    }
+    if from == to {
+        return Ok(());
     }
     if matches!(from, TaskStatus::Done | TaskStatus::Cancelled) {
         bail!(
@@ -1577,6 +1621,125 @@ mod tests {
             })
             .expect_err("unknown phase");
         assert!(err.to_string().contains("phase not found"), "got: {err}");
+    }
+
+    #[test]
+    fn create_task_rejects_traversal_in_project_or_phase() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+
+        let err = store
+            .create_task(NewTask {
+                project: "../../etc".to_owned(),
+                phase: None,
+                slug: "x".to_owned(),
+                title: "x".to_owned(),
+                body: String::new(),
+                actor: "human:test".to_owned(),
+            })
+            .expect_err("project slug must be validated");
+        assert!(
+            err.to_string().contains("project slug must be lowercase"),
+            "got: {err}"
+        );
+
+        let err = store
+            .create_task(NewTask {
+                project: "alpha".to_owned(),
+                phase: Some("../sneaky".to_owned()),
+                slug: "x".to_owned(),
+                title: "x".to_owned(),
+                body: String::new(),
+                actor: "human:test".to_owned(),
+            })
+            .expect_err("phase slug must be validated");
+        assert!(
+            err.to_string().contains("phase slug must be lowercase"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn update_task_rejects_claimed_done_even_when_already_in_state() {
+        // Reordering check: `from == to` short-circuit must not let
+        // status=claimed / status=done through under any circumstances.
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let task = seed_task(&store, "alpha", "guard");
+        claim(&store, &task.id, "ship");
+
+        // Task is now in `claimed`. update with status=claimed must still fail.
+        let err = store
+            .update_task(UpdateTask {
+                id: task.id.clone(),
+                status: Some(TaskStatus::Claimed),
+                actor: "ship".to_owned(),
+                ..Default::default()
+            })
+            .expect_err("status=claimed must be rejected even when already claimed");
+        assert!(err.to_string().contains("use task.claim"), "got: {err}");
+
+        // Move to in_progress, complete, then attempt update with status=done.
+        store
+            .update_task(UpdateTask {
+                id: task.id.clone(),
+                status: Some(TaskStatus::InProgress),
+                actor: "ship".to_owned(),
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .complete_task(CompleteTask {
+                id: task.id.clone(),
+                note: None,
+                actor: "ship".to_owned(),
+            })
+            .unwrap();
+        let err = store
+            .update_task(UpdateTask {
+                id: task.id,
+                status: Some(TaskStatus::Done),
+                actor: "ship".to_owned(),
+                ..Default::default()
+            })
+            .expect_err("status=done must be rejected even when already done");
+        assert!(err.to_string().contains("use task.complete"), "got: {err}");
+    }
+
+    #[test]
+    fn task_notes_round_trip_through_api() {
+        // After append, the next `list_tasks` should expose the note via
+        // `Task.notes` so API consumers can read the log.
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let task = seed_task(&store, "alpha", "logged");
+
+        store
+            .update_task(UpdateTask {
+                id: task.id.clone(),
+                note: Some("first progress".to_owned()),
+                actor: "ship".to_owned(),
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .update_task(UpdateTask {
+                id: task.id.clone(),
+                note: Some("second progress".to_owned()),
+                actor: "ship".to_owned(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let tasks = store.list_tasks("alpha").unwrap();
+        let logged = tasks
+            .iter()
+            .find(|t| t.id == task.id)
+            .expect("task in list");
+        assert_eq!(logged.notes.len(), 2, "notes should be parsed from disk");
+        assert_eq!(logged.notes[0].actor, "ship");
+        assert_eq!(logged.notes[0].body, "first progress");
+        assert_eq!(logged.notes[1].body, "second progress");
     }
 
     #[test]

@@ -23,20 +23,22 @@ This is a tool we run for our own agents. Not a reference implementation a third
 
 ## Verbs
 
+Addressing convention: project / phase are referenced by **slug** at the MCP boundary (cheaper for humans and agents to compose) and resolved to ULIDs internally for on-disk storage. Tasks and artifacts are addressed by their server-generated ULID once created.
+
 | Verb | Input | Output | Notes |
 | --- | --- | --- | --- |
 | `project.create` | `{slug, title, description, actor}` | `Project` | Errors on slug collision. |
-| `project.update` | `{id, title?, description?, status?, actor}` | `Project` | Last-write-wins per field. |
-| `phase.add` | `{project_id, title, body, after_phase_id?, actor}` | `Phase` | `after_phase_id` inserts in order; default appends. |
-| `phase.update` | `{id, title?, body?, status?, actor}` | `Phase` | |
-| `task.create` | `{project_id, phase_id?, slug, title, body, actor}` | `Task + warnings[]` | `slug` required; same lowercase ASCII rules as project/phase. Warnings include any conflicts. |
-| `task.claim` | `{id, actor}` | `Task + warnings[]` | Errors if already claimed by a different actor or task is in a terminal state. Re-claim by same actor on a non-terminal task is a no-op (no `updated_at` bump). |
+| `project.update` | `{slug, title?, description?, status?, actor}` | `Project` | Last-write-wins per field. |
+| `phase.add` | `{project, slug, title, body, after_phase?, actor}` | `Phase` | `after_phase` is a phase slug; default appends. |
+| `phase.update` | `{project, slug, title?, body?, status?, actor}` | `Phase` | |
+| `task.create` | `{project, phase?, slug, title, body, actor}` | `Task` | `slug` required; same lowercase ASCII rules as project/phase. Inline `warnings[]` arrives with conflict detection in PR E. |
+| `task.claim` | `{id, actor}` | `Task` | Errors if already claimed by a different actor or task is in a terminal state. Re-claim by same actor on a non-terminal task is a no-op (no `updated_at` bump). |
 | `task.update` | `{id, body?, status?, note?, actor}` | `Task` | `note` appends to the task's progress log. `status=claimed` and `status=done` are rejected — use `task.claim` / `task.complete` instead. |
 | `task.complete` | `{id, note?, actor}` | `Task` | Errors if not in a completable state. |
-| `artifact.link` | `{project_id, task_id?, kind, ref, label, actor}` | `Artifact` | Append-only. |
-| `conflicts.list` | `{project_id?}` | `Vec<Conflict>` | Read-only query (read side, not write). |
+| `artifact.link` | `{project, task?, kind, ref, label, actor}` | `Artifact` | Append-only. (PR D.) |
+| `conflicts.list` | `{project?}` | `Vec<Conflict>` | Read-only query. (PR E.) |
 
-`actor` is server-stamped onto provenance fields. Server generates ULIDs and stamps `created_at` / `updated_at`.
+`actor` is server-stamped onto provenance fields where domain models carry them (`Project.created_by`). Server generates ULIDs and stamps `created_at` / `updated_at`.
 
 ## Atomic write primitives
 

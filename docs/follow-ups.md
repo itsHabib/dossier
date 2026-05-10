@@ -6,13 +6,13 @@ deleted (commit history is the record).
 
 ## Write side
 
-- [ ] **Slug validation on every entry point** — `is_valid_slug` is
-  enforced in `create_project` / `add_phase` but not on `update_project`,
-  `update_phase`, or any read path. A `root.join("projects").join("../...")`
-  PoC reads outside the corpus root on Windows. Low severity for the
-  tool-for-ourselves threat model, trivial fix. Add a `project_dir(slug)`
-  helper that validates-and-joins, used everywhere a slug-derived path
-  is built.
+- [ ] **Slug validation on remaining entry points** — `is_valid_slug` is
+  now enforced on every create path (`create_project`, `add_phase`,
+  `create_task` covers project / phase / task slugs). Still missing on
+  `update_project`, `update_phase`, and all read paths (`get_project`,
+  `list_phases`, `list_tasks`, `list_artifacts`). A `project_dir(slug)`
+  helper that validates-and-joins, applied everywhere a slug-derived
+  path is built, closes the remaining gap.
 - [ ] **Clean "project not found" on `update_project`** — currently
   surfaces `os error 2: The system cannot find the file specified`.
   Mirror the `add_phase` explicit-existence-check pattern.
