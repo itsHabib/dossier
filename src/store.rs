@@ -171,9 +171,12 @@ fn load_task(path: &Path) -> Result<Task> {
 
 /// Read a task file and split its body into the spec section (above
 /// `## Notes`) and the raw note lines. `Task.body` holds the spec
-/// section only; `Task.notes` is populated by parsing each line —
-/// unparseable lines are skipped from the struct but kept verbatim in
-/// the returned `Vec<String>`, so the disk round-trip stays lossless.
+/// section only (trimmed); `Task.notes` is populated by parsing each
+/// line — unparseable lines are skipped from the struct but kept in
+/// the returned `Vec<String>`. Note that leading and trailing blank
+/// lines inside the notes section are trimmed during the split, so the
+/// round trip preserves entries and order but not surrounding blank
+/// padding.
 fn load_task_with_notes(path: &Path) -> Result<(Task, Vec<String>)> {
     let (front, body) = read_frontmatter(path)?;
     let mut t: Task = serde_yml::from_str(&front)
@@ -231,9 +234,14 @@ fn split_task_body(raw: &str) -> (String, Vec<String>) {
         }
     }
     let spec = spec_lines.join("\n").trim().to_owned();
-    while notes_lines.first().is_some_and(|l| l.trim().is_empty()) {
-        notes_lines.remove(0);
-    }
+    // Trim leading and trailing blank lines in linear time. `partition_point`
+    // gives the first non-blank index; `pop_while` falls out naturally on
+    // the tail. The previous `remove(0)` loop was quadratic for long logs.
+    let first_real = notes_lines
+        .iter()
+        .position(|l| !l.trim().is_empty())
+        .unwrap_or(notes_lines.len());
+    notes_lines.drain(..first_real);
     while notes_lines.last().is_some_and(|l| l.trim().is_empty()) {
         notes_lines.pop();
     }
@@ -559,6 +567,9 @@ impl FsStore {
     /// project, or unknown phase. Server-stamps id, timestamps, and
     /// `Todo` status.
     pub fn create_task(&self, args: NewTask) -> Result<Task> {
+        if args.actor.is_empty() {
+            bail!("actor is required to create a task");
+        }
         if !is_valid_slug(&args.project) {
             bail!(
                 "project slug must be lowercase ascii (a-z, 0-9, -, _): {}",
@@ -598,6 +609,7 @@ impl FsStore {
         if existing.iter().any(|t| t.slug == args.slug) {
             bail!("task slug already exists in project: {}", args.slug);
         }
+        validate_task_body(&args.body)?;
 
         let tasks_dir = project_dir.join("tasks");
         fs::create_dir_all(&tasks_dir)
@@ -702,6 +714,7 @@ impl FsStore {
             task.status = target;
         }
         if let Some(body) = args.body {
+            validate_task_body(&body)?;
             task.body = body;
         }
         let now = now_utc();
@@ -866,6 +879,18 @@ fn format_note_line(at: DateTime<Utc>, actor: &str, body: &str) -> String {
         actor,
         body
     )
+}
+
+/// Reject task body content that would collide with the `## Notes`
+/// section delimiter on the next read. `split_task_body` consumes the
+/// first line that trims to exactly `## Notes` as the boundary, so a
+/// body containing one would silently re-partition on round-trip and
+/// drop content out of `body` into `notes`.
+fn validate_task_body(body: &str) -> Result<()> {
+    if body.lines().any(|l| l.trim() == "## Notes") {
+        bail!("task body must not contain a `## Notes` heading (reserved as the notes-section delimiter; use a different heading like `### Notes`)");
+    }
+    Ok(())
 }
 
 /// Append a note to both the on-disk lines and the in-memory `Task`
@@ -2283,6 +2308,54 @@ mod tests {
             })
             .expect_err("todo+assignee should surface as corrupt");
         assert!(err.to_string().contains("corrupt state"), "got: {err}");
+    }
+
+    #[test]
+    fn create_task_rejects_empty_actor() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let err = store
+            .create_task(NewTask {
+                project: "alpha".to_owned(),
+                phase: None,
+                slug: "x".to_owned(),
+                title: "x".to_owned(),
+                body: String::new(),
+                actor: String::new(),
+            })
+            .expect_err("empty actor must be rejected");
+        assert!(err.to_string().contains("actor is required"), "got: {err}");
+    }
+
+    #[test]
+    fn task_body_rejects_notes_heading() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+
+        let bad_body = "## Spec\n\nDo the thing.\n\n## Notes\n\nlater\n";
+        let err = store
+            .create_task(NewTask {
+                project: "alpha".to_owned(),
+                phase: None,
+                slug: "collides".to_owned(),
+                title: "x".to_owned(),
+                body: bad_body.to_owned(),
+                actor: "ship".to_owned(),
+            })
+            .expect_err("body with ## Notes must be rejected");
+        assert!(err.to_string().contains("## Notes"), "got: {err}");
+
+        // Update path also guarded.
+        let task = seed_task(&store, "alpha", "good");
+        let err = store
+            .update_task(UpdateTask {
+                id: task.id,
+                body: Some(bad_body.to_owned()),
+                actor: "ship".to_owned(),
+                ..Default::default()
+            })
+            .expect_err("update body with ## Notes must be rejected");
+        assert!(err.to_string().contains("## Notes"), "got: {err}");
     }
 
     #[test]
