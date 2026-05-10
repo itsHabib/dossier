@@ -1,9 +1,9 @@
 //! `MCP` server wrapping the `FsStore` as dossier verbs.
 //!
-//! v0 verbs: read side (list / get for projects, phases, tasks,
-//! artifacts) plus write side for projects (create / update). Phase,
-//! task, artifact writes and conflict detection land in subsequent
-//! phases.
+//! Read side: `project.list` / `project.get` / `phase.list` / `task.list`
+//! / `artifact.list`. Write side: project / phase / task verbs all
+//! routed through the shared `write_lock`. Artifact writes and conflict
+//! detection are not yet wired.
 
 use std::sync::{Arc, Mutex};
 

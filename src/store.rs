@@ -170,8 +170,10 @@ fn load_task(path: &Path) -> Result<Task> {
 }
 
 /// Read a task file and split its body into the spec section (above
-/// `## Notes`) and the raw note lines. The task's `body` field is the
-/// spec section only; structured `notes` parsing is a follow-up.
+/// `## Notes`) and the raw note lines. `Task.body` holds the spec
+/// section only; `Task.notes` is populated by parsing each line —
+/// unparseable lines are skipped from the struct but kept verbatim in
+/// the returned `Vec<String>`, so the disk round-trip stays lossless.
 fn load_task_with_notes(path: &Path) -> Result<(Task, Vec<String>)> {
     let (front, body) = read_frontmatter(path)?;
     let mut t: Task = serde_yml::from_str(&front)
@@ -644,8 +646,22 @@ impl FsStore {
                 task_status_str(task.status)
             );
         }
+        // Same-actor re-claim only no-ops on legitimate held states.
+        // `Todo` with a non-empty assignee is a corrupt state (the
+        // assignee is set by claim, which also moves status off Todo)
+        // and should surface, not be swallowed silently.
         if task.assignee == args.actor {
-            return Ok(task);
+            if matches!(
+                task.status,
+                TaskStatus::Claimed | TaskStatus::InProgress | TaskStatus::Blocked
+            ) {
+                return Ok(task);
+            }
+            bail!(
+                "task in state {} has assignee {} but isn't held (corrupt state)",
+                task_status_str(task.status),
+                task.assignee
+            );
         }
         if !task.assignee.is_empty() {
             bail!("task already claimed by {}", task.assignee);
@@ -688,10 +704,11 @@ impl FsStore {
         if let Some(body) = args.body {
             task.body = body;
         }
+        let now = now_utc();
         if let Some(note) = args.note {
-            notes_lines.push(format_note_line(now_utc(), &args.actor, &note));
+            append_note(&mut task, &mut notes_lines, now, &args.actor, &note)?;
         }
-        task.updated_at = now_utc();
+        task.updated_at = now;
 
         let content = serialize_task_file(&task, &notes_lines)?;
         write_atomic(&path, content.as_bytes())?;
@@ -721,7 +738,7 @@ impl FsStore {
         task.completed_at = Some(now);
         task.updated_at = now;
         if let Some(note) = args.note {
-            notes_lines.push(format_note_line(now, &args.actor, &note));
+            append_note(&mut task, &mut notes_lines, now, &args.actor, &note)?;
         }
 
         let content = serialize_task_file(&task, &notes_lines)?;
@@ -801,24 +818,24 @@ const fn task_status_str(s: TaskStatus) -> &'static str {
 /// `claimed` and `done` targets are sole-property of `task.claim` and
 /// `task.complete` respectively; terminal states accept nothing.
 fn validate_task_update_transition(from: TaskStatus, to: TaskStatus) -> Result<()> {
-    // Reject claimed/done targets first — even when `from == to`. The
-    // dedicated verbs (`task.claim` / `task.complete`) own those targets;
-    // letting an update through on a same-status no-op would still bump
-    // `updated_at` and weaken the guard.
+    // Order matters. claimed/done targets are owned by task.claim and
+    // task.complete; terminal sources reject *every* status write
+    // (including idempotent same-state). Both gates must fire before
+    // the `from == to` no-op short-circuit.
     if matches!(to, TaskStatus::Claimed) {
         bail!("use task.claim to transition into claimed");
     }
     if matches!(to, TaskStatus::Done) {
         bail!("use task.complete to transition into done");
     }
-    if from == to {
-        return Ok(());
-    }
     if matches!(from, TaskStatus::Done | TaskStatus::Cancelled) {
         bail!(
             "task is in a terminal state ({}); transitions are not allowed",
             task_status_str(from)
         );
+    }
+    if from == to {
+        return Ok(());
     }
     let allowed = matches!(
         (from, to),
@@ -849,6 +866,33 @@ fn format_note_line(at: DateTime<Utc>, actor: &str, body: &str) -> String {
         actor,
         body
     )
+}
+
+/// Append a note to both the on-disk lines and the in-memory `Task`
+/// so the verb's return value reflects the new state. Rejects multi-
+/// line input — the `## Notes` section is one entry per line, and
+/// `\n` / `\r` in either field would break parsing on the round trip.
+fn append_note(
+    task: &mut Task,
+    notes_lines: &mut Vec<String>,
+    at: DateTime<Utc>,
+    actor: &str,
+    body: &str,
+) -> Result<()> {
+    if actor.contains(['\n', '\r']) || body.contains(['\n', '\r']) {
+        bail!("note must be single-line (no newline or carriage return)");
+    }
+    let body_trimmed = body.trim();
+    if body_trimmed.is_empty() {
+        bail!("note body must not be empty");
+    }
+    notes_lines.push(format_note_line(at, actor, body_trimmed));
+    task.notes.push(crate::domain::Note {
+        actor: actor.to_owned(),
+        body: body_trimmed.to_owned(),
+        posted_at: at,
+    });
+    Ok(())
 }
 
 /// Write `content` to `path` atomically: write to a `.tmp` sibling, then
@@ -2102,5 +2146,168 @@ mod tests {
         let started_idx = raw.find("started").unwrap();
         let shipped_idx = raw.find("shipped").unwrap();
         assert!(started_idx < shipped_idx, "notes out of order: {raw}");
+    }
+
+    #[test]
+    fn update_task_rejects_terminal_idempotent_status() {
+        // `cancelled → cancelled` is not a transition, but the terminal
+        // guard must still reject it — terminal means nothing writes.
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let task = seed_task(&store, "alpha", "to-cancel");
+
+        store
+            .update_task(UpdateTask {
+                id: task.id.clone(),
+                status: Some(TaskStatus::Cancelled),
+                actor: "ship".to_owned(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let err = store
+            .update_task(UpdateTask {
+                id: task.id,
+                status: Some(TaskStatus::Cancelled),
+                actor: "ship".to_owned(),
+                ..Default::default()
+            })
+            .expect_err("cancelled→cancelled must be rejected");
+        assert!(err.to_string().contains("terminal state"), "got: {err}");
+    }
+
+    #[test]
+    fn update_task_note_appears_in_returned_task() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let task = seed_task(&store, "alpha", "logged");
+
+        let returned = store
+            .update_task(UpdateTask {
+                id: task.id,
+                note: Some("first progress".to_owned()),
+                actor: "ship".to_owned(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            returned.notes.len(),
+            1,
+            "appended note must appear in the returned Task"
+        );
+        assert_eq!(returned.notes[0].actor, "ship");
+        assert_eq!(returned.notes[0].body, "first progress");
+    }
+
+    #[test]
+    fn complete_task_note_appears_in_returned_task() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let task = seed_task(&store, "alpha", "to-complete");
+        advance_to_in_progress(&store, &task.id, "ship");
+
+        let returned = store
+            .complete_task(CompleteTask {
+                id: task.id,
+                note: Some("shipped".to_owned()),
+                actor: "ship".to_owned(),
+            })
+            .unwrap();
+        assert_eq!(returned.notes.len(), 1);
+        assert_eq!(returned.notes[0].body, "shipped");
+    }
+
+    #[test]
+    fn note_input_rejects_newlines_and_empty() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let task = seed_task(&store, "alpha", "guarded");
+
+        for bad in ["", "   ", "\n"] {
+            let err = store
+                .update_task(UpdateTask {
+                    id: task.id.clone(),
+                    note: Some(bad.to_owned()),
+                    actor: "ship".to_owned(),
+                    ..Default::default()
+                })
+                .expect_err("bad note input must be rejected");
+            assert!(
+                err.to_string().contains("note ")
+                    && (err.to_string().contains("single-line")
+                        || err.to_string().contains("must not be empty")),
+                "unexpected error for input {bad:?}: {err}"
+            );
+        }
+
+        let err = store
+            .update_task(UpdateTask {
+                id: task.id.clone(),
+                note: Some("line1\nline2".to_owned()),
+                actor: "ship".to_owned(),
+                ..Default::default()
+            })
+            .expect_err("multi-line note must be rejected");
+        assert!(err.to_string().contains("single-line"), "got: {err}");
+
+        let err = store
+            .update_task(UpdateTask {
+                id: task.id,
+                note: Some("ok".to_owned()),
+                actor: "act\nor".to_owned(),
+                ..Default::default()
+            })
+            .expect_err("multi-line actor must be rejected");
+        assert!(err.to_string().contains("single-line"), "got: {err}");
+    }
+
+    #[test]
+    fn claim_task_corrupt_todo_with_assignee_errors() {
+        // Manually craft a corrupt task file (status=todo + assignee
+        // set) and confirm claim_task surfaces it rather than silently
+        // no-op'ing on same-actor.
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let task = seed_task(&store, "alpha", "corrupt");
+        let (_proj, path) = store.find_task_path(&task.id).unwrap();
+
+        // Inject assignee while leaving status=todo.
+        let raw = fs::read_to_string(&path).unwrap();
+        let injected = raw.replace("status: todo\n", "status: todo\nassignee: ship\n");
+        fs::write(&path, injected).unwrap();
+
+        let err = store
+            .claim_task(ClaimTask {
+                id: task.id,
+                actor: "ship".to_owned(),
+            })
+            .expect_err("todo+assignee should surface as corrupt");
+        assert!(err.to_string().contains("corrupt state"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_note_line_handles_formats_and_edge_cases() {
+        let canonical = "- 2026-05-10T15:30:00Z — ship: did the thing";
+        let n = parse_note_line(canonical).expect("canonical line parses");
+        assert_eq!(n.actor, "ship");
+        assert_eq!(n.body, "did the thing");
+
+        let legacy = "- 2026-05-10 — claude-code:michael: claimed";
+        let n = parse_note_line(legacy).expect("date-only legacy line parses");
+        assert_eq!(n.actor, "claude-code:michael");
+        assert_eq!(n.body, "claimed");
+
+        // Bodies may contain `:` after the actor split.
+        let colons = "- 2026-05-10T15:30:00Z — ship: needs follow-up: also see #42";
+        let n = parse_note_line(colons).expect("body with colons parses");
+        assert_eq!(n.actor, "ship");
+        assert_eq!(n.body, "needs follow-up: also see #42");
+
+        // Unparseable inputs should return None, not panic.
+        assert!(parse_note_line("").is_none());
+        assert!(parse_note_line("not a note line").is_none());
+        assert!(parse_note_line("- 2026-05-10T15:30:00Z ship: no em dash").is_none());
+        assert!(parse_note_line("- not-a-date — ship: body").is_none());
+        assert!(parse_note_line("  ").is_none());
     }
 }
