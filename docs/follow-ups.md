@@ -30,6 +30,24 @@ deleted (commit history is the record).
   not persist. Mitigation: an exhaustive round-trip test per type;
   optional `#[serde(flatten)]` marker.
 
+## Post-PR C (from Claude review on #7)
+
+- [ ] **Uniform error-data taxonomy on MCP verbs** — every task / phase
+  / project handler in `src/server.rs` routes user errors (unknown id,
+  illegal transition, empty actor) through `internal()`, so MCP clients
+  see them as server faults rather than request validation errors. Pre-
+  existing across all verbs; fix uniformly in one tidy-up PR (probably
+  via an `internal_or_invalid(err)` helper that distinguishes).
+- [ ] **`find_task_path` should bail on duplicate hits** — currently
+  returns the first match and keeps walking; a `bail!` on the second
+  matching ID is one line and turns a near-impossible ULID collision
+  into an explicit error rather than silent misrouting.
+- [ ] **`read_dogfood_corpus` doesn't lock in the body / `## Notes`
+  split** — one extra assertion (`!task.body.contains("## Notes")`)
+  would pin the new semantics introduced in PR C against regressions on
+  the read side. Write side is already covered by
+  `task_body_rejects_notes_heading`.
+
 ## Docs
 
 - [ ] **CLAUDE.md / PROTOCOL.md reframe drift** — both still lead with
