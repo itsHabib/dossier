@@ -234,9 +234,11 @@ fn split_task_body(raw: &str) -> (String, Vec<String>) {
         }
     }
     let spec = spec_lines.join("\n").trim().to_owned();
-    // Trim leading and trailing blank lines in linear time. `partition_point`
-    // gives the first non-blank index; `pop_while` falls out naturally on
-    // the tail. The previous `remove(0)` loop was quadratic for long logs.
+    // Trim leading and trailing blank lines in linear time. `position` finds
+    // the first non-blank index, then a single `drain(..first_real)` removes
+    // the leading run; the tail uses `pop` since blank padding there is
+    // bounded by a few lines. The previous `remove(0)` loop was quadratic
+    // for long logs.
     let first_real = notes_lines
         .iter()
         .position(|l| !l.trim().is_empty())
@@ -658,31 +660,29 @@ impl FsStore {
                 task_status_str(task.status)
             );
         }
-        // Same-actor re-claim only no-ops on legitimate held states.
-        // `Todo` with a non-empty assignee is a corrupt state (the
-        // assignee is set by claim, which also moves status off Todo)
-        // and should surface, not be swallowed silently.
-        if task.assignee == args.actor {
-            if matches!(
-                task.status,
-                TaskStatus::Claimed | TaskStatus::InProgress | TaskStatus::Blocked
-            ) {
-                return Ok(task);
-            }
+        // Surface corrupt frontmatter combinations up front, regardless of
+        // who is asking — claim sets both fields atomically, so `Todo` with
+        // an assignee or a held state with an empty assignee is structural
+        // damage, not a routing decision.
+        if matches!(task.status, TaskStatus::Todo) && !task.assignee.is_empty() {
             bail!(
-                "task in state {} has assignee {} but isn't held (corrupt state)",
-                task_status_str(task.status),
+                "task in todo has assignee {} (corrupt state)",
                 task.assignee
             );
         }
-        if !task.assignee.is_empty() {
-            bail!("task already claimed by {}", task.assignee);
-        }
-        if !matches!(task.status, TaskStatus::Todo) {
+        if !matches!(task.status, TaskStatus::Todo) && task.assignee.is_empty() {
             bail!(
                 "task in state {} has no assignee (corrupt state)",
                 task_status_str(task.status)
             );
+        }
+        // Same-actor re-claim on a held state is a no-op.
+        if task.assignee == args.actor {
+            return Ok(task);
+        }
+        // Different actor on a held task.
+        if !task.assignee.is_empty() {
+            bail!("task already claimed by {}", task.assignee);
         }
 
         let now = now_utc();
@@ -906,6 +906,12 @@ fn append_note(
 ) -> Result<()> {
     if actor.contains(['\n', '\r']) || body.contains(['\n', '\r']) {
         bail!("note must be single-line (no newline or carriage return)");
+    }
+    // `parse_note_line` splits actor from body on the first `": "`.
+    // Allowing it in the actor string would yield a truncated actor and
+    // a mangled body on round-trip, even though the raw line is intact.
+    if actor.contains(": ") {
+        bail!("actor must not contain `: ` (reserved as the actor/body delimiter in note lines)");
     }
     let body_trimmed = body.trim();
     if body_trimmed.is_empty() {
@@ -2356,6 +2362,48 @@ mod tests {
             })
             .expect_err("update body with ## Notes must be rejected");
         assert!(err.to_string().contains("## Notes"), "got: {err}");
+    }
+
+    #[test]
+    fn claim_task_corrupt_todo_with_assignee_different_actor() {
+        // Same corrupt-state injection as the same-actor variant, but
+        // the claim attempt comes from a different actor. Should surface
+        // as corrupt state, not as "already claimed".
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let task = seed_task(&store, "alpha", "corrupt-diff");
+        let (_proj, path) = store.find_task_path(&task.id).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        let injected = raw.replace("status: todo\n", "status: todo\nassignee: ship\n");
+        fs::write(&path, injected).unwrap();
+
+        let err = store
+            .claim_task(ClaimTask {
+                id: task.id,
+                actor: "different-actor".to_owned(),
+            })
+            .expect_err("todo+assignee should surface as corrupt regardless of actor");
+        assert!(err.to_string().contains("corrupt state"), "got: {err}");
+    }
+
+    #[test]
+    fn append_note_rejects_actor_with_delimiter() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let task = seed_task(&store, "alpha", "delim-actor");
+
+        let err = store
+            .update_task(UpdateTask {
+                id: task.id,
+                note: Some("body".to_owned()),
+                actor: "ship: rogue".to_owned(),
+                ..Default::default()
+            })
+            .expect_err("actor containing ': ' must be rejected");
+        assert!(
+            err.to_string().contains("actor must not contain"),
+            "got: {err}"
+        );
     }
 
     #[test]
