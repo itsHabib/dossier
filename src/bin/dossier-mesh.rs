@@ -1,6 +1,4 @@
-use std::env;
-
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use rmcp::{transport::stdio, ServiceExt};
 
 use dossier::server::MeshService;
@@ -8,39 +6,40 @@ use dossier::store::FsStore;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
+    let args: Vec<String> = std::env::args().collect();
+    let Some((_program, rest)) = args.split_first() else {
+        unreachable!("argv always contains the program name");
+    };
+    let Some((cmd, rest)) = rest.split_first() else {
         print_usage();
         bail!("no command given");
-    }
-    match args[1].as_str() {
-        "serve" => run_serve(&args[2..]).await,
+    };
+    match cmd.as_str() {
+        "serve" => run_serve(rest).await,
         "help" | "-h" | "--help" => {
             print_usage();
             Ok(())
         }
-        cmd => {
+        other => {
             print_usage();
-            bail!("unknown command: {cmd}");
+            bail!("unknown command: {other}");
         }
     }
 }
 
 async fn run_serve(args: &[String]) -> Result<()> {
+    let mut iter = args.iter();
     let mut corpus: Option<String> = None;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
             "--corpus" => {
-                i += 1;
-                if i >= args.len() {
-                    bail!("--corpus requires a path");
-                }
-                corpus = Some(args[i].clone());
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("--corpus requires a path"))?;
+                corpus = Some(value.clone());
             }
             other => bail!("unknown serve flag: {other}"),
         }
-        i += 1;
     }
     let corpus = corpus.context("--corpus is required (the mcp server has no cwd context)")?;
     let store = FsStore::open(&corpus)?;

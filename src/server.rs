@@ -1,4 +1,5 @@
-//! MCP server wrapping the `FsStore` as Agent Project Protocol verbs.
+//! `MCP` server wrapping the `FsStore` as Agent Project Protocol verbs.
+//!
 //! v0 covers the read side only: list projects/phases/tasks/artifacts
 //! and fetch a hydrated project view. Write verbs land in a later phase.
 
@@ -19,8 +20,8 @@ use crate::store::FsStore;
 /// protocol version (which lives in PROTOCOL.md, currently v0).
 pub const VERSION: &str = "0.1.0";
 
-/// Stateless service: holds a shared FsStore behind an Arc so the rmcp
-/// runtime can clone it across handler invocations without cost.
+/// Stateless service: holds a shared `FsStore` behind an `Arc` so the
+/// `rmcp` runtime can clone it across handler invocations without cost.
 #[derive(Clone)]
 pub struct MeshService {
     store: Arc<FsStore>,
@@ -68,10 +69,11 @@ pub struct PhaseListResult {
 pub struct TaskListArgs {
     /// project slug
     pub project: String,
-    /// if set, only tasks in this phase (matched by phase ID)
+    /// if set, only tasks in this phase (matched by phase id)
     #[serde(default)]
     pub phase: String,
-    /// if set, only tasks with this status (todo, claimed, in_progress, blocked, done, cancelled)
+    /// if set, only tasks with this status (`todo`, `claimed`,
+    /// `in_progress`, `blocked`, `done`, `cancelled`)
     #[serde(default)]
     pub status: String,
 }
@@ -183,6 +185,11 @@ impl MeshService {
     }
 }
 
-fn internal(e: anyhow::Error) -> ErrorData {
+/// Map an internal error to an MCP `ErrorData`. Generic over `ToString`
+/// so callers can pass `.map_err(internal)` without an extra closure;
+/// the `needless_pass_by_value` lint is allowed here because `map_err`
+/// hands the error to its callback by value.
+#[allow(clippy::needless_pass_by_value)]
+fn internal<E: ToString>(e: E) -> ErrorData {
     ErrorData::internal_error(e.to_string(), None)
 }

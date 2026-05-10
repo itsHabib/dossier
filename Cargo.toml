@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 description = "Agent Project Protocol reference mesh — MCP server over a markdown-on-disk corpus"
 license = "MIT"
+authors = ["Michael Habib <michael.habib@hadrian.co>"]
+repository = "https://github.com/itsHabib/dossier"
+keywords = ["mcp", "agent", "project-management", "protocol"]
+categories = ["development-tools", "command-line-utilities"]
+readme = "README.md"
 
 [dependencies]
 rmcp = { version = "1", features = ["server", "transport-io", "macros"] }
@@ -16,10 +21,39 @@ chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
 
 [lints.rust]
+# Cheney-flavored Rust: forbid unsafe, refuse stale qualifications and
+# unreachable visibility. (missing_docs deferred until the public API
+# stabilizes past v0 — too noisy on DTOs that are 1:1 with PROTOCOL.md.)
 unsafe_code = "forbid"
+unreachable_pub = "warn"
+unused_lifetimes = "warn"
+unused_qualifications = "warn"
+non_ascii_idents = "warn"
 
 [lints.clippy]
+# Default groups: warn-everything, opt out individually below.
+all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+
+# Selective restriction lints — the rest of restriction is too prescriptive.
+# Cheney: don't panic, don't ignore errors, don't index-and-pray.
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+indexing_slicing = "warn"
+dbg_macro = "warn"
+print_stdout = "warn"
+str_to_string = "warn"
+get_unwrap = "warn"
+
+# Opt-outs from pedantic/nursery that fight idiom or aren't worth the noise.
 module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
+multiple_crate_versions = "allow"
+must_use_candidate = "allow"
+similar_names = "allow"
