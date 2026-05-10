@@ -92,10 +92,12 @@ pub struct Note {
     pub posted_at: DateTime<Utc>,
 }
 
-/// Artifact `kind` is a free-form string so unknown kinds round-trip
-/// untouched, per PROTOCOL.md. A future minor version may promote
-/// well-known kinds (commit, pr, file, url, run, doc) to a typed enum
-/// while still accepting strings for forward compatibility.
+/// Artifact `kind` is a free-form string so unknown kinds round-trip.
+///
+/// Unknown kinds are persisted untouched, per `PROTOCOL.md`. A future
+/// minor version may promote well-known kinds (`commit`, `pr`, `file`,
+/// `url`, `run`, `doc`) to a typed enum while still accepting strings
+/// for forward compatibility.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Artifact {
     pub id: String,

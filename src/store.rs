@@ -1,6 +1,8 @@
-//! Read-side of the on-disk corpus described in LAYOUT.md. Single-writer
-//! assumption — concurrent FsStore handles against the same root will
-//! eventually corrupt it. Write methods are deferred to a later phase.
+//! Read-side of the on-disk corpus described in `LAYOUT.md`.
+//!
+//! Single-writer assumption — concurrent `FsStore` handles against the
+//! same root will eventually corrupt it. Write methods are deferred to a
+//! later phase.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -65,11 +67,7 @@ impl FsStore {
 
     /// Phases of a project, ordered by their `order` field.
     pub fn list_phases(&self, project_slug: &str) -> Result<Vec<Phase>> {
-        let dir = self
-            .root
-            .join("projects")
-            .join(project_slug)
-            .join("phases");
+        let dir = self.root.join("projects").join(project_slug).join("phases");
         if !dir.exists() {
             return Ok(Vec::new());
         }
@@ -83,8 +81,8 @@ impl FsStore {
             if path.extension().and_then(|s| s.to_str()) != Some("md") {
                 continue;
             }
-            let phase = load_phase(&path)
-                .with_context(|| format!("load phase {}", path.display()))?;
+            let phase =
+                load_phase(&path).with_context(|| format!("load phase {}", path.display()))?;
             out.push(phase);
         }
         out.sort_by_key(|p| p.order);
@@ -93,11 +91,7 @@ impl FsStore {
 
     /// Tasks of a project, ordered by creation time.
     pub fn list_tasks(&self, project_slug: &str) -> Result<Vec<Task>> {
-        let dir = self
-            .root
-            .join("projects")
-            .join(project_slug)
-            .join("tasks");
+        let dir = self.root.join("projects").join(project_slug).join("tasks");
         if !dir.exists() {
             return Ok(Vec::new());
         }
@@ -111,8 +105,7 @@ impl FsStore {
             if path.extension().and_then(|s| s.to_str()) != Some("md") {
                 continue;
             }
-            let task = load_task(&path)
-                .with_context(|| format!("load task {}", path.display()))?;
+            let task = load_task(&path).with_context(|| format!("load task {}", path.display()))?;
             out.push(task);
         }
         out.sort_by_key(|t| t.created_at);
@@ -146,16 +139,12 @@ impl FsStore {
     }
 
     fn load_project(&self, slug: &str, with_body: bool) -> Result<Project> {
-        let path = self
-            .root
-            .join("projects")
-            .join(slug)
-            .join("project.md");
+        let path = self.root.join("projects").join(slug).join("project.md");
         let (front, body) = read_frontmatter(&path)?;
         let mut p: Project = serde_yml::from_str(&front)
             .with_context(|| format!("parse project frontmatter {}", path.display()))?;
         if with_body {
-            p.description = body.trim().to_string();
+            body.trim().clone_into(&mut p.description);
         }
         Ok(p)
     }
@@ -165,7 +154,7 @@ fn load_phase(path: &Path) -> Result<Phase> {
     let (front, body) = read_frontmatter(path)?;
     let mut p: Phase = serde_yml::from_str(&front)
         .with_context(|| format!("parse phase frontmatter {}", path.display()))?;
-    p.body = body.trim().to_string();
+    body.trim().clone_into(&mut p.body);
     Ok(p)
 }
 
@@ -173,7 +162,7 @@ fn load_task(path: &Path) -> Result<Task> {
     let (front, body) = read_frontmatter(path)?;
     let mut t: Task = serde_yml::from_str(&front)
         .with_context(|| format!("parse task frontmatter {}", path.display()))?;
-    t.body = body.trim().to_string();
+    body.trim().clone_into(&mut t.body);
     Ok(t)
 }
 
@@ -186,16 +175,23 @@ fn read_frontmatter(path: &Path) -> Result<(String, String)> {
     let close_idx = after_open
         .find("\n---")
         .ok_or_else(|| anyhow!("{}: unterminated frontmatter", path.display()))?;
-    let front = after_open[..close_idx].to_string();
+    let front = after_open[..close_idx].to_owned();
     let after = &after_open[close_idx + 4..];
-    let body = after
-        .trim_start_matches(|c: char| c == '\r' || c == '\n')
-        .to_string();
+    let body = after.trim_start_matches(['\r', '\n']).to_owned();
     Ok((front, body))
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic,
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap
+    )]
+
     use super::*;
 
     fn repo_root() -> PathBuf {
