@@ -1,0 +1,4 @@
+# dossier corpus config
+# v0 — intentionally empty. Reserved for future fields:
+#   mesh_version, actor_default, id_generator
+mesh_version = "0"

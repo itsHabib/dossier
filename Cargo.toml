@@ -1,0 +1,25 @@
+[package]
+name = "dossier"
+version = "0.1.0"
+edition = "2021"
+description = "Agent Project Protocol reference mesh — MCP server over a markdown-on-disk corpus"
+license = "MIT"
+
+[dependencies]
+rmcp = { version = "1", features = ["server", "transport-io", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yml = "0.0"
+schemars = { version = "1", features = ["chrono04"] }
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
