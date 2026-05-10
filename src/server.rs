@@ -1,9 +1,9 @@
 //! `MCP` server wrapping the `FsStore` as dossier verbs.
 //!
-//! v0 verbs: read side (list / get for projects, phases, tasks,
-//! artifacts) plus write side for projects (create / update). Phase,
-//! task, artifact writes and conflict detection land in subsequent
-//! phases.
+//! Read side: `project.list` / `project.get` / `phase.list` / `task.list`
+//! / `artifact.list`. Write side: project / phase / task verbs all
+//! routed through the shared `write_lock`. Artifact writes and conflict
+//! detection are not yet wired.
 
 use std::sync::{Arc, Mutex};
 
@@ -15,8 +15,11 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{Artifact, Phase, PhaseStatus, Project, ProjectStatus, Task};
-use crate::store::{FsStore, NewPhase, NewProject, UpdatePhase, UpdateProject};
+use crate::domain::{Artifact, Phase, PhaseStatus, Project, ProjectStatus, Task, TaskStatus};
+use crate::store::{
+    ClaimTask, CompleteTask, FsStore, NewPhase, NewProject, NewTask, UpdatePhase, UpdateProject,
+    UpdateTask,
+};
 
 /// Implementation version of the dossier mesh. Distinct from the
 /// protocol version (which lives in PROTOCOL.md, currently v0).
@@ -178,6 +181,62 @@ pub struct PhaseUpdateArgs {
     pub actor: String,
 }
 
+#[derive(Deserialize, JsonSchema)]
+pub struct TaskCreateArgs {
+    /// project slug
+    pub project: String,
+    /// phase slug — optional; omit for a project-wide task
+    #[serde(default)]
+    pub phase: Option<String>,
+    /// task slug — lowercase ASCII; must be unique within the project
+    pub slug: String,
+    /// human-readable task title
+    pub title: String,
+    /// task body / acceptance criteria (markdown)
+    #[serde(default)]
+    pub body: String,
+    /// who's creating the task
+    pub actor: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct TaskClaimArgs {
+    /// task id (ULID with `tsk_` prefix)
+    pub id: String,
+    /// actor claiming the task (e.g. `ship`, `claude-code:michael`)
+    pub actor: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct TaskUpdateArgs {
+    /// task id
+    pub id: String,
+    /// new body; omit to leave unchanged
+    #[serde(default)]
+    pub body: Option<String>,
+    /// new status; omit to leave unchanged.
+    /// `claimed` and `done` are rejected — use task.claim / task.complete.
+    /// (`todo` | `claimed` | `in_progress` | `blocked` | `done` | `cancelled`)
+    #[serde(default)]
+    pub status: Option<TaskStatus>,
+    /// optional note line appended to the task's `## Notes` log
+    #[serde(default)]
+    pub note: Option<String>,
+    /// who's making the update
+    pub actor: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct TaskCompleteArgs {
+    /// task id
+    pub id: String,
+    /// optional closing note line
+    #[serde(default)]
+    pub note: Option<String>,
+    /// who's completing the task
+    pub actor: String,
+}
+
 #[tool_router(server_handler)]
 impl MeshService {
     #[tool(
@@ -306,6 +365,102 @@ impl MeshService {
             })
             .map_err(internal)?;
         Ok(Json(phase))
+    }
+
+    #[tool(
+        name = "task.create",
+        description = "Create a new task in a project. Slug must be unique within the project and lowercase ASCII. Optionally anchor to a phase by slug. Server stamps id, timestamps, and 'todo' status."
+    )]
+    fn task_create(
+        &self,
+        Parameters(args): Parameters<TaskCreateArgs>,
+    ) -> Result<Json<Task>, ErrorData> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|e| internal(format!("write lock poisoned: {e}")))?;
+        let task = self
+            .store
+            .create_task(NewTask {
+                project: args.project,
+                phase: args.phase,
+                slug: args.slug,
+                title: args.title,
+                body: args.body,
+                actor: args.actor,
+            })
+            .map_err(internal)?;
+        Ok(Json(task))
+    }
+
+    #[tool(
+        name = "task.claim",
+        description = "Claim a task for an actor. Sole entry into 'claimed' status. Same-actor re-claim on a non-terminal task is a no-op (no updated_at bump). Errors on terminal tasks or tasks held by a different actor."
+    )]
+    fn task_claim(
+        &self,
+        Parameters(args): Parameters<TaskClaimArgs>,
+    ) -> Result<Json<Task>, ErrorData> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|e| internal(format!("write lock poisoned: {e}")))?;
+        let task = self
+            .store
+            .claim_task(ClaimTask {
+                id: args.id,
+                actor: args.actor,
+            })
+            .map_err(internal)?;
+        Ok(Json(task))
+    }
+
+    #[tool(
+        name = "task.update",
+        description = "Update a task's body, status, and/or append a note to its progress log. Rejects status=claimed and status=done — use task.claim / task.complete instead. Terminal states reject all transitions."
+    )]
+    fn task_update(
+        &self,
+        Parameters(args): Parameters<TaskUpdateArgs>,
+    ) -> Result<Json<Task>, ErrorData> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|e| internal(format!("write lock poisoned: {e}")))?;
+        let task = self
+            .store
+            .update_task(UpdateTask {
+                id: args.id,
+                body: args.body,
+                status: args.status,
+                note: args.note,
+                actor: args.actor,
+            })
+            .map_err(internal)?;
+        Ok(Json(task))
+    }
+
+    #[tool(
+        name = "task.complete",
+        description = "Mark a task done. Sole entry into 'done' status. Task must be in 'in_progress'; stamps completed_at and bumps updated_at. Optionally appends a closing note."
+    )]
+    fn task_complete(
+        &self,
+        Parameters(args): Parameters<TaskCompleteArgs>,
+    ) -> Result<Json<Task>, ErrorData> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|e| internal(format!("write lock poisoned: {e}")))?;
+        let task = self
+            .store
+            .complete_task(CompleteTask {
+                id: args.id,
+                note: args.note,
+                actor: args.actor,
+            })
+            .map_err(internal)?;
+        Ok(Json(task))
     }
 
     #[tool(
