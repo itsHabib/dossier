@@ -15,8 +15,8 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{Artifact, Phase, Project, ProjectStatus, Task};
-use crate::store::{FsStore, NewProject, UpdateProject};
+use crate::domain::{Artifact, Phase, PhaseStatus, Project, ProjectStatus, Task};
+use crate::store::{FsStore, NewPhase, NewProject, UpdatePhase, UpdateProject};
 
 /// Implementation version of the dossier mesh. Distinct from the
 /// protocol version (which lives in PROTOCOL.md, currently v0).
@@ -139,6 +139,45 @@ pub struct ProjectUpdateArgs {
     pub actor: String,
 }
 
+#[derive(Deserialize, JsonSchema)]
+pub struct PhaseAddArgs {
+    /// project slug
+    pub project: String,
+    /// phase slug — lowercase ASCII; must be unique within the project
+    pub slug: String,
+    /// human-readable phase title
+    pub title: String,
+    /// phase body / acceptance criteria (markdown)
+    #[serde(default)]
+    pub body: String,
+    /// existing phase slug to insert after; omit to append to the end
+    #[serde(default)]
+    pub after_phase: Option<String>,
+    /// who's adding the phase
+    pub actor: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct PhaseUpdateArgs {
+    /// project slug
+    pub project: String,
+    /// phase slug (addressing key)
+    pub slug: String,
+    /// new title; omit to leave unchanged
+    #[serde(default)]
+    pub title: Option<String>,
+    /// new body; omit to leave unchanged
+    #[serde(default)]
+    pub body: Option<String>,
+    /// new status; omit to leave unchanged
+    /// (`pending` | `active` | `done` | `skipped`)
+    #[serde(default)]
+    pub status: Option<PhaseStatus>,
+    /// who's making the update
+    #[allow(dead_code)] // provenance, not persisted on the phase row in v0
+    pub actor: String,
+}
+
 #[tool_router(server_handler)]
 impl MeshService {
     #[tool(
@@ -216,6 +255,57 @@ impl MeshService {
             tasks,
             artifacts,
         }))
+    }
+
+    #[tool(
+        name = "phase.add",
+        description = "Add a new phase to a project. Phase slug must be unique within the project. `after_phase` (a phase slug) inserts in order; default appends to the end."
+    )]
+    fn phase_add(
+        &self,
+        Parameters(args): Parameters<PhaseAddArgs>,
+    ) -> Result<Json<Phase>, ErrorData> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|e| internal(format!("write lock poisoned: {e}")))?;
+        let phase = self
+            .store
+            .add_phase(NewPhase {
+                project: args.project,
+                slug: args.slug,
+                title: args.title,
+                body: args.body,
+                after_phase: args.after_phase,
+                actor: args.actor,
+            })
+            .map_err(internal)?;
+        Ok(Json(phase))
+    }
+
+    #[tool(
+        name = "phase.update",
+        description = "Update mutable fields of a phase (title, body, status). (project, slug) is the addressing key. Preserves id, order, and created_at; bumps updated_at."
+    )]
+    fn phase_update(
+        &self,
+        Parameters(args): Parameters<PhaseUpdateArgs>,
+    ) -> Result<Json<Phase>, ErrorData> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|e| internal(format!("write lock poisoned: {e}")))?;
+        let phase = self
+            .store
+            .update_phase(UpdatePhase {
+                project: args.project,
+                slug: args.slug,
+                title: args.title,
+                body: args.body,
+                status: args.status,
+            })
+            .map_err(internal)?;
+        Ok(Json(phase))
     }
 
     #[tool(

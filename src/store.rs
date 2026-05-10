@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use ulid::Ulid;
 
-use crate::domain::{Artifact, Phase, Project, ProjectStatus, Task};
+use crate::domain::{Artifact, Phase, PhaseStatus, Project, ProjectStatus, Task};
 
 #[derive(Debug)]
 pub struct FsStore {
@@ -212,6 +212,30 @@ pub struct UpdateProject {
     pub status: Option<ProjectStatus>,
 }
 
+/// Arguments for `FsStore::add_phase`. Slug must be unique within the
+/// project. `after_phase` (also a slug) inserts in order; default appends.
+#[derive(Debug, Clone)]
+pub struct NewPhase {
+    pub project: String,
+    pub slug: String,
+    pub title: String,
+    pub body: String,
+    pub after_phase: Option<String>,
+    pub actor: String,
+}
+
+/// Arguments for `FsStore::update_phase`. (project, slug) is the
+/// addressing key. Order is managed via `add_phase` only — bulk reorder
+/// is out of scope for v0.
+#[derive(Debug, Clone, Default)]
+pub struct UpdatePhase {
+    pub project: String,
+    pub slug: String,
+    pub title: Option<String>,
+    pub body: Option<String>,
+    pub status: Option<PhaseStatus>,
+}
+
 impl FsStore {
     /// Create a new project on disk.
     ///
@@ -280,6 +304,146 @@ impl FsStore {
         write_atomic(&path, content.as_bytes())?;
         Ok(project)
     }
+
+    /// Add a new phase to a project.
+    ///
+    /// `after_phase` (a phase slug, optional) inserts the new phase
+    /// immediately after that phase, shifting subsequent phases up by 1.
+    /// When omitted, the new phase is appended to the end. The phase
+    /// slug must be unique within the project.
+    pub fn add_phase(&self, args: NewPhase) -> Result<Phase> {
+        if args.project.is_empty() {
+            bail!("project is required");
+        }
+        if !is_valid_slug(&args.slug) {
+            bail!(
+                "slug must be lowercase ascii (a-z, 0-9, -, _): {}",
+                args.slug
+            );
+        }
+        let project_dir = self.root.join("projects").join(&args.project);
+        if !project_dir.exists() {
+            bail!("project not found: {}", args.project);
+        }
+        let project = self.load_project(&args.project, false)?;
+
+        let mut existing = self.list_phases(&args.project)?;
+        if existing.iter().any(|p| p.slug == args.slug) {
+            bail!("phase slug already exists in project: {}", args.slug);
+        }
+
+        let new_order = match &args.after_phase {
+            Some(after_slug) => {
+                let after = existing
+                    .iter()
+                    .find(|p| &p.slug == after_slug)
+                    .ok_or_else(|| anyhow!("after_phase not found: {after_slug}"))?;
+                after.order + 1
+            }
+            None => existing.iter().map(|p| p.order).max().unwrap_or(0) + 1,
+        };
+
+        let phases_dir = self
+            .root
+            .join("projects")
+            .join(&args.project)
+            .join("phases");
+        fs::create_dir_all(&phases_dir)
+            .with_context(|| format!("create {}", phases_dir.display()))?;
+
+        // Shift existing phases at or above new_order (descending so renames
+        // don't collide).
+        existing.sort_by_key(|p| std::cmp::Reverse(p.order));
+        for p in &mut existing {
+            if p.order < new_order {
+                continue;
+            }
+            let old_name = phase_filename(p.order, &p.slug);
+            let new_name = phase_filename(p.order + 1, &p.slug);
+            fs::rename(phases_dir.join(&old_name), phases_dir.join(&new_name))
+                .with_context(|| format!("rename {old_name} -> {new_name}"))?;
+            p.order += 1;
+            let path = phases_dir.join(&new_name);
+            let content = serialize_phase_file(p)?;
+            write_atomic(&path, content.as_bytes())?;
+        }
+
+        let now = now_utc();
+        let phase = Phase {
+            id: new_id("phs"),
+            project: project.id,
+            slug: args.slug.clone(),
+            title: args.title,
+            body: args.body,
+            order: new_order,
+            status: PhaseStatus::Pending,
+            created_at: now,
+            updated_at: now,
+        };
+        let _ = args.actor; // recorded in commit history; not persisted on the phase row in v0
+        let path = phases_dir.join(phase_filename(new_order, &args.slug));
+        let content = serialize_phase_file(&phase)?;
+        write_atomic(&path, content.as_bytes())?;
+        Ok(phase)
+    }
+
+    /// Update mutable fields of a phase (`title`, `body`, `status`).
+    ///
+    /// (`project`, `slug`) is the addressing key; both are immutable.
+    /// `id`, `order`, and `created_at` are preserved; `updated_at` is
+    /// bumped.
+    pub fn update_phase(&self, args: UpdatePhase) -> Result<Phase> {
+        if args.project.is_empty() || args.slug.is_empty() {
+            bail!("project and slug are required");
+        }
+        let path = self.find_phase_path(&args.project, &args.slug)?;
+        let mut phase = load_phase(&path)?;
+        if let Some(title) = args.title {
+            phase.title = title;
+        }
+        if let Some(body) = args.body {
+            phase.body = body;
+        }
+        if let Some(status) = args.status {
+            phase.status = status;
+        }
+        phase.updated_at = now_utc();
+        let content = serialize_phase_file(&phase)?;
+        write_atomic(&path, content.as_bytes())?;
+        Ok(phase)
+    }
+
+    fn find_phase_path(&self, project_slug: &str, phase_slug: &str) -> Result<PathBuf> {
+        let phases_dir = self.root.join("projects").join(project_slug).join("phases");
+        if !phases_dir.exists() {
+            bail!("phase not found: {project_slug}/{phase_slug}");
+        }
+        let entries =
+            fs::read_dir(&phases_dir).with_context(|| format!("read {}", phases_dir.display()))?;
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("md") {
+                continue;
+            }
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            if let Some((_, slug)) = stem.split_once('-') {
+                if slug == phase_slug {
+                    return Ok(path);
+                }
+            }
+        }
+        bail!("phase not found: {project_slug}/{phase_slug}")
+    }
+}
+
+/// Filename for a phase: zero-padded order + slug. The order prefix
+/// gives stable sort in directory listings AND a human-readable hint.
+fn phase_filename(order: i32, slug: &str) -> String {
+    format!("{order:02}-{slug}.md")
 }
 
 /// Write `content` to `path` atomically: write to a `.tmp` sibling, then
@@ -376,6 +540,44 @@ fn serialize_project_file(project: &Project) -> Result<String> {
     let frontmatter = serde_yml::to_string(&ProjectFrontmatter::from(project))
         .context("serialize frontmatter")?;
     let body = project.description.trim();
+    Ok(if body.is_empty() {
+        format!("---\n{frontmatter}---\n")
+    } else {
+        format!("---\n{frontmatter}---\n\n{body}\n")
+    })
+}
+
+#[derive(Serialize)]
+struct PhaseFrontmatter<'a> {
+    id: &'a str,
+    project: &'a str,
+    slug: &'a str,
+    title: &'a str,
+    order: i32,
+    status: PhaseStatus,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+impl<'a> From<&'a Phase> for PhaseFrontmatter<'a> {
+    fn from(p: &'a Phase) -> Self {
+        Self {
+            id: &p.id,
+            project: &p.project,
+            slug: &p.slug,
+            title: &p.title,
+            order: p.order,
+            status: p.status,
+            created_at: p.created_at,
+            updated_at: p.updated_at,
+        }
+    }
+}
+
+fn serialize_phase_file(phase: &Phase) -> Result<String> {
+    let frontmatter = serde_yml::to_string(&PhaseFrontmatter::from(phase))
+        .context("serialize phase frontmatter")?;
+    let body = phase.body.trim();
     Ok(if body.is_empty() {
         format!("---\n{frontmatter}---\n")
     } else {
@@ -626,5 +828,208 @@ mod tests {
         assert_eq!(fetched.title, "Alpha v2");
         assert_eq!(fetched.description, "v2 body");
         assert_eq!(fetched.status, ProjectStatus::Active);
+    }
+
+    fn seed_project(store: &FsStore, slug: &str) -> Project {
+        store
+            .create_project(NewProject {
+                slug: slug.to_owned(),
+                title: format!("Project {slug}"),
+                description: String::new(),
+                actor: "human:test".to_owned(),
+            })
+            .expect("seed project")
+    }
+
+    fn add_phase_simple(store: &FsStore, project: &str, slug: &str) -> Phase {
+        store
+            .add_phase(NewPhase {
+                project: project.to_owned(),
+                slug: slug.to_owned(),
+                title: slug.to_owned(),
+                body: String::new(),
+                after_phase: None,
+                actor: "human:test".to_owned(),
+            })
+            .expect("add phase")
+    }
+
+    #[test]
+    fn add_phase_appends_to_end() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+
+        let p1 = add_phase_simple(&store, "alpha", "spec");
+        let p2 = add_phase_simple(&store, "alpha", "build");
+        let p3 = add_phase_simple(&store, "alpha", "ship");
+
+        assert_eq!(p1.order, 1);
+        assert_eq!(p2.order, 2);
+        assert_eq!(p3.order, 3);
+
+        let listed = store.list_phases("alpha").unwrap();
+        let slugs: Vec<&str> = listed.iter().map(|p| p.slug.as_str()).collect();
+        assert_eq!(slugs, vec!["spec", "build", "ship"]);
+    }
+
+    #[test]
+    fn add_phase_inserts_after_and_shifts() {
+        let (tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        add_phase_simple(&store, "alpha", "spec"); // order 1
+        add_phase_simple(&store, "alpha", "build"); // order 2
+        add_phase_simple(&store, "alpha", "ship"); // order 3
+
+        // Insert after "spec": new phase becomes order 2; build/ship shift to 3/4.
+        let inserted = store
+            .add_phase(NewPhase {
+                project: "alpha".to_owned(),
+                slug: "design".to_owned(),
+                title: "design".to_owned(),
+                body: String::new(),
+                after_phase: Some("spec".to_owned()),
+                actor: "human:test".to_owned(),
+            })
+            .unwrap();
+        assert_eq!(inserted.order, 2);
+
+        let listed = store.list_phases("alpha").unwrap();
+        let pairs: Vec<(&str, i32)> = listed.iter().map(|p| (p.slug.as_str(), p.order)).collect();
+        assert_eq!(
+            pairs,
+            vec![("spec", 1), ("design", 2), ("build", 3), ("ship", 4)]
+        );
+
+        // Files on disk reflect the new ordering.
+        let phases_dir = tmp.path().join("projects").join("alpha").join("phases");
+        let mut names: Vec<String> = fs::read_dir(&phases_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "01-spec.md".to_owned(),
+                "02-design.md".to_owned(),
+                "03-build.md".to_owned(),
+                "04-ship.md".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn add_phase_rejects_duplicate_slug() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        add_phase_simple(&store, "alpha", "spec");
+
+        let err = store
+            .add_phase(NewPhase {
+                project: "alpha".to_owned(),
+                slug: "spec".to_owned(),
+                title: "Another spec".to_owned(),
+                body: String::new(),
+                after_phase: None,
+                actor: "human:test".to_owned(),
+            })
+            .expect_err("duplicate slug");
+        assert!(
+            err.to_string().contains("phase slug already exists"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn add_phase_rejects_unknown_after_phase() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        add_phase_simple(&store, "alpha", "spec");
+
+        let err = store
+            .add_phase(NewPhase {
+                project: "alpha".to_owned(),
+                slug: "design".to_owned(),
+                title: "design".to_owned(),
+                body: String::new(),
+                after_phase: Some("nonexistent".to_owned()),
+                actor: "human:test".to_owned(),
+            })
+            .expect_err("unknown after_phase");
+        assert!(
+            err.to_string().contains("after_phase not found"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn add_phase_rejects_unknown_project() {
+        let (_tmp, store) = fresh_corpus();
+        let err = store
+            .add_phase(NewPhase {
+                project: "ghost".to_owned(),
+                slug: "spec".to_owned(),
+                title: "spec".to_owned(),
+                body: String::new(),
+                after_phase: None,
+                actor: "human:test".to_owned(),
+            })
+            .expect_err("unknown project");
+        assert!(err.to_string().contains("project not found"), "got: {err}");
+    }
+
+    #[test]
+    fn update_phase_preserves_id_order_created_at() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let original = add_phase_simple(&store, "alpha", "spec");
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        let updated = store
+            .update_phase(UpdatePhase {
+                project: "alpha".to_owned(),
+                slug: "spec".to_owned(),
+                title: Some("Spec v2".to_owned()),
+                body: Some("acceptance criteria here".to_owned()),
+                status: Some(PhaseStatus::Active),
+            })
+            .unwrap();
+
+        assert_eq!(updated.id, original.id, "id changed");
+        assert_eq!(updated.order, original.order, "order changed");
+        assert_eq!(
+            updated.created_at, original.created_at,
+            "created_at changed"
+        );
+        assert!(
+            updated.updated_at > original.updated_at,
+            "updated_at not bumped"
+        );
+        assert_eq!(updated.title, "Spec v2");
+        assert_eq!(updated.body, "acceptance criteria here");
+        assert_eq!(updated.status, PhaseStatus::Active);
+
+        // Confirm round-trip.
+        let listed = store.list_phases("alpha").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].title, "Spec v2");
+        assert_eq!(listed[0].status, PhaseStatus::Active);
+    }
+
+    #[test]
+    fn update_phase_unknown_errors() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+
+        let err = store
+            .update_phase(UpdatePhase {
+                project: "alpha".to_owned(),
+                slug: "ghost".to_owned(),
+                title: Some("x".to_owned()),
+                ..Default::default()
+            })
+            .expect_err("missing phase");
+        assert!(err.to_string().contains("phase not found"), "got: {err}");
     }
 }
