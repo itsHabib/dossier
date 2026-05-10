@@ -29,9 +29,9 @@ This is a tool we run for our own agents. Not a reference implementation a third
 | `project.update` | `{id, title?, description?, status?, actor}` | `Project` | Last-write-wins per field. |
 | `phase.add` | `{project_id, title, body, after_phase_id?, actor}` | `Phase` | `after_phase_id` inserts in order; default appends. |
 | `phase.update` | `{id, title?, body?, status?, actor}` | `Phase` | |
-| `task.create` | `{project_id, phase_id?, title, body, actor}` | `Task + warnings[]` | Warnings include any conflicts. |
-| `task.claim` | `{id, actor}` | `Task + warnings[]` | Errors if already claimed by a different actor. |
-| `task.update` | `{id, body?, status?, note?, actor}` | `Task` | `note` appends to the task's progress log. |
+| `task.create` | `{project_id, phase_id?, slug, title, body, actor}` | `Task + warnings[]` | `slug` required; same lowercase ASCII rules as project/phase. Warnings include any conflicts. |
+| `task.claim` | `{id, actor}` | `Task + warnings[]` | Errors if already claimed by a different actor or task is in a terminal state. Re-claim by same actor on a non-terminal task is a no-op (no `updated_at` bump). |
+| `task.update` | `{id, body?, status?, note?, actor}` | `Task` | `note` appends to the task's progress log. `status=claimed` and `status=done` are rejected — use `task.claim` / `task.complete` instead. |
 | `task.complete` | `{id, note?, actor}` | `Task` | Errors if not in a completable state. |
 | `artifact.link` | `{project_id, task_id?, kind, ref, label, actor}` | `Artifact` | Append-only. |
 | `conflicts.list` | `{project_id?}` | `Vec<Conflict>` | Read-only query (read side, not write). |
@@ -168,9 +168,14 @@ Each is a follow-up if and when it actually matters.
 - **Conflict tests** under `tests/conflicts.rs`: fixture corpora that trigger each conflict kind.
 - **Dogfood smoke** per PR: point a Claude Code at the new mesh and drive the dossier project's own corpus.
 
+## Resolved decisions (PR C)
+
+- **Task slug**: required on `task.create`, same lowercase ASCII rules as project/phase. Consistency with the other create verbs; grep-able filenames; strict slug rules beat title-derivation edge cases.
+- **State machine table**: holds as drafted. `task.claim` is the only entry to `claimed`; `task.complete` is the only entry to `done`. `task.update` rejects those two status targets explicitly.
+- **Re-claim**: same-actor re-claim on a non-terminal task is a no-op that returns the existing task with **no `updated_at` bump**. Re-claim on a terminal task (`done`/`cancelled`) is an error. Different-actor claim on a held task is an error. Re-assignment is not supported in v0.
+
 ## Open questions
 
-- `task.update` allow re-assignment? Lean **no** for v0 — re-assignment is workflow, not state-machine; would need explicit unclaim semantics.
 - Slug case-sensitivity? Filesystems differ. Lean **lowercase only**; reject uppercase at create time.
 - Note timestamp format in the markdown body — RFC3339 verbose vs short `2026-05-10 17:42`? Lean **RFC3339** for machine-readability.
 - Conflict thresholds — stale = 7 days, slug similarity = Levenshtein ≤ 3 — reasonable starts; tune from real usage.
