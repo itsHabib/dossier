@@ -572,6 +572,12 @@ impl FsStore {
         if args.actor.is_empty() {
             bail!("actor is required to create a task");
         }
+        if args.project.is_empty() {
+            bail!("project is required");
+        }
+        if args.slug.is_empty() {
+            bail!("slug is required");
+        }
         if !is_valid_slug(&args.project) {
             bail!(
                 "project slug must be lowercase ascii (a-z, 0-9, -, _): {}",
@@ -579,6 +585,9 @@ impl FsStore {
             );
         }
         if let Some(phase) = &args.phase {
+            if phase.is_empty() {
+                bail!("phase is required (omit the field entirely for a project-wide task)");
+            }
             if !is_valid_slug(phase) {
                 bail!("phase slug must be lowercase ascii (a-z, 0-9, -, _): {phase}");
             }
@@ -1822,6 +1831,11 @@ mod tests {
         let (_tmp, store) = fresh_corpus();
         seed_project(&store, "alpha");
         let task = seed_task(&store, "alpha", "write-protocol");
+
+        // Force a measurable gap so updated_at comparisons aren't flaky
+        // on systems where consecutive Utc::now() calls can land in the
+        // same monotonic tick (e.g. coarse-grained Windows clocks).
+        std::thread::sleep(std::time::Duration::from_millis(10));
 
         let claimed = claim(&store, &task.id, "ship");
         assert_eq!(claimed.status, TaskStatus::Claimed);
