@@ -834,8 +834,11 @@ impl FsStore {
     ///
     /// Validates that the project exists and (when supplied) the task
     /// belongs to that same project. `kind`, `reference`, `label`, and
-    /// `actor` are required and must be single-line — newlines would
-    /// corrupt the JSONL format.
+    /// `actor` are required and rejected if they contain newline / CR.
+    /// JSON serialization would *escape* embedded newlines (so the
+    /// JSONL framing stays valid), but a multi-line label or ref is
+    /// almost certainly a caller bug and breaks grep-ability of the
+    /// file; cheap to refuse at the boundary.
     pub fn link_artifact(&self, args: LinkArtifact) -> Result<Artifact> {
         if args.actor.is_empty() {
             bail!("actor is required to link an artifact");
