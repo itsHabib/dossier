@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::{Artifact, Phase, PhaseStatus, Project, ProjectStatus, Task, TaskStatus};
 use crate::store::{
-    ClaimTask, CompleteTask, FsStore, NewPhase, NewProject, NewTask, UpdatePhase, UpdateProject,
-    UpdateTask,
+    ClaimTask, CompleteTask, FsStore, LinkArtifact, NewPhase, NewProject, NewTask, UpdatePhase,
+    UpdateProject, UpdateTask,
 };
 
 /// Implementation version of the dossier mesh. Distinct from the
@@ -234,6 +234,24 @@ pub struct TaskCompleteArgs {
     #[serde(default)]
     pub note: Option<String>,
     /// who's completing the task
+    pub actor: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ArtifactLinkArgs {
+    /// project slug
+    pub project: String,
+    /// task id to anchor this artifact to; omit for a project-wide artifact
+    #[serde(default)]
+    pub task: Option<String>,
+    /// artifact kind (`commit` | `pr` | `file` | `url` | `run` | `doc` — extensible)
+    pub kind: String,
+    /// the artifact's pointer — a SHA, URL, file path, or run id
+    #[serde(rename = "ref")]
+    pub reference: String,
+    /// short human-readable label, e.g. `"v0 spec"` or `"PR #7"`
+    pub label: String,
+    /// who's linking the artifact
     pub actor: String,
 }
 
@@ -461,6 +479,32 @@ impl MeshService {
             })
             .map_err(internal)?;
         Ok(Json(task))
+    }
+
+    #[tool(
+        name = "artifact.link",
+        description = "Link an artifact (commit, PR, file, URL, run, doc, …) to a project, optionally anchored to a specific task. Append-only — entries are never rewritten. `ref` is the pointer (SHA, URL, path, run id); `label` is a short human-readable hint."
+    )]
+    fn artifact_link(
+        &self,
+        Parameters(args): Parameters<ArtifactLinkArgs>,
+    ) -> Result<Json<Artifact>, ErrorData> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|e| internal(format!("write lock poisoned: {e}")))?;
+        let artifact = self
+            .store
+            .link_artifact(LinkArtifact {
+                project: args.project,
+                task: args.task,
+                kind: args.kind,
+                reference: args.reference,
+                label: args.label,
+                actor: args.actor,
+            })
+            .map_err(internal)?;
+        Ok(Json(artifact))
     }
 
     #[tool(
