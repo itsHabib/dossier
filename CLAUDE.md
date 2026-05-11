@@ -26,6 +26,48 @@ validation is enforced on every create path.
 an existing repo. Conflict detection and other "enterprise" verbs are
 explicitly deferred — see [docs/vision.md](docs/vision.md).
 
+## Development workbench
+
+MCP tools available in any Claude session on this machine. Use them
+**proactively** — when the signal matches, just call the verb. Don't
+ask permission first.
+
+### dossier — project memory
+
+The corpus at `~/pers/dossier-state/` holds project state across the
+portfolio: design docs as phase bodies, work in flight as tasks, and
+PRs / commits / files as artifacts. dossier is the long-term home for
+these — we're moving *toward* having design docs live in the corpus
+rather than scattered across `pers/<repo>/docs/`.
+
+Use proactively for:
+
+- *"What's the state of `<project>`?"* → `project.get { slug }`, then
+  `phase.list` + `task.list { project: <slug>, status: in_progress }`.
+- *"I'm starting `<new chunk of work>`."* → `phase.add { project, slug,
+  title, body: <design content the user describes> }`.
+- *"I need to do X"* / discrete actionable surfaces → `task.create
+  { project, phase?, slug, title, body }` (status defaults to `todo`).
+- User picks up a task → `task.claim { id, actor: human:michael }`.
+  Re-claim by same actor is a no-op (no spurious updated_at bumps).
+- Progress on a task / state transitions → `task.update { id, status?,
+  note?, ... }`. Append progress notes liberally — the corpus *is*
+  the working log.
+- Open / merged PR, commit ties to a task → `artifact.link { project,
+  task?, kind: "pr" | "commit" | "file" | ..., ref, label }` without
+  being asked.
+- *"Done with task X."* → `task.complete { id, note? }`.
+
+Don't use for:
+
+- Code-level work (write the code first; *then* `artifact.link` the PR).
+- Anything that lives only in this session's scratch context.
+
+The corpus is plain markdown (see LAYOUT.md). When in doubt about
+shape, read the file directly — dossier is just typed access over
+the same bytes a human would `cat`. PROTOCOL.md has the data-model
+details.
+
 ## Architecture
 
 Strict layered dependency direction (mirrored from tower):
