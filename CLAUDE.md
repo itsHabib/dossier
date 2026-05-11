@@ -8,7 +8,7 @@ through any LLM, linkable to the PRs that shipped the work. Vision and
 non-goals live in [docs/vision.md](docs/vision.md); read that first if
 you haven't.
 
-The implementation is a Rust MCP server (`dossier-mesh`) over a
+The implementation is a Rust MCP server (`dossier`) over a
 markdown-on-disk corpus. The corpus is the source of truth; the mesh
 is a typed API over a folder of markdown. On-disk format in
 [LAYOUT.md](LAYOUT.md); data model in [PROTOCOL.md](PROTOCOL.md).
@@ -22,7 +22,7 @@ machine is runtime-guarded, atomic writes route through helpers, slug
 validation is enforced on every create path.
 
 `artifact.link` is the next chunk (~80 LOC). After that: a
-`dossier-mesh init` / `sync` CLI that scaffolds a fresh corpus from
+`dossier init` / `sync` CLI that scaffolds a fresh corpus from
 an existing repo. Conflict detection and other "enterprise" verbs are
 explicitly deferred — see [docs/vision.md](docs/vision.md).
 
@@ -37,7 +37,7 @@ domain → store → server → bin
 - `src/domain.rs` — plain types + status enums. No I/O. 1:1 with PROTOCOL.md primitives.
 - `src/store.rs` — `FsStore` reads and writes the on-disk corpus per LAYOUT.md.
 - `src/server.rs` — `MeshService`: MCP server wrapping the store; tools registered via `rmcp`'s `#[tool_router(server_handler)]`.
-- `src/bin/dossier-mesh.rs` — CLI entry, stdio transport, arg parsing.
+- `src/bin/dossier.rs` — CLI entry, stdio transport, arg parsing.
 
 Don't introduce a downward import. If a feature needs a new dependency
 direction, lift the shared concern into `domain`.

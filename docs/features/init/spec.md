@@ -3,7 +3,7 @@
 **Status:** parked
 **Date last touched:** 2026-05-10
 
-A `dossier-mesh init` command that scaffolds a corpus from an existing
+A `dossier init` command that scaffolds a corpus from an existing
 repo, so a user doesn't have to hand-create `.dossier/` and `project.md`
 the first time. We drafted a design and then parked it.
 

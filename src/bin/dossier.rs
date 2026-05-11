@@ -51,8 +51,8 @@ async fn run_serve(args: &[String]) -> Result<()> {
 
 fn print_usage() {
     eprintln!(
-        "dossier-mesh — reference Agent Project Protocol server\n\n\
-         usage: dossier-mesh <command> [args...]\n\n\
+        "dossier — project memory for the solo developer\n\n\
+         usage: dossier <command> [args...]\n\n\
          commands:\n  \
            serve --corpus <path>   run the MCP server over stdio against the corpus at <path>\n  \
                                    register with: claude mcp add dossier -- <path-to-binary> serve --corpus <corpus>\n\n\
