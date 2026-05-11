@@ -887,19 +887,36 @@ impl FsStore {
                 // known, so walking the whole corpus is wasteful and the
                 // resulting error ("task not found") doesn't tell the
                 // caller *where* dossier looked. Scan only this project's
-                // tasks/ directory.
+                // tasks/ directory, mirroring `list_tasks`' file filter
+                // (regular `.md` files only) and propagating I/O errors
+                // rather than silently dropping them — a permissions hit
+                // mid-walk shouldn't masquerade as "not found".
                 let tasks_dir = project_dir.join("tasks");
-                let found = tasks_dir.exists()
-                    && fs::read_dir(&tasks_dir)
-                        .with_context(|| format!("read {}", tasks_dir.display()))?
-                        .filter_map(std::result::Result::ok)
-                        .any(|e| {
-                            e.path()
-                                .file_stem()
-                                .and_then(|s| s.to_str())
-                                .and_then(|stem| stem.split_once('-'))
-                                .is_some_and(|(id, _)| id == task_id)
-                        });
+                let mut found = false;
+                if tasks_dir.exists() {
+                    let entries = fs::read_dir(&tasks_dir)
+                        .with_context(|| format!("read {}", tasks_dir.display()))?;
+                    for entry in entries {
+                        let entry = entry?;
+                        let path = entry.path();
+                        if path.is_dir() {
+                            continue;
+                        }
+                        if path.extension().and_then(|s| s.to_str()) != Some("md") {
+                            continue;
+                        }
+                        let stem = path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or_default();
+                        if let Some((id, _)) = stem.split_once('-') {
+                            if id == task_id {
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+                }
                 if !found {
                     bail!("task {task_id} not found in project {}", args.project);
                 }
