@@ -15,7 +15,7 @@ cargo install --path .
 mkdir -p ~/dossier-corpus/.dossier   # the .dossier/ marker is all you need
 
 # 3. Register the mesh with Claude Code as an MCP server
-claude mcp add dossier -- "$(which dossier-mesh)" serve --corpus ~/dossier-corpus
+claude mcp add dossier -- "$(which dossier)" serve --corpus ~/dossier-corpus
 
 # 4. Open a new Claude Code session
 #    The verbs are now available: project.create, phase.add, task.create,
