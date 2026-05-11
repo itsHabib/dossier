@@ -32,15 +32,15 @@ MCP tools available in any Claude session on this machine. Use them
 **proactively** — when the signal matches, just call the verb. Don't
 ask permission first.
 
-### dossier — project memory
+| MCP | What it owns | When to reach for it |
+|---|---|---|
+| **`dossier`** | Project / phase / task ledger + artifact links. Markdown corpus at `~/pers/dossier-state/`. | Plan a feature, capture a design doc as a phase body, record what's in flight, bind a PR back to the task that produced it. The long-term home for project state — we're moving *toward* design docs living here instead of scattered across `pers/<repo>/docs/`. |
 
-The corpus at `~/pers/dossier-state/` holds project state across the
-portfolio: design docs as phase bodies, work in flight as tasks, and
-PRs / commits / files as artifacts. dossier is the long-term home for
-these — we're moving *toward* having design docs live in the corpus
-rather than scattered across `pers/<repo>/docs/`.
+In a repo with other MCPs registered (e.g. ship's `mcp__ship__*`,
+tower's `mcp__tower__*`), the same workbench section should add a row
+per MCP. This is dossier's CLAUDE.md so only the dossier row is here.
 
-Use proactively for:
+### dossier — signal → verb
 
 - *"What's the state of `<project>`?"* → `project.get { slug }`, then
   `phase.list` + `task.list { project: <slug>, status: in_progress }`.
@@ -58,15 +58,23 @@ Use proactively for:
   being asked.
 - *"Done with task X."* → `task.complete { id, note? }`.
 
-Don't use for:
+**Don't use for**:
 
 - Code-level work (write the code first; *then* `artifact.link` the PR).
 - Anything that lives only in this session's scratch context.
 
-The corpus is plain markdown (see LAYOUT.md). When in doubt about
-shape, read the file directly — dossier is just typed access over
-the same bytes a human would `cat`. PROTOCOL.md has the data-model
-details.
+### Why this shape
+
+The corpus is the contract, not the storage backend. Today dossier is
+plain markdown on disk — files are queryable / greppable; dossier is
+just typed access over the same bytes a human would `cat`. Eventually
+the backend can swap (S3, vector store) without the MCP surface
+changing. The verbs above are stable; how they persist is not.
+
+When in doubt about shape, read the file directly. PROTOCOL.md has
+the data-model details, LAYOUT.md the on-disk format, and
+[docs/vision.md](docs/vision.md) the longer "what / why / what we're
+explicitly not building."
 
 ## Architecture
 
