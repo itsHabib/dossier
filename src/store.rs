@@ -883,12 +883,25 @@ impl FsStore {
                 bail!("task is empty (omit the field entirely for a project-wide artifact)")
             }
             Some(task_id) => {
-                let (task_project_slug, _path) = self.find_task_path(task_id)?;
-                if task_project_slug != args.project {
-                    bail!(
-                        "task {task_id} belongs to project {task_project_slug}, not {}",
-                        args.project
-                    );
+                // Project-scoped lookup: the artifact's project is already
+                // known, so walking the whole corpus is wasteful and the
+                // resulting error ("task not found") doesn't tell the
+                // caller *where* dossier looked. Scan only this project's
+                // tasks/ directory.
+                let tasks_dir = project_dir.join("tasks");
+                let found = tasks_dir.exists()
+                    && fs::read_dir(&tasks_dir)
+                        .with_context(|| format!("read {}", tasks_dir.display()))?
+                        .filter_map(std::result::Result::ok)
+                        .any(|e| {
+                            e.path()
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .and_then(|stem| stem.split_once('-'))
+                                .is_some_and(|(id, _)| id == task_id)
+                        });
+                if !found {
+                    bail!("task {task_id} not found in project {}", args.project);
                 }
                 task_id.clone()
             }
@@ -2656,7 +2669,10 @@ mod tests {
                 actor: "human:test".to_owned(),
             })
             .expect_err("cross-project task should be rejected");
-        assert!(err.to_string().contains("belongs to project"), "got: {err}");
+        assert!(
+            err.to_string().contains("not found in project beta"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -2673,7 +2689,29 @@ mod tests {
                 actor: "human:test".to_owned(),
             })
             .expect_err("unknown task should be rejected");
-        assert!(err.to_string().contains("task not found"), "got: {err}");
+        assert!(
+            err.to_string().contains("not found in project alpha"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn link_artifact_rejects_empty_task_string() {
+        // Some(\"\") is a caller bug — telling them to omit the field is
+        // friendlier than treating it as a project-wide artifact.
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let err = store
+            .link_artifact(LinkArtifact {
+                project: "alpha".to_owned(),
+                task: Some(String::new()),
+                kind: "pr".to_owned(),
+                reference: "x".to_owned(),
+                label: "x".to_owned(),
+                actor: "human:test".to_owned(),
+            })
+            .expect_err("Some(empty) task must be rejected");
+        assert!(err.to_string().contains("task is empty"), "got: {err}");
     }
 
     #[test]
