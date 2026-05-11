@@ -358,6 +358,21 @@ pub struct CompleteTask {
     pub actor: String,
 }
 
+/// Arguments for `FsStore::link_artifact`.
+///
+/// `task` is optional — omit for a project-wide artifact. `kind` is
+/// free-form (`commit`, `pr`, `file`, `url`, `run`, `doc`, or whatever
+/// else makes sense); unknown kinds round-trip untouched.
+#[derive(Debug, Clone)]
+pub struct LinkArtifact {
+    pub project: String,
+    pub task: Option<String>,
+    pub kind: String,
+    pub reference: String,
+    pub label: String,
+    pub actor: String,
+}
+
 impl FsStore {
     /// Create a new project on disk.
     ///
@@ -808,6 +823,124 @@ impl FsStore {
             }
         }
         bail!("task not found: {task_id}")
+    }
+}
+
+impl FsStore {
+    /// Append an artifact pointing at something concrete (a commit, PR,
+    /// file, URL, run, doc, …). Append-only — `artifacts.jsonl` never
+    /// rewrites a prior entry; deletes are tombstones if we ever need
+    /// them.
+    ///
+    /// Validates that the project exists and (when supplied) the task
+    /// belongs to that same project. `kind`, `reference`, `label`, and
+    /// `actor` are required and rejected if they contain newline / CR.
+    /// JSON serialization would *escape* embedded newlines (so the
+    /// JSONL framing stays valid), but a multi-line label or ref is
+    /// almost certainly a caller bug and breaks grep-ability of the
+    /// file; cheap to refuse at the boundary.
+    pub fn link_artifact(&self, args: LinkArtifact) -> Result<Artifact> {
+        if args.actor.is_empty() {
+            bail!("actor is required to link an artifact");
+        }
+        if args.project.is_empty() {
+            bail!("project is required");
+        }
+        if !is_valid_slug(&args.project) {
+            bail!(
+                "project slug must be lowercase ascii (a-z, 0-9, -, _): {}",
+                args.project
+            );
+        }
+        if args.kind.is_empty() {
+            bail!("kind is required");
+        }
+        if args.reference.is_empty() {
+            bail!("ref is required");
+        }
+        if args.label.is_empty() {
+            bail!("label is required");
+        }
+        for (field, value) in [
+            ("kind", &args.kind),
+            ("ref", &args.reference),
+            ("label", &args.label),
+            ("actor", &args.actor),
+        ] {
+            if value.contains(['\n', '\r']) {
+                bail!("{field} must be single-line (no newline or carriage return)");
+            }
+        }
+
+        let project_dir = self.root.join("projects").join(&args.project);
+        if !project_dir.exists() {
+            bail!("project not found: {}", args.project);
+        }
+        let project = self.load_project(&args.project, false)?;
+
+        let task_id = match &args.task {
+            Some(task_id) if task_id.is_empty() => {
+                bail!("task is empty (omit the field entirely for a project-wide artifact)")
+            }
+            Some(task_id) => {
+                // Project-scoped lookup: the artifact's project is already
+                // known, so walking the whole corpus is wasteful and the
+                // resulting error ("task not found") doesn't tell the
+                // caller *where* dossier looked. Scan only this project's
+                // tasks/ directory, mirroring `list_tasks`' file filter
+                // (regular `.md` files only) and propagating I/O errors
+                // rather than silently dropping them — a permissions hit
+                // mid-walk shouldn't masquerade as "not found".
+                let tasks_dir = project_dir.join("tasks");
+                let mut found = false;
+                if tasks_dir.exists() {
+                    let entries = fs::read_dir(&tasks_dir)
+                        .with_context(|| format!("read {}", tasks_dir.display()))?;
+                    for entry in entries {
+                        let entry = entry?;
+                        let path = entry.path();
+                        if path.is_dir() {
+                            continue;
+                        }
+                        if path.extension().and_then(|s| s.to_str()) != Some("md") {
+                            continue;
+                        }
+                        let stem = path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or_default();
+                        if let Some((id, _)) = stem.split_once('-') {
+                            if id == task_id {
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if !found {
+                    bail!("task {task_id} not found in project {}", args.project);
+                }
+                task_id.clone()
+            }
+            None => String::new(),
+        };
+
+        let now = now_utc();
+        let artifact = Artifact {
+            id: new_id("art"),
+            project: project.id,
+            task: task_id,
+            kind: args.kind,
+            reference: args.reference,
+            label: args.label,
+            linked_at: now,
+            actor: args.actor,
+        };
+
+        let line = serde_json::to_string(&artifact).context("serialize artifact")?;
+        let path = project_dir.join("artifacts.jsonl");
+        append_jsonl(&path, &line)?;
+        Ok(artifact)
     }
 }
 
@@ -2444,5 +2577,240 @@ mod tests {
         assert!(parse_note_line("- 2026-05-10T15:30:00Z ship: no em dash").is_none());
         assert!(parse_note_line("- not-a-date — ship: body").is_none());
         assert!(parse_note_line("  ").is_none());
+    }
+
+    fn link_simple(
+        store: &FsStore,
+        project: &str,
+        task: Option<&str>,
+        kind: &str,
+        reference: &str,
+        label: &str,
+    ) -> Artifact {
+        store
+            .link_artifact(LinkArtifact {
+                project: project.to_owned(),
+                task: task.map(str::to_owned),
+                kind: kind.to_owned(),
+                reference: reference.to_owned(),
+                label: label.to_owned(),
+                actor: "human:test".to_owned(),
+            })
+            .expect("link artifact")
+    }
+
+    #[test]
+    fn link_artifact_project_wide_round_trip() {
+        let (_tmp, store) = fresh_corpus();
+        let project = seed_project(&store, "alpha");
+
+        let art = link_simple(&store, "alpha", None, "pr", "https://example/pr/7", "PR #7");
+        assert!(art.id.starts_with("art_"));
+        assert_eq!(art.project, project.id);
+        assert!(art.task.is_empty());
+        assert_eq!(art.kind, "pr");
+        assert_eq!(art.reference, "https://example/pr/7");
+        assert_eq!(art.label, "PR #7");
+        assert_eq!(art.actor, "human:test");
+
+        let listed = store.list_artifacts("alpha").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, art.id);
+    }
+
+    #[test]
+    fn link_artifact_anchored_to_task() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let task = seed_task(&store, "alpha", "implement-x");
+
+        let art = link_simple(
+            &store,
+            "alpha",
+            Some(&task.id),
+            "commit",
+            "abc123",
+            "first commit",
+        );
+        assert_eq!(art.task, task.id);
+
+        let listed = store.list_artifacts("alpha").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].task, task.id);
+    }
+
+    #[test]
+    fn link_artifact_appends_in_order() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+
+        let a = link_simple(&store, "alpha", None, "pr", "https://example/pr/1", "PR #1");
+        let b = link_simple(&store, "alpha", None, "pr", "https://example/pr/2", "PR #2");
+        let c = link_simple(&store, "alpha", None, "pr", "https://example/pr/3", "PR #3");
+
+        let listed = store.list_artifacts("alpha").unwrap();
+        let ids: Vec<&str> = listed.iter().map(|x| x.id.as_str()).collect();
+        assert_eq!(ids, vec![a.id.as_str(), b.id.as_str(), c.id.as_str()]);
+    }
+
+    #[test]
+    fn link_artifact_rejects_unknown_project() {
+        let (_tmp, store) = fresh_corpus();
+        let err = store
+            .link_artifact(LinkArtifact {
+                project: "ghost".to_owned(),
+                task: None,
+                kind: "pr".to_owned(),
+                reference: "x".to_owned(),
+                label: "x".to_owned(),
+                actor: "human:test".to_owned(),
+            })
+            .expect_err("unknown project");
+        assert!(err.to_string().contains("project not found"), "got: {err}");
+    }
+
+    #[test]
+    fn link_artifact_rejects_task_in_wrong_project() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        seed_project(&store, "beta");
+        let alpha_task = seed_task(&store, "alpha", "owned-by-alpha");
+
+        let err = store
+            .link_artifact(LinkArtifact {
+                project: "beta".to_owned(),
+                task: Some(alpha_task.id),
+                kind: "pr".to_owned(),
+                reference: "x".to_owned(),
+                label: "x".to_owned(),
+                actor: "human:test".to_owned(),
+            })
+            .expect_err("cross-project task should be rejected");
+        assert!(
+            err.to_string().contains("not found in project beta"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn link_artifact_rejects_unknown_task() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let err = store
+            .link_artifact(LinkArtifact {
+                project: "alpha".to_owned(),
+                task: Some("tsk_does_not_exist".to_owned()),
+                kind: "pr".to_owned(),
+                reference: "x".to_owned(),
+                label: "x".to_owned(),
+                actor: "human:test".to_owned(),
+            })
+            .expect_err("unknown task should be rejected");
+        assert!(
+            err.to_string().contains("not found in project alpha"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn link_artifact_rejects_empty_task_string() {
+        // Some(\"\") is a caller bug — telling them to omit the field is
+        // friendlier than treating it as a project-wide artifact.
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let err = store
+            .link_artifact(LinkArtifact {
+                project: "alpha".to_owned(),
+                task: Some(String::new()),
+                kind: "pr".to_owned(),
+                reference: "x".to_owned(),
+                label: "x".to_owned(),
+                actor: "human:test".to_owned(),
+            })
+            .expect_err("Some(empty) task must be rejected");
+        assert!(err.to_string().contains("task is empty"), "got: {err}");
+    }
+
+    #[test]
+    fn link_artifact_rejects_required_field_emptiness() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+
+        // Each required field, blanked one at a time. Builds a fresh
+        // baseline before each mutation so a single failure doesn't
+        // mask later ones.
+        let baseline = || LinkArtifact {
+            project: "alpha".to_owned(),
+            task: None,
+            kind: "pr".to_owned(),
+            reference: "x".to_owned(),
+            label: "x".to_owned(),
+            actor: "human:test".to_owned(),
+        };
+        let mut a = baseline();
+        a.actor = String::new();
+        assert!(store
+            .link_artifact(a)
+            .expect_err("empty actor")
+            .to_string()
+            .contains("actor is required"));
+        let mut a = baseline();
+        a.project = String::new();
+        assert!(store
+            .link_artifact(a)
+            .expect_err("empty project")
+            .to_string()
+            .contains("project is required"));
+        let mut a = baseline();
+        a.kind = String::new();
+        assert!(store
+            .link_artifact(a)
+            .expect_err("empty kind")
+            .to_string()
+            .contains("kind is required"));
+        let mut a = baseline();
+        a.reference = String::new();
+        assert!(store
+            .link_artifact(a)
+            .expect_err("empty ref")
+            .to_string()
+            .contains("ref is required"));
+        let mut a = baseline();
+        a.label = String::new();
+        assert!(store
+            .link_artifact(a)
+            .expect_err("empty label")
+            .to_string()
+            .contains("label is required"));
+    }
+
+    #[test]
+    fn link_artifact_rejects_newlines_in_text_fields() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        for field in ["kind", "ref", "label", "actor"] {
+            let mut a = LinkArtifact {
+                project: "alpha".to_owned(),
+                task: None,
+                kind: "pr".to_owned(),
+                reference: "x".to_owned(),
+                label: "x".to_owned(),
+                actor: "human:test".to_owned(),
+            };
+            match field {
+                "kind" => a.kind = "p\nr".to_owned(),
+                "ref" => a.reference = "line1\nline2".to_owned(),
+                "label" => a.label = "label\r\ninjected".to_owned(),
+                "actor" => a.actor = "human\nadmin".to_owned(),
+                _ => unreachable!(),
+            }
+            let err = store
+                .link_artifact(a)
+                .expect_err("newline must be rejected");
+            assert!(
+                err.to_string().contains("single-line"),
+                "field={field}, got: {err}"
+            );
+        }
     }
 }
