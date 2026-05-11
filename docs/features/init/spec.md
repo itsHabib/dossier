@@ -7,9 +7,11 @@
 
 ## Scope
 
-Estimated weighted LOC: ~250–350 in one PR. Bin-side new command +
-import logic in the store layer + frontmatter parser. No new deps —
-we already pull in `serde_yml`.
+Estimated weighted LOC: **~700–1000** (stretch band) in one PR — bin-
+side new command + import logic in the store layer + frontmatter
+parser + state-machine-bypass surface + integration test. No new
+deps; `serde_yml` is already pulled in. See [PR breakdown](#pr-breakdown)
+for the fallback split if review feels too dense.
 
 ## Goal
 
@@ -188,8 +190,13 @@ mutation, which is the common failure mode (typo in frontmatter,
 unknown phase reference, etc.).
 
 If a write fails mid-import (disk full, permissions changed), the
-corpus is half-state. Recovery is **manual**: `rm -rf <corpus>/.dossier
-<corpus>/projects/<slug>` and re-run. The error message says so.
+corpus is half-state. Recovery is **manual** — re-run after cleaning up:
+
+```sh
+rm -rf <corpus>/.dossier <corpus>/projects/<slug>
+```
+
+The error message says so.
 
 ## Frontmatter stripping
 
