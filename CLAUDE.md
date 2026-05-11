@@ -28,7 +28,9 @@ explicitly deferred — see [docs/vision.md](docs/vision.md).
 
 ## Development workbench
 
-Three MCP tools work together to turn "I want to ship X" into "here's the PR + durable trail." When the signal matches, **just call the verb**. Don't ask permission.
+Three MCP tools are available in any Claude session on this machine. **This is dossier — the project-memory plane itself** — so the dossier verbs are the most directly relevant when working in this repo, but tower (worktrees) and ship (workflow execution) are part of the same workbench. When the signal matches, **just call the verb**. Don't ask permission.
+
+Dogfood reality: we track dossier's own work in the real corpus at `~/pers/dossier-state/projects/dossier/` (separate from the in-repo test fixture under `projects/dossier/`). When you call `phase.add` / `task.create` for dossier work, it lands there.
 
 ### dossier — project memory
 
@@ -84,13 +86,13 @@ Don't use for:
 
 ### The loop
 
-Most features go through all three in order:
+A feature on dossier (or any repo in the portfolio) flows through these steps. Steps 3-4 are *aspirational* for dossier itself — we've been driving manually rather than through `ship.ship` so far; the loop documents the pattern, not the historical reality.
 
 1. **Dossier** — `project.create` (once per feature), `phase.add` (one per stage), `task.create` (one per shippable unit).
-2. **Tower** — `tower.register_repo` (once per repo), then `tower.add_worktree` per task. Branch = `tower/<name>`, path = `<repo>/.worktrees/<name>`.
-3. **Task doc** — write `docs/features/<feature>/phases/<NN>-<slug>.md` inside the worktree (Status / Owner / Scope / Functional / Tradeoffs / EDs / Validation / Risks / Out-of-scope / Implementation-plan). Commit + push.
-4. **Ship** — `ship.ship` against the worktree + doc. Poll `get_workflow_run` if the MCP request times out. Inspect the diff; iterate or accept.
-5. **PR** — push, open, request reviewers (Copilot via `gh pr edit --add-reviewer copilot-swe-agent`; `@codex review`; `@claude review`).
+2. **Tower** — `tower.register_repo` (once per repo), then `tower.add_worktree` per task. Branch = `tower/<name>`, path = `<repo>/.worktrees/<name>`. *Optional for small / single-session dossier PRs; required when running things in parallel.*
+3. **Spec doc** — write `docs/features/<feature>/spec.md` with dossier's standard header (`**Status / Owner / Date / Related**` block at the top, then `## Scope` with weighted LOC estimate, then `## Goal`, then behavior + acceptance + testing). Multi-PR features get an additional `docs/features/<feature>/plan.md` with phase checkboxes. Commit + push.
+4. **Implement** — either `ship.ship` against the worktree + spec (when the work fits an agentic run), or drive manually in a Claude Code session (current default for dossier). Both end in a working branch with the change.
+5. **PR** — push, open, request reviewers (Copilot via `gh pr edit --add-reviewer copilot-pull-request-reviewer`; `@codex review`; `@claude review`).
 6. **Dossier (close)** — `task.complete { id, note }` + `artifact.link` to bind the merged PR url back to the task.
 
 ### Why three MCPs and not one
