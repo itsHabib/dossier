@@ -47,10 +47,3 @@ deleted (commit history is the record).
   would pin the new semantics introduced in PR C against regressions on
   the read side. Write side is already covered by
   `task_body_rejects_notes_heading`.
-
-## Docs
-
-- [ ] **CLAUDE.md / PROTOCOL.md reframe drift** — both still lead with
-  "Agent Project Protocol — wire spec for any agent". The write-side
-  spec already reframed dossier as "a tool we run for our own agents,
-  not a reference implementation". Reconcile.
