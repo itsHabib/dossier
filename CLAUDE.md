@@ -2,23 +2,29 @@
 
 Notes for agents working on this repo. Read before touching code.
 
-dossier is **agent-native project management**. It ships two things:
+dossier is **project memory for the solo developer** — one place to
+track design docs, TDDs, and task notes across a portfolio, queryable
+through any LLM, linkable to the PRs that shipped the work. Vision and
+non-goals live in [docs/vision.md](docs/vision.md); read that first if
+you haven't.
 
-1. The **Agent Project Protocol (APP)** — a wire spec over MCP for any
-   agent to drive or query project work. Defines primitives (project,
-   phase, task, artifact) and verbs (create, claim, update, complete,
-   link). Spec lives in [PROTOCOL.md](PROTOCOL.md).
-2. The **dossier mesh** — a Rust reference server that implements APP
-   over a git-backed markdown corpus. On-disk format in [LAYOUT.md](LAYOUT.md).
-
-The protocol is the contract. The mesh is one implementation of it.
+The implementation is a Rust MCP server (`dossier-mesh`) over a
+markdown-on-disk corpus. The corpus is the source of truth; the mesh
+is a typed API over a folder of markdown. On-disk format in
+[LAYOUT.md](LAYOUT.md); data model in [PROTOCOL.md](PROTOCOL.md).
 
 ## State
 
-Post-spike, post-lint, pre-write-side. Read-side mesh works end-to-end
-(`tools/list`, `project.list`, `project.get`, `phase.list`, `task.list`,
-`artifact.list`). Writes (`project.create`, `phase.add`, `task.create /
-claim / update / complete`, `artifact.link`) are the next major chunk.
+Write side is shipped. Verbs available end-to-end: `project.list /
+get / create / update`, `phase.list / add / update`, `task.list /
+create / claim / update / complete`, `artifact.list`. The state
+machine is runtime-guarded, atomic writes route through helpers, slug
+validation is enforced on every create path.
+
+`artifact.link` is the next chunk (~80 LOC). After that: a
+`dossier-mesh init` / `sync` CLI that scaffolds a fresh corpus from
+an existing repo. Conflict detection and other "enterprise" verbs are
+explicitly deferred — see [docs/vision.md](docs/vision.md).
 
 ## Architecture
 
@@ -29,19 +35,23 @@ domain → store → server → bin
 ```
 
 - `src/domain.rs` — plain types + status enums. No I/O. 1:1 with PROTOCOL.md primitives.
-- `src/store.rs` — `FsStore` reads (and eventually writes) the on-disk corpus per LAYOUT.md.
+- `src/store.rs` — `FsStore` reads and writes the on-disk corpus per LAYOUT.md.
 - `src/server.rs` — `MeshService`: MCP server wrapping the store; tools registered via `rmcp`'s `#[tool_router(server_handler)]`.
 - `src/bin/dossier-mesh.rs` — CLI entry, stdio transport, arg parsing.
 
 Don't introduce a downward import. If a feature needs a new dependency
 direction, lift the shared concern into `domain`.
 
-## Specs (canonical)
+## Docs
 
-- [PROTOCOL.md](PROTOCOL.md) — wire spec for APP. Primitives, verbs, task state machine, identity, versioning, scope.
-- [LAYOUT.md](LAYOUT.md) — on-disk corpus convention. Directory tree, frontmatter shape per primitive, append-only `artifacts.jsonl`, concurrency assumptions, what doesn't live on disk.
+- [docs/vision.md](docs/vision.md) — what dossier is, why, what we're explicitly NOT building. Read first.
+- [PROTOCOL.md](PROTOCOL.md) — data model: primitives, verbs, task state machine.
+- [LAYOUT.md](LAYOUT.md) — on-disk corpus convention: directory tree, frontmatter shape, append-only `artifacts.jsonl`, concurrency assumptions.
+- [docs/features/&lt;feature&gt;/spec.md](docs/features/) — design spec per feature (problem, scope, decisions, acceptance).
+- [docs/features/&lt;feature&gt;/plan.md](docs/features/) — execution plan with phase checkboxes when the feature spans multiple PRs (optional).
+- [docs/follow-ups.md](docs/follow-ups.md) — cross-cutting backlog from review / implementation passes.
 
-If you change behavior, update the spec in the same PR.
+Specs and plans live under `docs/features/<feature>/`. Reference docs go directly under `docs/`. If you change behavior, update the spec in the same PR.
 
 ## Develop
 

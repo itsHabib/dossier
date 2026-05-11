@@ -1,20 +1,21 @@
-# Agent Project Protocol (APP) — v0
+# Data model — v0
 
-A protocol over MCP for agents and humans to coordinate on project work.
-Defines the primitives ("what is a project, phase, task") and verbs ("claim
-this task, post progress, link this PR") that any conforming server exposes
-and any conforming agent can call.
+The primitives and verbs dossier exposes over MCP. This document is the
+*data-model* contract — what a `Project` looks like, what a `Task` is,
+what transitions the state machine allows. It is **not** a multi-
+implementer wire spec: dossier is a tool we run for our own agents, not
+a reference implementation a third party will conform to (see
+[docs/vision.md](docs/vision.md)).
 
-The protocol is the contract. Servers (storage backends, indices, UIs) and
-agents (implementers, readers, orchestrators) are interchangeable as long as
-they speak it.
+If you're curious about the on-disk format, that lives in [LAYOUT.md](LAYOUT.md).
 
 ## Status
 
-v0 — minimal core. Designed to be the smallest surface that lets a single
-implementer agent (e.g. ship) drive a project end-to-end while a human or
-reader agent observes. Search, semantic queries, multi-tenant auth,
-cross-project relationships, and decision tracking are explicitly deferred.
+v0 — minimal core. The smallest surface that lets a single implementer
+agent (Claude / Cursor / ship) drive a project end-to-end while the
+operator queries it. Search, semantic queries, multi-tenant auth,
+cross-project relationships, conflict detection, and decision tracking
+are explicitly out of scope; see the vision doc.
 
 ## Roles
 
@@ -152,36 +153,25 @@ so readers can attribute work.
 
 ## Versioning
 
-Servers expose `protocol_version` (semver) in their MCP `initialize`
-response. Clients SHOULD refuse to operate against a server with an
-incompatible major version. Tool names and field names are stable within
-a major version; new optional fields and new tools may appear in minor
-versions.
-
-This document is `v0` — pre-1.0, breaking changes are allowed between
-revisions. A breaking change requires bumping the v0.x revision and
-updating this document.
+This document is `v0` — pre-1.0. Tool names and field names may change
+between revisions. When dossier picks up an external consumer that
+needs version stability, this section grows; today it doesn't.
 
 ## Out of scope (v0)
 
-Deliberately deferred to keep the core small. Each is a candidate for a
-future minor version once a real consumer demands it:
+Deliberately not built. See [docs/vision.md](docs/vision.md) for the
+"samurai sword, not swiss army" framing.
 
-- **Search / semantic query** across projects (lives in a storage layer
-  consumer, not the protocol)
-- **Decisions** as a first-class primitive (currently just a task or an
-  artifact-of-kind=doc)
-- **Cross-project links / dependencies** (out: keep projects independent for v0)
-- **Permissions / multi-tenant auth** (server concern)
-- **Notifications / subscriptions / streaming** (poll for now)
-- **Rich attachments** (use artifacts pointing at external storage)
-- **Time tracking, estimates, sprints** (workflow conventions on top, not
-  protocol primitives)
-
-## Conformance
-
-A server is conforming if it implements every verb above, validates inputs
-against the schemas, and respects the state machine. A client is conforming
-if it identifies itself with a stable `actor` and uses verbs as defined.
-Strict beats permissive — reject unknown fields rather than silently
-ignoring them, so protocol drift surfaces fast.
+- **Search / semantic query / RAG inside dossier** — LLMs already do
+  retrieval over MCP tool outputs; the query engine lives in the
+  consumer, not the store.
+- **Conflict detection** (multi-claim, slug similarity, stale claims) —
+  enterprise problem; solo dev doesn't have it.
+- **Decisions** as a first-class primitive — use a task or an
+  artifact-of-kind=doc.
+- **Cross-project links / dependencies** — keep projects independent.
+- **Permissions / multi-tenant auth** — solo today.
+- **Notifications / subscriptions / streaming** — poll.
+- **Rich attachments** — use artifacts pointing at external storage.
+- **Time tracking, estimates, sprints** — workflow conventions on top,
+  not primitives.
