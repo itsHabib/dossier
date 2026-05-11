@@ -87,9 +87,14 @@ dossier:
 ```
 
 ### `kind`
-Defaults from path location. Frontmatter `kind` lets a file at a non-
-canonical location declare what it is (e.g., a phase doc that doesn't
-live under `docs/features/`).
+Defaults from path location. Frontmatter `kind` overrides the
+default *for files dossier already found via the convention scan* —
+e.g., a file at `docs/project.md` with `dossier: { kind: phase }`
+gets imported as a phase. The discovery pass itself is convention-
+only (init never scans for `dossier:` frontmatter outside the
+canonical paths); importing a file from outside the convention is
+not supported in v0. See [Path vs frontmatter conflicts](#path-vs-frontmatter-conflicts)
+for the consistent-shape edge cases.
 
 ### `status` defaults
 
