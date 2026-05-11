@@ -1,35 +1,94 @@
 # dossier
 
-Agent-native project management. A protocol and a reference mesh.
+Project memory for the solo developer. One markdown-on-disk corpus tracking
+design docs, TDDs, and task notes across a portfolio, queryable through any
+LLM via MCP. See [docs/vision.md](docs/vision.md) for the longer "what +
+why + what we're explicitly not building."
 
-- **[PROTOCOL.md](PROTOCOL.md)** — the Agent Project Protocol (APP) spec.
-  Defines the primitives (project, phase, task, artifact) and verbs
-  (create, claim, update, complete, link) that any conforming MCP server
-  exposes and any conforming agent can call.
-- **mesh** — reference server implementing the protocol. Not yet built.
-  Will be a single Go binary: MCP server + git-backed markdown store +
-  index. Storage and search arrive after the protocol stabilizes.
+## Quick start
 
-## Why
+```sh
+# 1. Build + install the mesh binary
+cargo install --path .
 
-Markdown task docs work great in a single project, in a single head. They
-break across teams, orgs, and years: bloat, drift from reality, hard to
-query. Jira and friends solve query but humans hate filling them out and
-agents can't reason about them well.
+# 2. Pick (or create) a corpus directory
+mkdir -p ~/dossier-corpus/.dossier   # the .dossier/ marker is all you need
 
-dossier's bet: define a small protocol over MCP so any agent (implementers
-like ship, manager-facing readers, future tools) can read and write project
-state through a uniform surface. The doc is still the artifact; the
-protocol gives it structure agents can act on.
+# 3. Register the mesh with Claude Code as an MCP server
+claude mcp add dossier -- "$(which dossier-mesh)" serve --corpus ~/dossier-corpus
 
-## Layers
+# 4. Open a new Claude Code session
+#    The verbs are now available: project.create, phase.add, task.create,
+#    task.claim, task.update, task.complete, artifact.link, plus the
+#    matching list / get reads.
+```
 
-Each layer is standalone-useful. Build bottom-up.
+Ask Claude to create a project for one of your repos and link a PR:
 
-1. **Protocol spec** — `PROTOCOL.md`. The contract.
-2. **Reference mesh** — Go MCP server, git-backed markdown store. Implements
-   the protocol against a real backend.
-3. **Index + search** — semantic + keyword over the corpus. Powers reader
-   agents.
-4. **Conforming clients** — ship and others as implementers; a reader CLI
-   or chat surface for managers.
+> Create a project in dossier for "tower" with slug `tower` and title "Tower —
+> worktree observer". Add a phase `01-spec` titled "v0 spec". Then link
+> PR #42 from `itsHabib/tower` as an artifact under that phase.
+
+That's it. No `init` command needed — the write verbs scaffold the
+directory tree as you go.
+
+## Layout
+
+A corpus is any directory with a `.dossier/` marker. Inside:
+
+```
+~/dossier-corpus/
+  .dossier/
+    config.toml          # reserved; may be empty
+  projects/
+    <project-slug>/
+      project.md         # YAML frontmatter + markdown body
+      phases/
+        01-<phase-slug>.md
+      tasks/
+        <task-id>-<task-slug>.md
+      artifacts.jsonl    # append-only
+```
+
+Full format in [LAYOUT.md](LAYOUT.md). The corpus is the source of truth
+— humans grep and edit the markdown directly, and the mesh re-reads it
+on every call.
+
+## Verbs
+
+| Read | Write |
+| --- | --- |
+| `project.list` | `project.create` |
+| `project.get` | `project.update` |
+| `phase.list` | `phase.add` |
+| `task.list` | `phase.update` |
+| `artifact.list` | `task.create` |
+| | `task.claim` |
+| | `task.update` |
+| | `task.complete` |
+| | `artifact.link` |
+
+Data model in [PROTOCOL.md](PROTOCOL.md), including the task state machine.
+
+## Develop
+
+```sh
+make check        # fmt-check + clippy --all-targets -- -D warnings + test
+make fmt          # apply rustfmt
+make test         # cargo test
+make build        # debug build
+make release      # release build
+```
+
+CI runs `make check` on every PR. Lint discipline + conventions live in
+[CLAUDE.md](CLAUDE.md).
+
+## Why this exists
+
+A solo dev with a dozen side projects has the same recurring problem:
+*where did I write that down?* The design doc for the auth migration
+lives in one repo, the TDD for the data pipeline in another, and the
+PRs are scattered across GitHub. dossier consolidates the project-state
+plane in plain markdown that humans grep and LLMs query. The full
+framing — and the explicit list of things we're *not* building — is in
+[docs/vision.md](docs/vision.md).
