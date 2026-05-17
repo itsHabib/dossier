@@ -2438,6 +2438,10 @@ mod tests {
             })
             .expect_err("terminal -> anything forbidden");
         assert!(err.to_string().contains("terminal state"), "got: {err}");
+        assert!(
+            err.to_string().contains("cancelled"),
+            "expected wire status name surfaced in terminal transition error ({err})"
+        );
     }
 
     #[test]
@@ -3172,8 +3176,377 @@ mod tests {
             .unwrap();
     }
 
+    /// Overwrite a frontmatter scalar on project.md (`created_at` /
+    /// `updated_at`) for quadrant filter fixtures.
+    fn set_project_field(store: &FsStore, slug: &str, field: &str, value: &str) {
+        use std::fmt::Write as _;
+        let path = store.root().join("projects").join(slug).join("project.md");
+        let raw = fs::read_to_string(&path).unwrap();
+        let needle = format!("{field}: ");
+        let parts: Vec<&str> = raw.splitn(3, "---").collect();
+        assert_eq!(
+            parts.len(),
+            3,
+            "project file missing frontmatter delimiters"
+        );
+        let front = parts[1];
+        let mut new_front = String::new();
+        let mut replaced = false;
+        for line in front.lines() {
+            if line.starts_with(&needle) {
+                let _ = writeln!(new_front, "{field}: {value}");
+                replaced = true;
+            } else {
+                new_front.push_str(line);
+                new_front.push('\n');
+            }
+        }
+        if !replaced {
+            let _ = writeln!(new_front, "{field}: {value}");
+        }
+        let body = parts[2].trim_start_matches('\n');
+        let new_raw = format!("---{new_front}---\n{body}");
+        fs::write(&path, new_raw).unwrap();
+    }
+
     fn t(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn in_range_respects_exclusive_before_and_inclusive_after() {
+        let t_anchor = DateTime::parse_from_rfc3339("2026-05-05T12:34:56.789Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let epsilon = chrono::Duration::milliseconds(1);
+
+        assert!(in_range(t_anchor, Some(t_anchor), None));
+        assert!(!in_range(t_anchor - epsilon, Some(t_anchor), None));
+        assert!(!in_range(t_anchor, None, Some(t_anchor)));
+        assert!(in_range(t_anchor - epsilon, None, Some(t_anchor)));
+    }
+
+    #[test]
+    fn list_tasks_boundary_queries_match_created_at_semantics() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let task = seed_task(&store, "alpha", "timed");
+        set_task_field(&store, &task.id, "created_at", "2026-04-02T09:09:09Z");
+
+        let boundary = DateTime::parse_from_rfc3339("2026-04-02T09:09:09Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let after_min = store
+            .list_tasks(&TaskListFilter {
+                project: Some("alpha".to_owned()),
+                created_after: Some(boundary),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(after_min.len(), 1, "`created_after` inclusive on equality");
+        assert_eq!(after_min[0].id, task.id);
+
+        let before_max = store
+            .list_tasks(&TaskListFilter {
+                project: Some("alpha".to_owned()),
+                created_before: Some(boundary),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            before_max.is_empty(),
+            "`created_before` strictly excludes equal boundary rows"
+        );
+    }
+
+    #[test]
+    fn list_projects_predicate_created_and_updated_and_together() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "hit");
+        seed_project(&store, "old-new");
+        seed_project(&store, "new-old");
+        seed_project(&store, "neither");
+
+        let m = t("2026-04-15T15:15:15Z");
+
+        // Only `hit` satisfies BOTH `created_at >= m` and `updated_at >= m`.
+        set_project_field(&store, "hit", "created_at", "2026-05-01T00:00:00Z");
+        set_project_field(&store, "hit", "updated_at", "2026-08-08T08:08:08Z");
+
+        set_project_field(&store, "old-new", "created_at", "2026-03-03T03:03:03Z");
+        set_project_field(&store, "old-new", "updated_at", "2026-06-06T06:06:06Z");
+
+        set_project_field(&store, "new-old", "created_at", "2026-06-06T06:06:06Z");
+        set_project_field(&store, "new-old", "updated_at", "2026-02-02T02:02:02Z");
+
+        set_project_field(&store, "neither", "created_at", "2026-01-01T00:00:00Z");
+        set_project_field(&store, "neither", "updated_at", "2026-01-02T02:02:02Z");
+
+        let hits = store
+            .list_projects(&ProjectListFilter {
+                created_after: Some(m),
+                updated_after: Some(m),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].slug, "hit");
+    }
+
+    #[test]
+    fn list_phases_matches_status_and_body_contains_intersection() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let _hit = add_phase_simple(&store, "alpha", "hit");
+        let _active_plain = add_phase_simple(&store, "alpha", "active-plain");
+        let _pending_design = add_phase_simple(&store, "alpha", "pending-design");
+        let _cold = add_phase_simple(&store, "alpha", "cold");
+
+        set_phase_body(&store, "alpha", "hit", "RFC for the design subsystem");
+        set_phase_body(&store, "alpha", "active-plain", "no keyword here");
+        set_phase_body(
+            &store,
+            "alpha",
+            "pending-design",
+            "review the design backlog",
+        );
+        set_phase_body(&store, "alpha", "cold", "nothing");
+
+        store
+            .update_phase(UpdatePhase {
+                project: "alpha".to_owned(),
+                slug: "hit".to_owned(),
+                status: Some(PhaseStatus::Active),
+                ..Default::default()
+            })
+            .unwrap();
+
+        store
+            .update_phase(UpdatePhase {
+                project: "alpha".to_owned(),
+                slug: "active-plain".to_owned(),
+                status: Some(PhaseStatus::Active),
+                ..Default::default()
+            })
+            .unwrap();
+
+        store
+            .update_phase(UpdatePhase {
+                project: "alpha".to_owned(),
+                slug: "pending-design".to_owned(),
+                status: Some(PhaseStatus::Pending),
+                ..Default::default()
+            })
+            .unwrap();
+
+        store
+            .update_phase(UpdatePhase {
+                project: "alpha".to_owned(),
+                slug: "cold".to_owned(),
+                status: Some(PhaseStatus::Pending),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let phases = store
+            .list_phases(&PhaseListFilter {
+                project: Some("alpha".to_owned()),
+                status: Some(vec![PhaseStatus::Active]),
+                body_contains: Some("DESIGN".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(phases.len(), 1);
+        assert_eq!(phases[0].slug, "hit");
+    }
+
+    #[test]
+    fn list_projects_matches_status_and_body_contains_intersection() {
+        let (_tmp, store) = fresh_corpus();
+
+        store
+            .create_project(NewProject {
+                slug: "hit".to_owned(),
+                title: "Hit".to_owned(),
+                description: "team CORE platform rollout".to_owned(),
+                actor: "human:test".to_owned(),
+            })
+            .unwrap();
+
+        store
+            .create_project(NewProject {
+                slug: "active-no-core".to_owned(),
+                title: "Bare".to_owned(),
+                description: "edge tooling only".to_owned(),
+                actor: "human:test".to_owned(),
+            })
+            .unwrap();
+
+        store
+            .create_project(NewProject {
+                slug: "paused-core-text".to_owned(),
+                title: "Paused core".to_owned(),
+                description: "contains CORE mention but wrong status fixture".to_owned(),
+                actor: "human:test".to_owned(),
+            })
+            .unwrap();
+
+        store
+            .create_project(NewProject {
+                slug: "miss".to_owned(),
+                title: "Miss".to_owned(),
+                description: "unrelated backlog".to_owned(),
+                actor: "human:test".to_owned(),
+            })
+            .unwrap();
+
+        store
+            .update_project(UpdateProject {
+                slug: "hit".to_owned(),
+                status: Some(ProjectStatus::Active),
+                ..Default::default()
+            })
+            .unwrap();
+
+        store
+            .update_project(UpdateProject {
+                slug: "active-no-core".to_owned(),
+                status: Some(ProjectStatus::Active),
+                ..Default::default()
+            })
+            .unwrap();
+
+        store
+            .update_project(UpdateProject {
+                slug: "paused-core-text".to_owned(),
+                status: Some(ProjectStatus::Paused),
+                ..Default::default()
+            })
+            .unwrap();
+
+        store
+            .update_project(UpdateProject {
+                slug: "miss".to_owned(),
+                status: Some(ProjectStatus::Done),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let hits = store
+            .list_projects(&ProjectListFilter {
+                status: Some(vec![ProjectStatus::Active]),
+                body_contains: Some("core".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].slug, "hit");
+    }
+
+    #[test]
+    fn list_tasks_matches_status_and_body_contains_intersection() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let ip_auth = seed_task(&store, "alpha", "ip-auth");
+        let ip_plain = seed_task(&store, "alpha", "ip-plain");
+        let done_auth = seed_task(&store, "alpha", "done-auth");
+        let todo_plain = seed_task(&store, "alpha", "todo-plain");
+
+        set_task_body(&store, &ip_auth.id, "finish auth hardening checklist");
+        set_task_body(&store, &ip_plain.id, "tune deploy pipeline");
+        set_task_body(&store, &done_auth.id, "close auth regressions batch");
+        set_task_body(&store, &todo_plain.id, "stretch goal");
+
+        set_task_field(&store, &ip_auth.id, "status", "in_progress");
+        set_task_field(&store, &ip_auth.id, "assignee", "ship");
+
+        set_task_field(&store, &ip_plain.id, "status", "in_progress");
+        set_task_field(&store, &ip_plain.id, "assignee", "ship");
+
+        set_task_field(&store, &done_auth.id, "status", "done");
+        set_task_field(&store, &todo_plain.id, "status", "todo");
+
+        let hits = store
+            .list_tasks(&TaskListFilter {
+                project: Some("alpha".to_owned()),
+                status: Some(vec![TaskStatus::InProgress]),
+                body_contains: Some("auth".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].slug, ip_auth.slug);
+    }
+
+    #[test]
+    fn list_tasks_completed_range_works_when_only_after_bound_given() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let winner = seed_task(&store, "alpha", "closed");
+        set_task_field(&store, &winner.id, "completed_at", "2026-06-06T06:06:06Z");
+
+        let hits = store
+            .list_tasks(&TaskListFilter {
+                project: Some("alpha".to_owned()),
+                completed_after: Some(t("2026-06-05T06:06:06Z")),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, winner.id);
+    }
+
+    #[test]
+    fn update_phase_errors_when_exactly_one_key_is_blank() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        add_phase_simple(&store, "alpha", "spec");
+
+        for (project, slug) in [
+            (String::new(), "spec".to_owned()),
+            ("alpha".to_owned(), String::new()),
+        ] {
+            let err = store
+                .update_phase(UpdatePhase {
+                    project,
+                    slug,
+                    title: Some("x".to_owned()),
+                    ..Default::default()
+                })
+                .expect_err("requires both keys");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("project and slug are required"),
+                "unexpected message: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn load_task_strips_blank_lines_after_notes_heading() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let task = seed_task(&store, "alpha", "notes-shape");
+
+        let (_proj_slug, path) = store.find_task_path(&task.id).unwrap();
+        let mut raw = fs::read_to_string(&path).unwrap();
+        raw.push_str("\n\n## Notes\n\n\n\r\n- 2026-01-01T00:00:00Z — actor: real note line\n");
+        fs::write(path, raw).unwrap();
+
+        let hits = store.list_tasks(&task_filter_for("alpha")).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].notes.len(),
+            1,
+            "leading blank noise must not swallow the canonical note row"
+        );
+        assert_eq!(hits[0].notes[0].body.as_str(), "real note line");
     }
 
     // ----- task.list per-predicate -----
