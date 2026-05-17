@@ -9,10 +9,10 @@
     clippy::expect_used,
     clippy::missing_panics_doc,
     clippy::missing_errors_doc,
-    clippy::indexing_slicing,
     reason = "test module"
 )]
 
+use dossier::domain::{PhaseListFilter, TaskListFilter};
 use dossier::store::{new_id, NewPhase, NewProject, NewTask};
 use proptest::prelude::*;
 
@@ -106,7 +106,12 @@ proptest! {
                 actor: "human:michael".into(),
             })
             .expect("add_phase");
-        let phases = store.list_phases(&proj_slug).expect("list_phases");
+        let phases = store
+            .list_phases(&PhaseListFilter {
+                project: Some(proj_slug),
+                ..Default::default()
+            })
+            .expect("list_phases");
         let fetched = phases
             .iter()
             .find(|p| p.slug == phase_slug)
@@ -149,7 +154,12 @@ proptest! {
                 actor: "human:michael".into(),
             })
             .expect("create_task");
-        let tasks = store.list_tasks(&proj_slug).expect("list_tasks");
+        let tasks = store
+            .list_tasks(&TaskListFilter {
+                project: Some(proj_slug),
+                ..Default::default()
+            })
+            .expect("list_tasks");
         let fetched = tasks
             .iter()
             .find(|t| t.slug == task_slug)
@@ -176,10 +186,11 @@ proptest! {
         let ulid = parts.next().expect("ulid segment");
         prop_assert_eq!(p, &prefix);
         prop_assert_eq!(ulid.len(), 26);
+        // Crockford base32: uppercase A-Z and digits 0-9 only, minus I/L/O/U.
         prop_assert!(
             ulid.chars()
-                .all(|c| c.is_ascii_alphanumeric()
-                    && !"ILOU".contains(c.to_ascii_uppercase())),
+                .all(|c| (c.is_ascii_uppercase() || c.is_ascii_digit())
+                    && !"ILOU".contains(c)),
             "ulid alphabet violation: {}",
             ulid
         );

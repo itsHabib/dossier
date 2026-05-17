@@ -27,9 +27,13 @@ fn looks_like_a_slug(s: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
 }
 
-/// Strategy for *valid* slugs: 1..=32 characters from the allowed set.
+/// Strategy for *valid* slugs: 2..=32 characters from the allowed set.
+/// The 2-char lower bound keeps the collision rate <0.01% when three
+/// independent slugs are drawn for the phase/task test — at 1 char,
+/// the alphabet only has 37 values and `prop_assume!` discards ~15%
+/// of cases.
 fn valid_slug_strategy() -> impl Strategy<Value = String> {
-    proptest::string::string_regex("[a-z0-9_-]{1,32}").expect("slug regex")
+    proptest::string::string_regex("[a-z0-9_-]{2,32}").expect("slug regex")
 }
 
 /// Strategy for *arbitrary* strings, used to probe the rejection path.
@@ -122,6 +126,57 @@ proptest! {
             slug: s,
             title: "T".into(),
             description: String::new(),
+            actor: "human:michael".into(),
+        });
+        prop_assert!(result.is_err());
+    }
+
+    /// `add_phase` calls `is_valid_slug` independently — verify it
+    /// rejects the same set as `create_project`. Without this, a
+    /// copy-paste error dropping the phase slug check would go
+    /// undetected.
+    #[test]
+    fn phase_add_rejects_invalid_slug(s in arbitrary_string_strategy()) {
+        prop_assume!(!looks_like_a_slug(&s));
+        let (_tmp, store) = fresh_corpus();
+        // Anchor project with a valid slug so the phase validation is
+        // the only thing being probed.
+        store.create_project(NewProject {
+            slug: "host".into(),
+            title: "T".into(),
+            description: String::new(),
+            actor: "human:michael".into(),
+        }).expect("create_project");
+        let result = store.add_phase(NewPhase {
+            project: "host".into(),
+            slug: s,
+            title: "P".into(),
+            body: String::new(),
+            after_phase: None,
+            actor: "human:michael".into(),
+        });
+        prop_assert!(result.is_err());
+    }
+
+    /// `create_task` also has its own slug-validation call site
+    /// (separate from `add_phase`). Same dual property as the other
+    /// rejection tests.
+    #[test]
+    fn task_create_rejects_invalid_slug(s in arbitrary_string_strategy()) {
+        prop_assume!(!looks_like_a_slug(&s));
+        let (_tmp, store) = fresh_corpus();
+        store.create_project(NewProject {
+            slug: "host".into(),
+            title: "T".into(),
+            description: String::new(),
+            actor: "human:michael".into(),
+        }).expect("create_project");
+        let result = store.create_task(NewTask {
+            project: "host".into(),
+            phase: None,
+            slug: s,
+            title: "Task".into(),
+            body: String::new(),
             actor: "human:michael".into(),
         });
         prop_assert!(result.is_err());

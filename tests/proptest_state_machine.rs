@@ -31,7 +31,7 @@
 )]
 
 use chrono::{DateTime, Utc};
-use dossier::domain::TaskStatus;
+use dossier::domain::{TaskListFilter, TaskStatus};
 use dossier::store::{ClaimTask, CompleteTask, FsStore, NewProject, NewTask, UpdateTask};
 use proptest::prelude::*;
 
@@ -43,11 +43,12 @@ const TASK_SLUG: &str = "subject";
 
 /// One verb invocation in the model. `actor` and `body` are small
 /// domains so that collisions and identical bodies appear often enough
-/// to exercise idempotent paths.
+/// to exercise idempotent paths. Every variant carries its own actor so
+/// the model never falls back to a placeholder name.
 #[derive(Debug, Clone)]
 enum Op {
     Claim { actor: String },
-    UpdateStatus { to: TaskStatus },
+    UpdateStatus { to: TaskStatus, actor: String },
     Complete { actor: String },
     UpdateBody { body: String, actor: String },
 }
@@ -72,7 +73,8 @@ fn status_strategy() -> impl Strategy<Value = TaskStatus> {
 fn op_strategy() -> impl Strategy<Value = Op> {
     prop_oneof![
         actor_strategy().prop_map(|actor| Op::Claim { actor }),
-        status_strategy().prop_map(|to| Op::UpdateStatus { to }),
+        (status_strategy(), actor_strategy())
+            .prop_map(|(to, actor)| Op::UpdateStatus { to, actor }),
         actor_strategy().prop_map(|actor| Op::Complete { actor }),
         (
             proptest::string::string_regex("[a-z0-9 ]{0,16}").expect("body regex"),
@@ -87,13 +89,12 @@ fn op_strategy() -> impl Strategy<Value = Op> {
 /// indirectly verified by the invariants: e.g. invariant 3 says that
 /// any successful `update_task` to `Claimed` is a bug.)
 fn apply(store: &FsStore, op: Op, task_id: &str) {
-    let actor = "ignored-by-this-call".to_owned();
     let _ = match op {
         Op::Claim { actor } => store.claim_task(ClaimTask {
             id: task_id.to_owned(),
             actor,
         }),
-        Op::UpdateStatus { to } => store.update_task(UpdateTask {
+        Op::UpdateStatus { to, actor } => store.update_task(UpdateTask {
             id: task_id.to_owned(),
             body: None,
             status: Some(to),
@@ -118,7 +119,12 @@ fn apply(store: &FsStore, op: Op, task_id: &str) {
 /// Reload the task after each op. Returns the up-to-date state of the
 /// single task we're tracking.
 fn current_state(store: &FsStore) -> dossier::domain::Task {
-    let tasks = store.list_tasks(PROJECT_SLUG).expect("list_tasks");
+    let tasks = store
+        .list_tasks(&TaskListFilter {
+            project: Some(PROJECT_SLUG.to_owned()),
+            ..Default::default()
+        })
+        .expect("list_tasks");
     tasks
         .into_iter()
         .find(|t| t.slug == TASK_SLUG)
@@ -192,14 +198,14 @@ proptest! {
             // Probe invariants 3 and 4 BEFORE applying the op so we can
             // assert that disallowed verbs error.
             let pre = current_state(&store);
-            if let Op::UpdateStatus { to } = op.clone() {
+            if let Op::UpdateStatus { to, actor } = op.clone() {
                 if matches!(to, TaskStatus::Claimed | TaskStatus::Done) {
                     let result = store.update_task(UpdateTask {
                         id: task_id.clone(),
                         body: None,
                         status: Some(to),
                         note: None,
-                        actor: "alice".into(),
+                        actor,
                     });
                     prop_assert!(
                         result.is_err(),
@@ -224,8 +230,18 @@ proptest! {
             }
 
             // Normal apply path.
+            let was_complete_from_in_progress =
+                matches!(op, Op::Complete { .. }) && pre.status == TaskStatus::InProgress;
             apply(&store, op, &task_id);
             let post = current_state(&store);
+
+            // Invariant 4 (success leg): a Complete from InProgress
+            // must actually transition to Done — not just leave state
+            // unchanged or land in some other status.
+            if was_complete_from_in_progress {
+                prop_assert_eq!(post.status, TaskStatus::Done);
+                prop_assert!(post.completed_at.is_some());
+            }
 
             // Invariant 1: terminal absorption.
             if let Some(t) = once_terminal {
@@ -258,5 +274,46 @@ proptest! {
             );
             last_updated_at = post.updated_at;
         }
+    }
+
+    /// Explicit check for the same-actor re-claim idempotency
+    /// invariant. Two consecutive `Claim { actor: a }` calls on a
+    /// fresh task must yield identical state — including no
+    /// `updated_at` bump on the second call. (The general sequence
+    /// test exercises this only by chance; this property guarantees
+    /// it on every run.)
+    #[test]
+    fn claim_is_idempotent_for_same_actor(actor in actor_strategy()) {
+        let (_tmp, store) = fresh_corpus();
+        store.create_project(NewProject {
+            slug: PROJECT_SLUG.into(),
+            title: "M".into(),
+            description: String::new(),
+            actor: "human:michael".into(),
+        }).expect("create_project");
+        let task = store.create_task(NewTask {
+            project: PROJECT_SLUG.into(),
+            phase: None,
+            slug: TASK_SLUG.into(),
+            title: "subject".into(),
+            body: String::new(),
+            actor: "human:michael".into(),
+        }).expect("create_task");
+
+        let first = store.claim_task(ClaimTask {
+            id: task.id.clone(),
+            actor: actor.clone(),
+        }).expect("first claim");
+        let second = store.claim_task(ClaimTask {
+            id: task.id,
+            actor,
+        }).expect("second claim (no-op)");
+
+        prop_assert_eq!(first.status, second.status);
+        prop_assert_eq!(&first.assignee, &second.assignee);
+        prop_assert_eq!(first.claimed_at, second.claimed_at);
+        // updated_at must not advance — claim_task's same-actor branch
+        // returns before stamping `now`.
+        prop_assert_eq!(first.updated_at, second.updated_at);
     }
 }
