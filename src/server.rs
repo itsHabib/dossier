@@ -997,4 +997,348 @@ mod tests {
         };
         assert!(out.projects.is_empty());
     }
+
+    #[test]
+    fn project_get_scopes_phases_and_tasks_to_requested_project() {
+        let (_tmp, svc) = fresh_service();
+
+        svc.project_create(Parameters(ProjectCreateArgs {
+            slug: "alpha".to_owned(),
+            title: "Alpha".to_owned(),
+            description: String::new(),
+            actor: "human:test".to_owned(),
+        }))
+        .expect("create alpha");
+
+        svc.project_create(Parameters(ProjectCreateArgs {
+            slug: "beta".to_owned(),
+            title: "Beta".to_owned(),
+            description: String::new(),
+            actor: "human:test".to_owned(),
+        }))
+        .expect("create beta");
+
+        svc.phase_add(Parameters(PhaseAddArgs {
+            project: "alpha".to_owned(),
+            slug: "alpha-phase".to_owned(),
+            title: "Alpha phase".to_owned(),
+            body: String::new(),
+            after_phase: None,
+            actor: "human:test".to_owned(),
+        }))
+        .expect("alpha phase");
+
+        svc.phase_add(Parameters(PhaseAddArgs {
+            project: "beta".to_owned(),
+            slug: "beta-phase".to_owned(),
+            title: "Beta phase".to_owned(),
+            body: String::new(),
+            after_phase: None,
+            actor: "human:test".to_owned(),
+        }))
+        .expect("beta phase");
+
+        svc.task_create(Parameters(TaskCreateArgs {
+            project: "alpha".to_owned(),
+            phase: None,
+            slug: "alpha-task".to_owned(),
+            title: "Alpha task".to_owned(),
+            body: String::new(),
+            actor: "human:test".to_owned(),
+        }))
+        .expect("alpha task");
+
+        svc.task_create(Parameters(TaskCreateArgs {
+            project: "beta".to_owned(),
+            phase: None,
+            slug: "beta-task".to_owned(),
+            title: "Beta task".to_owned(),
+            body: String::new(),
+            actor: "human:test".to_owned(),
+        }))
+        .expect("beta task");
+
+        let Json(view) = svc
+            .project_get(Parameters(ProjectGetArgs {
+                slug: "alpha".to_owned(),
+            }))
+            .expect("project.get alpha");
+
+        assert_eq!(view.phases.len(), 1, "scoped to alpha project");
+        assert_eq!(view.phases[0].slug, "alpha-phase");
+
+        assert_eq!(view.tasks.len(), 1, "scoped to alpha project");
+        assert_eq!(view.tasks[0].slug, "alpha-task");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn artifact_list_filters_combine_task_and_kind_predicates() {
+        let (_tmp, svc) = fresh_service();
+
+        svc.project_create(Parameters(ProjectCreateArgs {
+            slug: "corp".to_owned(),
+            title: "Corp".to_owned(),
+            description: String::new(),
+            actor: "human:test".to_owned(),
+        }))
+        .expect("create project");
+
+        let Json(t1) = svc
+            .task_create(Parameters(TaskCreateArgs {
+                project: "corp".to_owned(),
+                phase: None,
+                slug: "t1".to_owned(),
+                title: "T1".to_owned(),
+                body: String::new(),
+                actor: "human:test".to_owned(),
+            }))
+            .expect("t1");
+
+        let Json(t2) = svc
+            .task_create(Parameters(TaskCreateArgs {
+                project: "corp".to_owned(),
+                phase: None,
+                slug: "t2".to_owned(),
+                title: "T2".to_owned(),
+                body: String::new(),
+                actor: "human:test".to_owned(),
+            }))
+            .expect("t2");
+
+        let tid1 = t1.id;
+        let tid2 = t2.id;
+
+        let Json(Artifact { id: id_a1, .. }) = svc
+            .artifact_link(Parameters(ArtifactLinkArgs {
+                project: "corp".to_owned(),
+                task: Some(tid1.clone()),
+                kind: "pr".to_owned(),
+                reference: "https://example/pr/1".to_owned(),
+                label: "art1".to_owned(),
+                actor: "human:test".to_owned(),
+            }))
+            .expect("art1");
+
+        let Json(Artifact { id: id_a2, .. }) = svc
+            .artifact_link(Parameters(ArtifactLinkArgs {
+                project: "corp".to_owned(),
+                task: Some(tid2),
+                kind: "pr".to_owned(),
+                reference: "https://example/pr/2".to_owned(),
+                label: "art2".to_owned(),
+                actor: "human:test".to_owned(),
+            }))
+            .expect("art2");
+
+        let Json(Artifact { id: id_a3, .. }) = svc
+            .artifact_link(Parameters(ArtifactLinkArgs {
+                project: "corp".to_owned(),
+                task: Some(tid1.clone()),
+                kind: "commit".to_owned(),
+                reference: "deadbeef".to_owned(),
+                label: "art3".to_owned(),
+                actor: "human:test".to_owned(),
+            }))
+            .expect("art3");
+
+        macro_rules! ids {
+            ($args:expr) => {{
+                let Json(out) = svc.artifact_list(Parameters($args)).expect("artifact_list");
+                out.artifacts.into_iter().map(|a| a.id).collect::<Vec<_>>()
+            }};
+        }
+
+        let mut all = ids!(ArtifactListArgs {
+            project: "corp".to_owned(),
+            task: String::new(),
+            kind: String::new(),
+        });
+        all.sort_unstable();
+        assert_eq!(all.len(), 3);
+
+        let mut hit = ids!(ArtifactListArgs {
+            project: "corp".to_owned(),
+            task: tid1.clone(),
+            kind: String::new(),
+        });
+        hit.sort_unstable();
+        assert_eq!(
+            hit,
+            {
+                let mut v = vec![id_a1.clone(), id_a3.clone()];
+                v.sort_unstable();
+                v
+            },
+            "task filter narrows correctly"
+        );
+
+        hit = ids!(ArtifactListArgs {
+            project: "corp".to_owned(),
+            task: String::new(),
+            kind: "pr".to_owned(),
+        });
+        hit.sort_unstable();
+        assert_eq!(hit, {
+            let mut v = vec![id_a1, id_a2];
+            v.sort_unstable();
+            v
+        },);
+
+        hit = ids!(ArtifactListArgs {
+            project: "corp".to_owned(),
+            task: tid1,
+            kind: "commit".to_owned(),
+        });
+        assert_eq!(hit, vec![id_a3]);
+
+        hit = ids!(ArtifactListArgs {
+            project: "corp".to_owned(),
+            task: "tsk_does_not_exist".to_owned(),
+            kind: String::new(),
+        });
+        assert!(hit.is_empty());
+    }
+
+    #[test]
+    fn project_list_filter_round_trips_through_from_impl() {
+        let created_after = DateTime::parse_from_rfc3339("2026-01-01T08:15:30Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let created_before = DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let updated_after = DateTime::parse_from_rfc3339("2026-02-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let updated_before = DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let f = ProjectListFilter::from(ProjectListArgs {
+            status: Some(vec![ProjectStatus::Active]),
+            body_contains: Some("needle".to_owned()),
+            created_after: Some(created_after),
+            created_before: Some(created_before),
+            updated_after: Some(updated_after),
+            updated_before: Some(updated_before),
+            order_by: Some(ProjectOrderField::UpdatedAt),
+            desc: Some(true),
+            limit: Some(7),
+        });
+
+        assert_eq!(f.status, Some(vec![ProjectStatus::Active]));
+        assert_eq!(f.body_contains.as_deref(), Some("needle"));
+        assert_eq!(f.created_after, Some(created_after));
+        assert_eq!(f.created_before, Some(created_before));
+        assert_eq!(f.updated_after, Some(updated_after));
+        assert_eq!(f.updated_before, Some(updated_before));
+        assert_eq!(f.order_by, Some(ProjectOrderField::UpdatedAt));
+        assert_eq!(f.desc, Some(true));
+        assert_eq!(f.limit, Some(7));
+    }
+
+    #[test]
+    fn phase_list_filter_round_trips_through_from_impl() {
+        let created_after = DateTime::parse_from_rfc3339("2026-03-03T03:03:03Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let created_before = DateTime::parse_from_rfc3339("2026-03-04T03:03:03Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let updated_after = DateTime::parse_from_rfc3339("2026-03-05T03:03:03Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let updated_before = DateTime::parse_from_rfc3339("2026-03-06T03:03:03Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let f = PhaseListFilter::from(PhaseListArgs {
+            project: Some("omega".to_owned()),
+            status: Some(vec![PhaseStatus::Skipped]),
+            body_contains: Some("phase-body".to_owned()),
+            created_after: Some(created_after),
+            created_before: Some(created_before),
+            updated_after: Some(updated_after),
+            updated_before: Some(updated_before),
+            order_by: Some(PhaseOrderField::CreatedAt),
+            desc: Some(true),
+            limit: Some(42),
+        });
+
+        assert_eq!(f.project.as_deref(), Some("omega"));
+        assert_eq!(f.status, Some(vec![PhaseStatus::Skipped]));
+        assert_eq!(f.body_contains.as_deref(), Some("phase-body"));
+        assert_eq!(f.created_after, Some(created_after));
+        assert_eq!(f.created_before, Some(created_before));
+        assert_eq!(f.updated_after, Some(updated_after));
+        assert_eq!(f.updated_before, Some(updated_before));
+        assert_eq!(f.order_by, Some(PhaseOrderField::CreatedAt));
+        assert_eq!(f.desc, Some(true));
+        assert_eq!(f.limit, Some(42));
+    }
+
+    #[test]
+    fn task_list_filter_round_trips_through_from_impl() {
+        let created_after = DateTime::parse_from_rfc3339("2026-04-04T04:04:04Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let created_before = DateTime::parse_from_rfc3339("2026-04-05T04:04:04Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let updated_after = DateTime::parse_from_rfc3339("2026-04-06T04:04:04Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let updated_before = DateTime::parse_from_rfc3339("2026-04-07T04:04:04Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let completed_after = DateTime::parse_from_rfc3339("2026-04-08T04:04:04Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let completed_before = DateTime::parse_from_rfc3339("2026-04-09T04:04:04Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let claimed_after = DateTime::parse_from_rfc3339("2026-04-10T04:04:04Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let claimed_before = DateTime::parse_from_rfc3339("2026-04-11T04:04:04Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let f = TaskListFilter::from(TaskListArgs {
+            project: Some("rho".to_owned()),
+            phase: Some("implement".to_owned()),
+            status: Some(vec![TaskStatus::Todo, TaskStatus::Blocked]),
+            assignee: Some("ship".to_owned()),
+            body_contains: Some("fixture".to_owned()),
+            created_after: Some(created_after),
+            created_before: Some(created_before),
+            updated_after: Some(updated_after),
+            updated_before: Some(updated_before),
+            completed_after: Some(completed_after),
+            completed_before: Some(completed_before),
+            claimed_after: Some(claimed_after),
+            claimed_before: Some(claimed_before),
+            order_by: Some(TaskOrderField::ClaimedAt),
+            desc: Some(true),
+            limit: Some(99),
+        });
+
+        assert_eq!(f.project.as_deref(), Some("rho"));
+        assert_eq!(f.phase.as_deref(), Some("implement"));
+        assert_eq!(f.status, Some(vec![TaskStatus::Todo, TaskStatus::Blocked]));
+        assert_eq!(f.assignee.as_deref(), Some("ship"));
+        assert_eq!(f.body_contains.as_deref(), Some("fixture"));
+        assert_eq!(f.created_after, Some(created_after));
+        assert_eq!(f.created_before, Some(created_before));
+        assert_eq!(f.updated_after, Some(updated_after));
+        assert_eq!(f.updated_before, Some(updated_before));
+        assert_eq!(f.completed_after, Some(completed_after));
+        assert_eq!(f.completed_before, Some(completed_before));
+        assert_eq!(f.claimed_after, Some(claimed_after));
+        assert_eq!(f.claimed_before, Some(claimed_before));
+        assert_eq!(f.order_by, Some(TaskOrderField::ClaimedAt));
+        assert_eq!(f.desc, Some(true));
+        assert_eq!(f.limit, Some(99));
+    }
 }
