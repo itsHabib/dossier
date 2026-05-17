@@ -1601,6 +1601,9 @@ mod tests {
             .list_tasks(&task_filter_for("dossier"))
             .expect("list tasks");
         assert_eq!(tasks.len(), 3);
+        for task in &tasks {
+            assert!(!task.body.contains("## Notes"));
+        }
 
         let arts = store.list_artifacts("dossier").expect("list artifacts");
         assert_eq!(arts.len(), 3);
