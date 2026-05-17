@@ -238,3 +238,43 @@ pub enum ProjectOrderField {
     CreatedAt,
     UpdatedAt,
 }
+
+/// Which primitive kinds `FsStore::search` includes. Omitted on `search`
+/// means all three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchKind {
+    Project,
+    Phase,
+    Task,
+}
+
+/// Arguments for corpus-wide substring search (`search` MCP tool).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct SearchArgs {
+    /// Literal substring to find (case-insensitive); must be non-empty after trim.
+    pub query: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kinds: Option<Vec<SearchKind>>,
+    /// Restrict to this project slug; omit or `null` for the whole corpus.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+/// One row from `FsStore::search`, ranked by `score` then recency.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SearchHit {
+    pub kind: SearchKind,
+    pub id: String,
+    pub project: String,
+    /// Phase slug when `kind` is `task`, if the task is anchored to a phase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    pub slug: String,
+    pub title: String,
+    pub snippet: String,
+    /// Relevance signal (v1: overlapping literal match count in title+body).
+    pub score: f64,
+}

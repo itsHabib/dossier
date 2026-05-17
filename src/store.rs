@@ -17,7 +17,8 @@ use ulid::Ulid;
 
 use crate::domain::{
     Artifact, Phase, PhaseListFilter, PhaseOrderField, PhaseStatus, Project, ProjectListFilter,
-    ProjectOrderField, ProjectStatus, Task, TaskListFilter, TaskOrderField, TaskStatus,
+    ProjectOrderField, ProjectStatus, SearchArgs, SearchHit, SearchKind, Task, TaskListFilter,
+    TaskOrderField, TaskStatus,
 };
 
 #[derive(Debug)]
@@ -160,6 +161,138 @@ impl FsStore {
             out.truncate(limit);
         }
         Ok(out)
+    }
+
+    /// Case-insensitive literal substring search across project titles +
+    /// descriptions, phase titles + bodies, and task titles + spec bodies
+    /// (excluding `## Notes`). Results are ranked by match count
+    /// (`score`) descending, then `updated_at` descending, then truncated
+    /// to `limit` (default 50).
+    // `too_many_lines`: single corpus walk; splitting adds indirection
+    // without clarity benefit on a structurally linear function.
+    // `cast_precision_loss`: `score` is a match count; f64 precision is
+    // only lost past 2^53 matches, which is unreachable in practice.
+    #[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
+    pub fn search(&self, args: &SearchArgs) -> Result<Vec<SearchHit>> {
+        const SNIPPET_CHARS: usize = 80;
+        let needle = args.query.trim();
+        if needle.is_empty() {
+            bail!("search query must be non-empty");
+        }
+        let limit = args.limit.unwrap_or(50);
+        let kinds = args
+            .kinds
+            .clone()
+            .unwrap_or_else(|| vec![SearchKind::Project, SearchKind::Phase, SearchKind::Task]);
+        let want_project = kinds.contains(&SearchKind::Project);
+        let want_phase = kinds.contains(&SearchKind::Phase);
+        let want_task = kinds.contains(&SearchKind::Task);
+
+        // Empty-string `project` is a caller bug (form default, etc.),
+        // not a "search everywhere" request. Per spec contract,
+        // corpus-wide search is opt-in by omitting / `null`-ing
+        // `project`, not by passing `""`. Reject explicitly so a
+        // misconfigured caller doesn't silently broaden scope.
+        let project_slugs: Vec<String> = match &args.project {
+            Some(s) if s.is_empty() => bail!(
+                "search: project filter must be non-empty (omit `project` field for corpus-wide search)"
+            ),
+            Some(s) => vec![s.clone()],
+            None => self.project_slugs()?,
+        };
+
+        let mut ranked: Vec<(SearchHit, DateTime<Utc>)> = Vec::new();
+
+        for proj_slug in &project_slugs {
+            if want_project {
+                let Ok(p) = self.load_project(proj_slug, true) else {
+                    continue;
+                };
+                let hay = format!("{}\n{}", p.title, p.description);
+                let score = count_ci_overlapping(&hay, needle);
+                if score > 0 {
+                    ranked.push((
+                        SearchHit {
+                            kind: SearchKind::Project,
+                            id: p.id.clone(),
+                            project: p.slug.clone(),
+                            phase: None,
+                            slug: p.slug.clone(),
+                            title: p.title.clone(),
+                            snippet: search_snippet(&hay, needle, SNIPPET_CHARS),
+                            score: score as f64,
+                        },
+                        p.updated_at,
+                    ));
+                }
+            }
+
+            let phase_list = if want_phase || want_task {
+                self.load_phases_for(proj_slug)?
+            } else {
+                Vec::new()
+            };
+            let id_to_phase_slug: std::collections::HashMap<&str, &str> = phase_list
+                .iter()
+                .map(|ph| (ph.id.as_str(), ph.slug.as_str()))
+                .collect();
+
+            if want_phase {
+                for ph in &phase_list {
+                    let hay = format!("{}\n{}", ph.title, ph.body);
+                    let score = count_ci_overlapping(&hay, needle);
+                    if score > 0 {
+                        ranked.push((
+                            SearchHit {
+                                kind: SearchKind::Phase,
+                                id: ph.id.clone(),
+                                project: proj_slug.clone(),
+                                phase: None,
+                                slug: ph.slug.clone(),
+                                title: ph.title.clone(),
+                                snippet: search_snippet(&hay, needle, SNIPPET_CHARS),
+                                score: score as f64,
+                            },
+                            ph.updated_at,
+                        ));
+                    }
+                }
+            }
+
+            if want_task {
+                let tasks = self.load_tasks_for(proj_slug)?;
+                for t in tasks {
+                    let hay = format!("{}\n{}", t.title, t.body);
+                    let score = count_ci_overlapping(&hay, needle);
+                    if score > 0 {
+                        let phase_slug = if t.phase.is_empty() {
+                            None
+                        } else {
+                            id_to_phase_slug
+                                .get(t.phase.as_str())
+                                .map(|s| (*s).to_owned())
+                        };
+                        ranked.push((
+                            SearchHit {
+                                kind: SearchKind::Task,
+                                id: t.id.clone(),
+                                project: proj_slug.clone(),
+                                phase: phase_slug,
+                                slug: t.slug.clone(),
+                                title: t.title.clone(),
+                                snippet: search_snippet(&hay, needle, SNIPPET_CHARS),
+                                score: score as f64,
+                            },
+                            t.updated_at,
+                        ));
+                    }
+                }
+            }
+        }
+
+        ranked.sort_by(|(ha, ta), (hb, tb)| hb.score.total_cmp(&ha.score).then_with(|| tb.cmp(ta)));
+
+        Ok(ranked.into_iter().take(limit).map(|(h, _)| h).collect())
     }
 
     /// Slugs of every project directory under `projects/`, sorted for
@@ -1399,6 +1532,79 @@ fn icontains(haystack: &str, needle: &str) -> bool {
     haystack.to_lowercase().contains(&needle.to_lowercase())
 }
 
+fn unicode_ci_eq(a: char, b: char) -> bool {
+    let sa: String = a.to_lowercase().collect();
+    let sb: String = b.to_lowercase().collect();
+    sa == sb
+}
+
+/// First byte offset in `haystack` where `needle` matches case-insensitively.
+///
+/// Uses char-by-char comparison on the original string. This diverges from
+/// `count_ci_overlapping`, which scans on `to_lowercase()`, for the edge
+/// case of multi-char lowercase mappings (e.g. `ß` → `ss`): a hit can be
+/// counted but the snippet comes back empty. Corpus is developer notes in
+/// English; aligning the two strategies would require char-index
+/// translation between the original and lowercased strings in
+/// `search_snippet`. Tracking as a separate follow-up rather than
+/// over-engineering here.
+fn find_ci_start_byte(haystack: &str, needle: &str) -> Option<usize> {
+    if needle.is_empty() {
+        return None;
+    }
+    'outer: for (start, _) in haystack.char_indices() {
+        let tail = &haystack[start..];
+        let mut t = tail;
+        for nc in needle.chars() {
+            let Some(hc) = t.chars().next() else {
+                continue 'outer;
+            };
+            if !unicode_ci_eq(hc, nc) {
+                continue 'outer;
+            }
+            t = &t[hc.len_utf8()..];
+        }
+        return Some(start);
+    }
+    None
+}
+
+/// Overlapping occurrence count of literal `needle` in `haystack` (case-insensitive).
+fn count_ci_overlapping(haystack: &str, needle: &str) -> usize {
+    let h = haystack.to_lowercase();
+    let n = needle.to_lowercase();
+    if n.is_empty() {
+        return 0;
+    }
+    let mut count = 0;
+    let mut s = 0usize;
+    while let Some(i) = h[s..].find(&n) {
+        count += 1;
+        // Advance by one CHAR width, not one byte. `find` returns a
+        // byte offset; for multi-byte UTF-8 chars (accented letters,
+        // CJK, emoji), advancing by `i + 1` can land mid-codepoint and
+        // panic on the next slice. Stepping by `len_utf8()` of the
+        // first char at the match keeps the index on a char boundary
+        // while still allowing overlapping matches.
+        let first_char_len = h[s + i..].chars().next().map_or(1, char::len_utf8);
+        s += i + first_char_len;
+    }
+    count
+}
+
+/// Roughly `width` chars centered on the first case-insensitive match.
+fn search_snippet(haystack: &str, needle: &str, width: usize) -> String {
+    let Some(start_byte) = find_ci_start_byte(haystack, needle) else {
+        return String::new();
+    };
+    let start_char = haystack[..start_byte].chars().count();
+    let chars: Vec<char> = haystack.chars().collect();
+    let half = width / 2;
+    let lo = start_char.saturating_sub(half);
+    let hi = (lo + width).min(chars.len());
+    chars.into_iter().skip(lo).take(hi - lo).collect()
+}
+
 /// `_after` is inclusive (>=), `_before` is strictly less than. Picks
 /// the boundary semantics that match how a caller phrases "since" /
 /// "before" in natural language.
@@ -1556,6 +1762,7 @@ mod tests {
     )]
 
     use super::*;
+    use crate::domain::{SearchArgs, SearchKind};
 
     fn repo_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1582,12 +1789,14 @@ mod tests {
         let projects = store
             .list_projects(&ProjectListFilter::default())
             .expect("list projects");
-        assert_eq!(projects.len(), 1, "want 1 project, got {}", projects.len());
-        assert_eq!(projects[0].slug, "dossier");
-        assert!(
-            projects[0].description.is_empty(),
-            "list_projects returned a body — should be metadata only"
-        );
+        assert!(projects.iter().any(|p| p.slug == "dossier"));
+        for p in &projects {
+            assert!(
+                p.description.is_empty(),
+                "list_projects returned a body for {} — should be metadata only",
+                p.slug
+            );
+        }
 
         let p = store.get_project("dossier").expect("get project");
         assert!(
@@ -2082,10 +2291,7 @@ mod tests {
         let err = store
             .find_task_path(&task.id)
             .expect_err("duplicate task id must be rejected");
-        assert!(
-            err.to_string().contains("duplicate task id"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("duplicate task id"), "got: {err}");
     }
 
     #[test]
@@ -3839,5 +4045,332 @@ mod tests {
                 TaskStatus::Claimed | TaskStatus::InProgress
             ));
         }
+    }
+
+    // ----- search (corpus-wide ranked substring) -----
+
+    #[test]
+    fn dogfood_search_smoke_against_real_corpus() {
+        // Smoke test: exercise the real on-disk shape end-to-end without
+        // pinning specific slugs or content strings. Anything more specific
+        // would couple test pass/fail to corpus-rename PRs that have nothing
+        // to do with the search verb. Spec acceptance for filters, kinds,
+        // empty-query, and nonexistent-query lives in
+        // search_filters_in_temp_corpus, which uses a synthetic fixture
+        // we fully control.
+        let store = FsStore::open(repo_root()).expect("open corpus");
+
+        // "dossier" appears in the own-project name itself, so any future
+        // PM rename of unrelated content won't break this.
+        let hits = store
+            .search(&SearchArgs {
+                query: "dossier".to_owned(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!hits.is_empty(), "expected at least one 'dossier' hit");
+
+        let none = store
+            .search(&SearchArgs {
+                query: "DEFINITELY-NOT-IN-CORPUS-XYZ-9999".to_owned(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(none.is_empty());
+
+        assert!(store
+            .search(&SearchArgs {
+                query: String::new(),
+                ..Default::default()
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn search_filters_in_temp_corpus() {
+        let (_tmp, store) = fresh_corpus();
+        // Two projects, both indexed against the same needle to verify
+        // narrowing by project and by kind.
+        store
+            .create_project(NewProject {
+                slug: "alpha".to_owned(),
+                title: "alpha needle project".to_owned(),
+                description: "needle".to_owned(),
+                actor: "t".to_owned(),
+            })
+            .unwrap();
+        store
+            .create_project(NewProject {
+                slug: "beta".to_owned(),
+                title: "beta needle project".to_owned(),
+                description: "needle".to_owned(),
+                actor: "t".to_owned(),
+            })
+            .unwrap();
+        store
+            .add_phase(NewPhase {
+                project: "alpha".to_owned(),
+                slug: "ph".to_owned(),
+                title: "phase has needle".to_owned(),
+                body: String::new(),
+                after_phase: None,
+                actor: "t".to_owned(),
+            })
+            .unwrap();
+        store
+            .create_task(NewTask {
+                project: "alpha".to_owned(),
+                phase: None,
+                slug: "ta".to_owned(),
+                title: "task has needle".to_owned(),
+                body: String::new(),
+                actor: "t".to_owned(),
+            })
+            .unwrap();
+        store
+            .create_task(NewTask {
+                project: "beta".to_owned(),
+                phase: None,
+                slug: "tb".to_owned(),
+                title: "task has needle".to_owned(),
+                body: String::new(),
+                actor: "t".to_owned(),
+            })
+            .unwrap();
+
+        // Unscoped: cross-project + cross-kind hits.
+        let all = store
+            .search(&SearchArgs {
+                query: "needle".to_owned(),
+                ..Default::default()
+            })
+            .unwrap();
+        let projects: std::collections::HashSet<_> =
+            all.iter().map(|h| h.project.clone()).collect();
+        assert_eq!(projects.len(), 2);
+
+        // kinds filter narrows to Task only.
+        let tasks = store
+            .search(&SearchArgs {
+                query: "needle".to_owned(),
+                kinds: Some(vec![SearchKind::Task]),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!tasks.is_empty());
+        assert!(tasks.iter().all(|h| h.kind == SearchKind::Task));
+
+        // project filter narrows to one project across kinds.
+        let alpha_only = store
+            .search(&SearchArgs {
+                query: "needle".to_owned(),
+                project: Some("alpha".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!alpha_only.is_empty());
+        assert!(alpha_only.iter().all(|h| h.project == "alpha"));
+
+        // Filter composition: project + kinds.
+        let alpha_tasks = store
+            .search(&SearchArgs {
+                query: "needle".to_owned(),
+                project: Some("alpha".to_owned()),
+                kinds: Some(vec![SearchKind::Task]),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!alpha_tasks.is_empty());
+        assert!(alpha_tasks
+            .iter()
+            .all(|h| h.project == "alpha" && h.kind == SearchKind::Task));
+    }
+
+    #[test]
+    fn search_title_and_body_hits_in_temp_corpus() {
+        let (_tmp, store) = fresh_corpus();
+        store
+            .create_project(NewProject {
+                slug: "p1".to_owned(),
+                title: "TITLEKEY-alpha project".to_owned(),
+                description: "minimal".to_owned(),
+                actor: "t".to_owned(),
+            })
+            .unwrap();
+        store
+            .add_phase(NewPhase {
+                project: "p1".to_owned(),
+                slug: "ph1".to_owned(),
+                title: "TITLEKEY-beta phase".to_owned(),
+                body: "body has BODYKEY-gamma token".to_owned(),
+                after_phase: None,
+                actor: "t".to_owned(),
+            })
+            .unwrap();
+        store
+            .create_task(NewTask {
+                project: "p1".to_owned(),
+                phase: Some("ph1".to_owned()),
+                slug: "tsk".to_owned(),
+                title: "TITLEKEY-delta task".to_owned(),
+                body: "BODYKEY-epsilon in spec".to_owned(),
+                actor: "t".to_owned(),
+            })
+            .unwrap();
+
+        let t_alpha = store
+            .search(&SearchArgs {
+                query: "titlekey-alpha".to_owned(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(t_alpha.len(), 1);
+        assert_eq!(t_alpha[0].kind, SearchKind::Project);
+
+        let t_beta = store
+            .search(&SearchArgs {
+                query: "titlekey-beta".to_owned(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(t_beta.len(), 1);
+        assert_eq!(t_beta[0].kind, SearchKind::Phase);
+
+        let t_gamma = store
+            .search(&SearchArgs {
+                query: "bodykey-gamma".to_owned(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(t_gamma.len(), 1);
+        assert_eq!(t_gamma[0].kind, SearchKind::Phase);
+
+        let t_delta = store
+            .search(&SearchArgs {
+                query: "titlekey-delta".to_owned(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(t_delta.len(), 1);
+        assert_eq!(t_delta[0].kind, SearchKind::Task);
+
+        let t_eps = store
+            .search(&SearchArgs {
+                query: "bodykey-epsilon".to_owned(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(t_eps.len(), 1);
+        assert_eq!(t_eps[0].kind, SearchKind::Task);
+
+        let uni = store
+            .search(&SearchArgs {
+                query: "KEY-".to_owned(),
+                ..Default::default()
+            })
+            .unwrap();
+        let kinds: std::collections::HashSet<_> = uni.iter().map(|h| h.kind).collect();
+        assert_eq!(kinds.len(), 3);
+    }
+
+    #[test]
+    fn search_ranks_higher_score_before_lower() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let a = seed_task(&store, "alpha", "one-match");
+        let b = seed_task(&store, "alpha", "triple");
+        set_task_body(&store, &a.id, "needleonce");
+        set_task_body(&store, &b.id, "needleneedleneedle");
+        let hits = store
+            .search(&SearchArgs {
+                query: "needle".to_owned(),
+                project: Some("alpha".to_owned()),
+                kinds: Some(vec![SearchKind::Task]),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].slug, "triple");
+        assert_eq!(hits[0].score as i64, 3);
+        assert_eq!(hits[1].score as i64, 1);
+    }
+
+    #[test]
+    fn search_tiebreaks_by_updated_at_desc() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let a = seed_task(&store, "alpha", "oldhit");
+        let b = seed_task(&store, "alpha", "newhit");
+        set_task_body(&store, &a.id, "sameneedle");
+        set_task_body(&store, &b.id, "sameneedle");
+        set_task_field(&store, &a.id, "updated_at", "2026-01-01T00:00:00Z");
+        set_task_field(&store, &b.id, "updated_at", "2026-06-01T00:00:00Z");
+        let hits = store
+            .search(&SearchArgs {
+                query: "sameneedle".to_owned(),
+                project: Some("alpha".to_owned()),
+                kinds: Some(vec![SearchKind::Task]),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].slug, "newhit");
+        assert_eq!(hits[1].slug, "oldhit");
+    }
+
+    #[test]
+    fn search_limit_after_sort() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        for i in 0..5 {
+            let slug = format!("t{i}");
+            let task = seed_task(&store, "alpha", &slug);
+            set_task_body(&store, &task.id, &format!("{} needle", "x".repeat(i + 1)));
+            set_task_field(
+                &store,
+                &task.id,
+                "updated_at",
+                &format!("2026-05-{:02}T00:00:00Z", 10 + i),
+            );
+        }
+        let hits = store
+            .search(&SearchArgs {
+                query: "needle".to_owned(),
+                project: Some("alpha".to_owned()),
+                kinds: Some(vec![SearchKind::Task]),
+                limit: Some(2),
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].slug, "t4");
+        assert_eq!(hits[1].slug, "t3");
+    }
+
+    #[test]
+    fn search_notes_section_not_indexed() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let task = seed_task(&store, "alpha", "n");
+        set_task_body(&store, &task.id, "spec has no secret");
+        store
+            .update_task(UpdateTask {
+                id: task.id,
+                body: None,
+                status: None,
+                note: Some("note about zzzuniquezzz term".to_owned()),
+                actor: "t".to_owned(),
+            })
+            .unwrap();
+        let hits = store
+            .search(&SearchArgs {
+                query: "zzzuniquezzz".to_owned(),
+                project: Some("alpha".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            hits.is_empty(),
+            "notes must not be searchable, got {hits:?}"
+        );
     }
 }
