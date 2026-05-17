@@ -52,7 +52,10 @@ impl FsStore {
     /// project in the corpus, sorted by `created_at` ASC. Description
     /// bodies are loaded only when needed (a `body_contains` predicate
     /// is set or `created_by` provenance is referenced); the default
-    /// path stays as cheap as the pre-filter version.
+    /// path stays as cheap as the pre-filter version. Description
+    /// fields are always blanked before return so the response shape
+    /// is uniform regardless of which filters fired — `body_contains`
+    /// matches against the full body first, then the field is dropped.
     pub fn list_projects(&self, filter: &ProjectListFilter) -> Result<Vec<Project>> {
         let dir = self.root.join("projects");
         if !dir.exists() {
@@ -75,6 +78,9 @@ impl FsStore {
         sort_projects(&mut out, filter);
         if let Some(limit) = filter.limit {
             out.truncate(limit);
+        }
+        for p in &mut out {
+            p.description.clear();
         }
         Ok(out)
     }
@@ -119,21 +125,24 @@ impl FsStore {
     /// Default sort is `created_at` ASC; an explicit `order_by` on a
     /// nullable field drops rows where that field is null.
     pub fn list_tasks(&self, filter: &TaskListFilter) -> Result<Vec<Task>> {
-        // Resolve `filter.phase` (a slug) into a phase id per project so
-        // task-row equality on `phase` (which stores the id) lines up
-        // with what the caller meant.
-        let phase_id_per_project: Option<std::collections::HashMap<String, String>> =
-            match (&filter.project, &filter.phase) {
-                (Some(project_slug), Some(phase_slug)) => {
-                    let phases = self.load_phases_for(project_slug)?;
-                    let mut map = std::collections::HashMap::new();
-                    if let Some(p) = phases.iter().find(|p| &p.slug == phase_slug) {
-                        map.insert(project_slug.clone(), p.id.clone());
-                    }
-                    Some(map)
-                }
-                _ => None,
-            };
+        // Resolve `filter.phase` (a slug) into a phase id so task-row
+        // equality on `phase` (which stores the id) lines up with what
+        // the caller meant. An unresolvable slug is a typed error — not
+        // a silent "no matches" — so a caller with a typo learns about
+        // it instead of getting an empty result that looks correct.
+        let resolved_phase_id: Option<String> = match (&filter.project, &filter.phase) {
+            (Some(project_slug), Some(phase_slug)) => {
+                let phases = self.load_phases_for(project_slug)?;
+                let phase = phases
+                    .iter()
+                    .find(|p| &p.slug == phase_slug)
+                    .ok_or_else(|| {
+                        anyhow!("phase not found: {phase_slug} in project {project_slug}")
+                    })?;
+                Some(phase.id.clone())
+            }
+            _ => None,
+        };
 
         let mut out = if let Some(slug) = &filter.project {
             self.load_tasks_for(slug)?
@@ -145,11 +154,7 @@ impl FsStore {
             all
         };
 
-        let phase_id = phase_id_per_project
-            .as_ref()
-            .and_then(|m| filter.project.as_ref().and_then(|s| m.get(s)).cloned());
-
-        out.retain(|t| task_matches(t, filter, phase_id.as_deref()));
+        out.retain(|t| task_matches(t, filter, resolved_phase_id.as_deref()));
         sort_tasks(&mut out, filter);
         if let Some(limit) = filter.limit {
             out.truncate(limit);
@@ -3528,6 +3533,39 @@ mod tests {
         assert_ne!(hits[0].phase, build.id);
     }
 
+    #[test]
+    fn list_tasks_filter_by_phase_unknown_slug_errors() {
+        // A typo in the phase slug must surface as a typed error rather
+        // than silently returning every task in the project — the LLM
+        // needs to know its slug was wrong.
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        add_phase_simple(&store, "alpha", "spec");
+        store
+            .create_task(NewTask {
+                project: "alpha".to_owned(),
+                phase: Some("spec".to_owned()),
+                slug: "draft-spec".to_owned(),
+                title: "Draft spec".to_owned(),
+                body: String::new(),
+                actor: "human:test".to_owned(),
+            })
+            .unwrap();
+
+        let err = store
+            .list_tasks(&TaskListFilter {
+                project: Some("alpha".to_owned()),
+                phase: Some("typo-slug".to_owned()),
+                ..Default::default()
+            })
+            .expect_err("unknown phase slug must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("phase not found") && msg.contains("typo-slug"),
+            "expected 'phase not found' + slug; got: {msg}"
+        );
+    }
+
     // ----- phase.list per-predicate + combo -----
 
     #[test]
@@ -3639,6 +3677,12 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].slug, "alpha");
+        // Even though `body_contains` had to load descriptions to
+        // match, the response shape stays metadata-only.
+        assert!(
+            hits[0].description.is_empty(),
+            "list_projects must blank descriptions even when body_contains is set"
+        );
 
         let paused = store
             .list_projects(&ProjectListFilter {

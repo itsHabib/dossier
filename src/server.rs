@@ -74,7 +74,8 @@ pub struct ProjectView {
 #[derive(Deserialize, JsonSchema, Default)]
 pub struct ProjectListArgs {
     /// if set, only projects whose status is in this list
-    /// (`planning` | `active` | `paused` | `done` | `abandoned`)
+    /// (`planning` | `active` | `paused` | `done` | `abandoned`).
+    /// An empty list is treated as no filter — omit the field instead.
     #[serde(default)]
     pub status: Option<Vec<ProjectStatus>>,
     /// case-insensitive literal substring matched against the project's
@@ -112,7 +113,8 @@ pub struct PhaseListArgs {
     #[serde(default)]
     pub project: Option<String>,
     /// if set, only phases whose status is in this list
-    /// (`pending` | `active` | `done` | `skipped`)
+    /// (`pending` | `active` | `done` | `skipped`).
+    /// An empty list is treated as no filter — omit the field instead.
     #[serde(default)]
     pub status: Option<Vec<PhaseStatus>>,
     /// case-insensitive literal substring matched against the phase body
@@ -161,13 +163,15 @@ pub struct TaskListArgs {
     #[serde(default)]
     pub phase: Option<String>,
     /// if set, only tasks whose status is in this list
-    /// (`todo` | `claimed` | `in_progress` | `blocked` | `done` | `cancelled`)
+    /// (`todo` | `claimed` | `in_progress` | `blocked` | `done` | `cancelled`).
+    /// An empty list is treated as no filter — omit the field instead.
     #[serde(default)]
     pub status: Option<Vec<TaskStatus>>,
     /// exact match against the task's `assignee` frontmatter field
     #[serde(default)]
     pub assignee: Option<String>,
-    /// case-insensitive literal substring matched against the task body
+    /// case-insensitive literal substring matched against the task spec
+    /// body only — the appended `## Notes` section is not searched
     #[serde(default)]
     pub body_contains: Option<String>,
     /// RFC 3339 timestamp; matches rows with `created_at >= this`
@@ -797,18 +801,35 @@ mod tests {
 
     #[test]
     fn task_list_accepts_phase_with_project() {
+        // Confirms the server-layer "phase requires project" guard passes
+        // the call through to the store when both are present. The store
+        // surfaces an unresolvable phase slug as a typed error (rather
+        // than silently returning every task), which is what we expect
+        // here — the project doesn't exist, so neither does the phase.
         let (_tmp, svc) = fresh_service();
         let args = TaskListArgs {
             project: Some("nonexistent".to_owned()),
             phase: Some("spec".to_owned()),
             ..Default::default()
         };
-        // Project doesn't exist → empty result (the corpus is empty).
-        let out = match svc.task_list(Parameters(args)) {
-            Ok(Json(out)) => out,
-            Err(err) => panic!("phase+project must be accepted: {}", err.message),
-        };
-        assert!(out.tasks.is_empty());
+        match svc.task_list(Parameters(args)) {
+            Err(err) => {
+                assert!(
+                    !err.message.contains("phase requires project"),
+                    "server-layer validation should not reject phase+project; got: {}",
+                    err.message
+                );
+                assert!(
+                    err.message.contains("phase not found"),
+                    "store should report the unresolvable slug; got: {}",
+                    err.message
+                );
+            }
+            Ok(Json(out)) => panic!(
+                "expected typed error for unresolvable slug, got {} tasks",
+                out.tasks.len()
+            ),
+        }
     }
 
     #[test]
