@@ -18,7 +18,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::{
     Artifact, Phase, PhaseListFilter, PhaseOrderField, PhaseStatus, Project, ProjectListFilter,
-    ProjectOrderField, ProjectStatus, Task, TaskListFilter, TaskOrderField, TaskStatus,
+    ProjectOrderField, ProjectStatus, SearchArgs, SearchHit, Task, TaskListFilter, TaskOrderField,
+    TaskStatus,
 };
 use crate::store::{
     ClaimTask, CompleteTask, FsStore, LinkArtifact, NewPhase, NewProject, NewTask, UpdatePhase,
@@ -218,6 +219,11 @@ pub struct TaskListArgs {
 #[derive(Serialize, JsonSchema)]
 pub struct TaskListResult {
     pub tasks: Vec<Task>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct SearchResult {
+    pub hits: Vec<SearchHit>,
 }
 
 impl From<ProjectListArgs> for ProjectListFilter {
@@ -752,6 +758,24 @@ impl MeshService {
             .collect();
         Ok(Json(ArtifactListResult { artifacts }))
     }
+
+    #[tool(
+        name = "search",
+        description = "Unified case-insensitive literal substring search across project titles + description bodies, phase titles + bodies, and task titles + spec bodies (not notes, assignee, or other frontmatter). One call returns a single ranked list so the model can pick rows to open — use this instead of three `body_contains` list round-trips when you don't already know the primitive kind. Each hit includes `score` overlapping literal match count in title+newline+body (higher is stronger), `snippet` (~80 characters centered on the first match, no markdown awareness), and rows are ordered by `score` descending then `updated_at` descending; `limit` (default 50) applies after sorting. `kinds` filters to one or more of `project` | `phase` | `task` (default: all). `project` restricts to one project slug; omit or null for the whole corpus. Empty `query` is rejected; no matches returns an empty list. Prefer list verbs with `body_contains` when you already know you're only looking for tasks (or phases, projects)."
+    )]
+    fn search(
+        &self,
+        Parameters(args): Parameters<SearchArgs>,
+    ) -> Result<Json<SearchResult>, ErrorData> {
+        if args.query.trim().is_empty() {
+            return Err(ErrorData::invalid_params(
+                "query must be a non-empty literal substring",
+                None,
+            ));
+        }
+        let hits = self.store.search(&args).map_err(internal)?;
+        Ok(Json(SearchResult { hits }))
+    }
 }
 
 /// Map an internal error to an MCP `ErrorData`. Generic over `ToString`
@@ -773,6 +797,7 @@ mod tests {
     )]
 
     use super::*;
+    use crate::domain::SearchArgs;
 
     fn fresh_service() -> (tempfile::TempDir, MeshService) {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -934,6 +959,33 @@ mod tests {
             Err(e) => panic!("explicit null project must deserialize: {e}"),
         };
         assert!(args.project.is_none());
+    }
+
+    #[test]
+    fn search_rejects_whitespace_only_query() {
+        let (_tmp, svc) = fresh_service();
+        let args = SearchArgs {
+            query: "   ".to_owned(),
+            ..Default::default()
+        };
+        match svc.search(Parameters(args)) {
+            Err(e) => assert!(
+                e.message.to_lowercase().contains("query")
+                    || e.message.contains("non-empty"),
+                "{}",
+                e.message
+            ),
+            Ok(_) => panic!("whitespace-only query must be rejected"),
+        }
+    }
+
+    #[test]
+    fn search_args_rejects_bad_kind() {
+        let raw = r#"{"query":"x", "kinds": ["wat"]}"#;
+        assert!(
+            serde_json::from_str::<SearchArgs>(raw).is_err(),
+            "unknown kind must fail deserialization"
+        );
     }
 
     #[test]

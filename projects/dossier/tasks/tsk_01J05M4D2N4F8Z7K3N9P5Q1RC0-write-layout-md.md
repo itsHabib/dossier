@@ -16,7 +16,8 @@ updated_at: 2026-05-10T00:00:00Z
 
 Define the on-disk markdown convention. Tree shape, frontmatter schemas
 per primitive, append-only artifacts, concurrency assumptions, what does
-not live on disk (caches, indexes), migration story.
+not live on disk (caches, indexes), migration story. Explicitly defer
+multi-tenant **auth** to the protocol layer.
 
 ## Notes
 
