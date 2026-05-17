@@ -903,6 +903,7 @@ impl FsStore {
         }
         let entries = fs::read_dir(&projects_dir)
             .with_context(|| format!("read {}", projects_dir.display()))?;
+        let mut found: Option<(String, PathBuf)> = None;
         for entry in entries {
             let entry = entry?;
             if !entry.file_type()?.is_dir() {
@@ -927,12 +928,18 @@ impl FsStore {
                     .unwrap_or_default();
                 if let Some((id, _slug)) = stem.split_once('-') {
                     if id == task_id {
-                        return Ok((project_slug, path));
+                        if found.is_some() {
+                            bail!("duplicate task id: {task_id}");
+                        }
+                        found = Some((project_slug.clone(), path));
                     }
                 }
             }
         }
-        bail!("task not found: {task_id}")
+        match found {
+            Some(pair) => Ok(pair),
+            None => bail!("task not found: {task_id}"),
+        }
     }
 }
 
@@ -2059,6 +2066,26 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, task.id);
         assert!(listed[0].body.contains("spec body"));
+    }
+
+    #[test]
+    fn find_task_path_bails_on_duplicate_id_across_projects() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        seed_project(&store, "beta");
+        let task = seed_task(&store, "alpha", "original");
+        let (_proj, alpha_path) = store.find_task_path(&task.id).unwrap();
+        let beta_tasks = store.root().join("projects").join("beta").join("tasks");
+        fs::create_dir_all(&beta_tasks).unwrap();
+        let dup_path = beta_tasks.join(format!("{}-mirror.md", task.id));
+        fs::copy(&alpha_path, &dup_path).unwrap();
+        let err = store
+            .find_task_path(&task.id)
+            .expect_err("duplicate task id must be rejected");
+        assert!(
+            err.to_string().contains("duplicate task id"),
+            "got: {err}"
+        );
     }
 
     #[test]
