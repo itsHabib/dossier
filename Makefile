@@ -31,5 +31,10 @@ mutants:
 	cargo mutants --no-shuffle
 
 # Mutate only files changed vs main. PR-triage variant.
+# Uses a temp file (not bash process substitution) so this works under
+# /bin/sh aka dash on Ubuntu CI runners.
 mutants-quick:
-	cargo mutants --in-diff <(git diff main..HEAD)
+	mkdir -p target
+	git diff main..HEAD > target/.mutants-diff
+	cargo mutants --in-diff target/.mutants-diff
+	rm -f target/.mutants-diff
