@@ -1,0 +1,6 @@
+# Mutate production source only.
+examine_globs = ["src/**/*.rs"]
+exclude_globs = ["src/bin/**", "tests/**"]
+
+# Standard cargo test driver; default config is fine for v0.
+test_tool = "cargo"
