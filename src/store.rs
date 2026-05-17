@@ -168,6 +168,10 @@ impl FsStore {
     /// (excluding `## Notes`). Results are ranked by match count
     /// (`score`) descending, then `updated_at` descending, then truncated
     /// to `limit` (default 50).
+    // `too_many_lines`: single corpus walk; splitting adds indirection
+    // without clarity benefit on a structurally linear function.
+    // `cast_precision_loss`: `score` is a match count; f64 precision is
+    // only lost past 2^53 matches, which is unreachable in practice.
     #[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
     pub fn search(&self, args: &SearchArgs) -> Result<Vec<SearchHit>> {
         const SNIPPET_CHARS: usize = 80;
@@ -187,9 +191,17 @@ impl FsStore {
         let want_phase = kinds.contains(&SearchKind::Phase);
         let want_task = kinds.contains(&SearchKind::Task);
 
+        // Empty-string `project` is a caller bug (form default, etc.),
+        // not a "search everywhere" request. Per spec contract,
+        // corpus-wide search is opt-in by omitting / `null`-ing
+        // `project`, not by passing `""`. Reject explicitly so a
+        // misconfigured caller doesn't silently broaden scope.
         let project_slugs: Vec<String> = match &args.project {
-            Some(s) if !s.is_empty() => vec![s.clone()],
-            _ => self.project_slugs()?,
+            Some(s) if s.is_empty() => bail!(
+                "search: project filter must be non-empty (omit `project` field for corpus-wide search)"
+            ),
+            Some(s) => vec![s.clone()],
+            None => self.project_slugs()?,
         };
 
         let mut ranked: Vec<(SearchHit, DateTime<Utc>)> = Vec::new();
@@ -1570,7 +1582,14 @@ fn count_ci_overlapping(haystack: &str, needle: &str) -> usize {
     let mut s = 0usize;
     while let Some(i) = h[s..].find(&n) {
         count += 1;
-        s += i + 1;
+        // Advance by one CHAR width, not one byte. `find` returns a
+        // byte offset; for multi-byte UTF-8 chars (accented letters,
+        // CJK, emoji), advancing by `i + 1` can land mid-codepoint and
+        // panic on the next slice. Stepping by `len_utf8()` of the
+        // first char at the match keeps the index on a char boundary
+        // while still allowing overlapping matches.
+        let first_char_len = h[s + i..].chars().next().map_or(1, |c| c.len_utf8());
+        s += i + first_char_len;
     }
     count
 }
