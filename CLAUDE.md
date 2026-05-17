@@ -142,6 +142,16 @@ make release      # release build
 `make check` is the single command CI runs and the one to run before you
 push. Same matrix locally and in CI so failures reproduce. CI: `.github/workflows/ci.yml`.
 
+### Testing techniques
+
+Property tests (proptest) live in `tests/proptest_*.rs` and run as part of
+`cargo test`. Default 256 cases; override with `PROPTEST_CASES=N` for thorough
+audits.
+
+Mutation testing (cargo-mutants) is opt-in via `make mutants` or `make
+mutants-quick`. Not gated in CI — used as an audit tool to find blind spots
+in the test suite, not a regression gate.
+
 ### Toolchain
 
 - Rust stable, currently 1.95+, via rustup.

@@ -1,4 +1,4 @@
-.PHONY: check fmt fmt-check lint test build release clean
+.PHONY: check fmt fmt-check lint test build release clean mutants mutants-quick
 
 # `make check` is the single command CI runs and you run before commit.
 # Same matrix locally and in CI so failures are reproducible.
@@ -24,3 +24,12 @@ release:
 
 clean:
 	cargo clean
+
+# Full mutation audit. Slow (~30-60 min on this size repo).
+# Requires: cargo install cargo-mutants
+mutants:
+	cargo mutants --no-shuffle
+
+# Mutate only files changed vs main. PR-triage variant.
+mutants-quick:
+	cargo mutants --in-diff <(git diff main..HEAD)

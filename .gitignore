@@ -1,4 +1,5 @@
 /target/
+mutants.out/
 .dossier/cache/
 .idea/
 .vscode/
