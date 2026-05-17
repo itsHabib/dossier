@@ -112,3 +112,129 @@ pub struct Artifact {
     pub linked_at: DateTime<Utc>,
     pub actor: String,
 }
+
+/// Predicate set for `FsStore::list_tasks`. Every field is optional; an
+/// empty filter returns every task. Predicates AND-together.
+///
+/// `project = None` walks the whole corpus; `phase` requires `project`.
+/// `status` is a list (OR-of-statuses). `body_contains` is a
+/// case-insensitive literal substring against `Task.body`. The four
+/// date-range pairs operate on the matching frontmatter timestamp;
+/// `_after` is inclusive of equal, `_before` is strictly less than.
+/// `order_by` defaults to `created_at` ASC; sorting by a nullable field
+/// (`completed_at`, `claimed_at`) implicitly drops rows where the field
+/// is null.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct TaskListFilter {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<Vec<TaskStatus>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignee: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_contains: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_after: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_before: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_after: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_before: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_after: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_before: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_after: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_before: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_by: Option<TaskOrderField>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desc: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+/// Sort key for `TaskListFilter.order_by`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskOrderField {
+    CreatedAt,
+    UpdatedAt,
+    CompletedAt,
+    ClaimedAt,
+}
+
+/// Predicate set for `FsStore::list_phases`. `project = None` walks the
+/// whole corpus. `order_by` defaults to `order` ASC, matching the
+/// linear-position semantics of phases on disk.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct PhaseListFilter {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<Vec<PhaseStatus>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_contains: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_after: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_before: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_after: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_before: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_by: Option<PhaseOrderField>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desc: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+/// Sort key for `PhaseListFilter.order_by`. `Order` references the
+/// `order` frontmatter field — linear position within a project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PhaseOrderField {
+    CreatedAt,
+    UpdatedAt,
+    Order,
+}
+
+/// Predicate set for `FsStore::list_projects`. Always corpus-scoped —
+/// no parent to nullify. Default sort is `created_at` ASC.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ProjectListFilter {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<Vec<ProjectStatus>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_contains: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_after: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_before: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_after: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_before: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_by: Option<ProjectOrderField>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desc: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+/// Sort key for `ProjectListFilter.order_by`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectOrderField {
+    CreatedAt,
+    UpdatedAt,
+}

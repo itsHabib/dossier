@@ -15,7 +15,10 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use ulid::Ulid;
 
-use crate::domain::{Artifact, Phase, PhaseStatus, Project, ProjectStatus, Task, TaskStatus};
+use crate::domain::{
+    Artifact, Phase, PhaseListFilter, PhaseOrderField, PhaseStatus, Project, ProjectListFilter,
+    ProjectOrderField, ProjectStatus, Task, TaskListFilter, TaskOrderField, TaskStatus,
+};
 
 #[derive(Debug)]
 pub struct FsStore {
@@ -43,9 +46,120 @@ impl FsStore {
         &self.root
     }
 
-    /// List every project, sorted by slug. Description bodies are not
-    /// loaded — call `get_project` for the full record.
-    pub fn list_projects(&self) -> Result<Vec<Project>> {
+    /// List projects subject to a predicate filter.
+    ///
+    /// An empty filter (`ProjectListFilter::default()`) returns every
+    /// project in the corpus, sorted by `created_at` ASC. Description
+    /// bodies are loaded only when needed (a `body_contains` predicate
+    /// is set or `created_by` provenance is referenced); the default
+    /// path stays as cheap as the pre-filter version.
+    pub fn list_projects(&self, filter: &ProjectListFilter) -> Result<Vec<Project>> {
+        let dir = self.root.join("projects");
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let needs_body = filter.body_contains.is_some();
+        let mut out = Vec::new();
+        for entry in fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let slug = entry.file_name().to_string_lossy().into_owned();
+            let proj = self
+                .load_project(&slug, needs_body)
+                .with_context(|| format!("load project {slug}"))?;
+            out.push(proj);
+        }
+        out.retain(|p| project_matches(p, filter));
+        sort_projects(&mut out, filter);
+        if let Some(limit) = filter.limit {
+            out.truncate(limit);
+        }
+        Ok(out)
+    }
+
+    /// Get one project by slug, including the description body.
+    pub fn get_project(&self, slug: &str) -> Result<Project> {
+        self.load_project(slug, true)
+    }
+
+    /// List phases subject to a predicate filter.
+    ///
+    /// When `filter.project` is `Some`, scans only that project; when
+    /// `None`, walks every project in the corpus. Default sort is
+    /// `order` ASC for a single-project listing and (`project_id`,
+    /// `order`) ASC across projects, so cross-project results stay
+    /// readable. An explicit `order_by` overrides the default.
+    pub fn list_phases(&self, filter: &PhaseListFilter) -> Result<Vec<Phase>> {
+        let mut out = if let Some(slug) = &filter.project {
+            self.load_phases_for(slug)?
+        } else {
+            let mut all = Vec::new();
+            for slug in self.project_slugs()? {
+                all.extend(self.load_phases_for(&slug)?);
+            }
+            all
+        };
+        out.retain(|p| phase_matches(p, filter));
+        sort_phases(&mut out, filter);
+        if let Some(limit) = filter.limit {
+            out.truncate(limit);
+        }
+        Ok(out)
+    }
+
+    /// List tasks subject to a predicate filter.
+    ///
+    /// When `filter.project` is `Some`, scans only that project; when
+    /// `None`, walks every project in the corpus. `filter.phase` is
+    /// matched against the task's phase **slug** for ergonomics — the
+    /// internal `Task.phase` field stores the phase id, so the matcher
+    /// resolves the slug to an id once per project before filtering.
+    /// Default sort is `created_at` ASC; an explicit `order_by` on a
+    /// nullable field drops rows where that field is null.
+    pub fn list_tasks(&self, filter: &TaskListFilter) -> Result<Vec<Task>> {
+        // Resolve `filter.phase` (a slug) into a phase id per project so
+        // task-row equality on `phase` (which stores the id) lines up
+        // with what the caller meant.
+        let phase_id_per_project: Option<std::collections::HashMap<String, String>> =
+            match (&filter.project, &filter.phase) {
+                (Some(project_slug), Some(phase_slug)) => {
+                    let phases = self.load_phases_for(project_slug)?;
+                    let mut map = std::collections::HashMap::new();
+                    if let Some(p) = phases.iter().find(|p| &p.slug == phase_slug) {
+                        map.insert(project_slug.clone(), p.id.clone());
+                    }
+                    Some(map)
+                }
+                _ => None,
+            };
+
+        let mut out = if let Some(slug) = &filter.project {
+            self.load_tasks_for(slug)?
+        } else {
+            let mut all = Vec::new();
+            for slug in self.project_slugs()? {
+                all.extend(self.load_tasks_for(&slug)?);
+            }
+            all
+        };
+
+        let phase_id = phase_id_per_project
+            .as_ref()
+            .and_then(|m| filter.project.as_ref().and_then(|s| m.get(s)).cloned());
+
+        out.retain(|t| task_matches(t, filter, phase_id.as_deref()));
+        sort_tasks(&mut out, filter);
+        if let Some(limit) = filter.limit {
+            out.truncate(limit);
+        }
+        Ok(out)
+    }
+
+    /// Slugs of every project directory under `projects/`, sorted for
+    /// determinism. Used by the cross-project list paths.
+    fn project_slugs(&self) -> Result<Vec<String>> {
         let dir = self.root.join("projects");
         if !dir.exists() {
             return Ok(Vec::new());
@@ -56,23 +170,15 @@ impl FsStore {
             if !entry.file_type()?.is_dir() {
                 continue;
             }
-            let slug = entry.file_name().to_string_lossy().into_owned();
-            let proj = self
-                .load_project(&slug, false)
-                .with_context(|| format!("load project {slug}"))?;
-            out.push(proj);
+            out.push(entry.file_name().to_string_lossy().into_owned());
         }
-        out.sort_by(|a, b| a.slug.cmp(&b.slug));
+        out.sort();
         Ok(out)
     }
 
-    /// Get one project by slug, including the description body.
-    pub fn get_project(&self, slug: &str) -> Result<Project> {
-        self.load_project(slug, true)
-    }
-
-    /// Phases of a project, ordered by their `order` field.
-    pub fn list_phases(&self, project_slug: &str) -> Result<Vec<Phase>> {
+    /// Phases of a single project, unfiltered. Internal helper for both
+    /// the single-project and cross-project list paths.
+    fn load_phases_for(&self, project_slug: &str) -> Result<Vec<Phase>> {
         let dir = self.root.join("projects").join(project_slug).join("phases");
         if !dir.exists() {
             return Ok(Vec::new());
@@ -91,12 +197,12 @@ impl FsStore {
                 load_phase(&path).with_context(|| format!("load phase {}", path.display()))?;
             out.push(phase);
         }
-        out.sort_by_key(|p| p.order);
         Ok(out)
     }
 
-    /// Tasks of a project, ordered by creation time.
-    pub fn list_tasks(&self, project_slug: &str) -> Result<Vec<Task>> {
+    /// Tasks of a single project, unfiltered. Internal helper for both
+    /// the single-project and cross-project list paths.
+    fn load_tasks_for(&self, project_slug: &str) -> Result<Vec<Task>> {
         let dir = self.root.join("projects").join(project_slug).join("tasks");
         if !dir.exists() {
             return Ok(Vec::new());
@@ -114,7 +220,6 @@ impl FsStore {
             let task = load_task(&path).with_context(|| format!("load task {}", path.display()))?;
             out.push(task);
         }
-        out.sort_by_key(|t| t.created_at);
         Ok(out)
     }
 
@@ -464,7 +569,7 @@ impl FsStore {
         }
         let project = self.load_project(&args.project, false)?;
 
-        let mut existing = self.list_phases(&args.project)?;
+        let mut existing = self.load_phases_for(&args.project)?;
         if existing.iter().any(|p| p.slug == args.slug) {
             bail!("phase slug already exists in project: {}", args.slug);
         }
@@ -621,7 +726,7 @@ impl FsStore {
 
         let phase_id = match &args.phase {
             Some(phase_slug) => {
-                let phases = self.list_phases(&args.project)?;
+                let phases = self.load_phases_for(&args.project)?;
                 let phase = phases
                     .iter()
                     .find(|p| &p.slug == phase_slug)
@@ -631,7 +736,7 @@ impl FsStore {
             None => String::new(),
         };
 
-        let existing = self.list_tasks(&args.project)?;
+        let existing = self.load_tasks_for(&args.project)?;
         if existing.iter().any(|t| t.slug == args.slug) {
             bail!("task slug already exists in project: {}", args.slug);
         }
@@ -1268,6 +1373,165 @@ fn serialize_task_file(task: &Task, notes_lines: &[String]) -> Result<String> {
     Ok(out)
 }
 
+// =============================================================================
+// Filter matchers and sorters
+// =============================================================================
+
+/// Case-insensitive literal substring check. Allocates lowercased
+/// copies of both inputs — cheap at v0 corpus sizes, replace with a
+/// streaming check when measurement disagrees.
+fn icontains(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    haystack.to_lowercase().contains(&needle.to_lowercase())
+}
+
+/// `_after` is inclusive (>=), `_before` is strictly less than. Picks
+/// the boundary semantics that match how a caller phrases "since" /
+/// "before" in natural language.
+fn in_range(
+    value: DateTime<Utc>,
+    after: Option<DateTime<Utc>>,
+    before: Option<DateTime<Utc>>,
+) -> bool {
+    if let Some(a) = after {
+        if value < a {
+            return false;
+        }
+    }
+    if let Some(b) = before {
+        if value >= b {
+            return false;
+        }
+    }
+    true
+}
+
+fn project_matches(p: &Project, f: &ProjectListFilter) -> bool {
+    if let Some(statuses) = &f.status {
+        if !statuses.is_empty() && !statuses.contains(&p.status) {
+            return false;
+        }
+    }
+    if let Some(needle) = &f.body_contains {
+        if !icontains(&p.description, needle) {
+            return false;
+        }
+    }
+    in_range(p.created_at, f.created_after, f.created_before)
+        && in_range(p.updated_at, f.updated_after, f.updated_before)
+}
+
+fn sort_projects(out: &mut [Project], f: &ProjectListFilter) {
+    let order = f.order_by.unwrap_or(ProjectOrderField::CreatedAt);
+    out.sort_by(|a, b| match order {
+        ProjectOrderField::CreatedAt => a.created_at.cmp(&b.created_at),
+        ProjectOrderField::UpdatedAt => a.updated_at.cmp(&b.updated_at),
+    });
+    if f.desc.unwrap_or(false) {
+        out.reverse();
+    }
+}
+
+fn phase_matches(p: &Phase, f: &PhaseListFilter) -> bool {
+    if let Some(statuses) = &f.status {
+        if !statuses.is_empty() && !statuses.contains(&p.status) {
+            return false;
+        }
+    }
+    if let Some(needle) = &f.body_contains {
+        if !icontains(&p.body, needle) {
+            return false;
+        }
+    }
+    in_range(p.created_at, f.created_after, f.created_before)
+        && in_range(p.updated_at, f.updated_after, f.updated_before)
+}
+
+fn sort_phases(out: &mut [Phase], f: &PhaseListFilter) {
+    let order = f.order_by.unwrap_or(PhaseOrderField::Order);
+    out.sort_by(|a, b| match order {
+        PhaseOrderField::CreatedAt => a.created_at.cmp(&b.created_at),
+        PhaseOrderField::UpdatedAt => a.updated_at.cmp(&b.updated_at),
+        // Cross-project listings group by project so the linear `order`
+        // sort stays meaningful — phase order is per-project, not global.
+        PhaseOrderField::Order => a.project.cmp(&b.project).then(a.order.cmp(&b.order)),
+    });
+    if f.desc.unwrap_or(false) {
+        out.reverse();
+    }
+}
+
+fn task_matches(t: &Task, f: &TaskListFilter, resolved_phase_id: Option<&str>) -> bool {
+    if let Some(pid) = resolved_phase_id {
+        if t.phase != pid {
+            return false;
+        }
+    }
+    if let Some(statuses) = &f.status {
+        if !statuses.is_empty() && !statuses.contains(&t.status) {
+            return false;
+        }
+    }
+    if let Some(assignee) = &f.assignee {
+        if &t.assignee != assignee {
+            return false;
+        }
+    }
+    if let Some(needle) = &f.body_contains {
+        if !icontains(&t.body, needle) {
+            return false;
+        }
+    }
+    if !in_range(t.created_at, f.created_after, f.created_before) {
+        return false;
+    }
+    if !in_range(t.updated_at, f.updated_after, f.updated_before) {
+        return false;
+    }
+    if f.completed_after.is_some() || f.completed_before.is_some() {
+        let Some(ts) = t.completed_at else {
+            return false;
+        };
+        if !in_range(ts, f.completed_after, f.completed_before) {
+            return false;
+        }
+    }
+    if f.claimed_after.is_some() || f.claimed_before.is_some() {
+        let Some(ts) = t.claimed_at else {
+            return false;
+        };
+        if !in_range(ts, f.claimed_after, f.claimed_before) {
+            return false;
+        }
+    }
+    true
+}
+
+fn sort_tasks(out: &mut Vec<Task>, f: &TaskListFilter) {
+    let order = f.order_by.unwrap_or(TaskOrderField::CreatedAt);
+    // Sort keys on nullable fields (`completed_at`, `claimed_at`)
+    // implicitly drop nulls — sorting by a field you don't have is
+    // almost certainly not what the caller wants. This mirrors the
+    // documented behavior in the spec.
+    match order {
+        TaskOrderField::CreatedAt => out.sort_by_key(|t| t.created_at),
+        TaskOrderField::UpdatedAt => out.sort_by_key(|t| t.updated_at),
+        TaskOrderField::CompletedAt => {
+            out.retain(|t| t.completed_at.is_some());
+            out.sort_by_key(|t| t.completed_at);
+        }
+        TaskOrderField::ClaimedAt => {
+            out.retain(|t| t.claimed_at.is_some());
+            out.sort_by_key(|t| t.claimed_at);
+        }
+    }
+    if f.desc.unwrap_or(false) {
+        out.reverse();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -1285,11 +1549,27 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
     }
 
+    fn task_filter_for(project: &str) -> TaskListFilter {
+        TaskListFilter {
+            project: Some(project.to_owned()),
+            ..Default::default()
+        }
+    }
+
+    fn phase_filter_for(project: &str) -> PhaseListFilter {
+        PhaseListFilter {
+            project: Some(project.to_owned()),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn read_dogfood_corpus() {
         let store = FsStore::open(repo_root()).expect("open corpus");
 
-        let projects = store.list_projects().expect("list projects");
+        let projects = store
+            .list_projects(&ProjectListFilter::default())
+            .expect("list projects");
         assert_eq!(projects.len(), 1, "want 1 project, got {}", projects.len());
         assert_eq!(projects[0].slug, "dossier");
         assert!(
@@ -1304,13 +1584,17 @@ mod tests {
             p.description
         );
 
-        let phases = store.list_phases("dossier").expect("list phases");
+        let phases = store
+            .list_phases(&phase_filter_for("dossier"))
+            .expect("list phases");
         assert_eq!(phases.len(), 4);
         for (i, ph) in phases.iter().enumerate() {
             assert_eq!(ph.order, i as i32 + 1, "phase[{i}] order");
         }
 
-        let tasks = store.list_tasks("dossier").expect("list tasks");
+        let tasks = store
+            .list_tasks(&task_filter_for("dossier"))
+            .expect("list tasks");
         assert_eq!(tasks.len(), 3);
 
         let arts = store.list_artifacts("dossier").expect("list artifacts");
@@ -1416,7 +1700,7 @@ mod tests {
         assert_eq!(project.created_at, project.updated_at);
 
         // Round-trip through the read side.
-        let listed = store.list_projects().unwrap();
+        let listed = store.list_projects(&ProjectListFilter::default()).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, project.id);
 
@@ -1550,7 +1834,7 @@ mod tests {
         assert_eq!(p2.order, 2);
         assert_eq!(p3.order, 3);
 
-        let listed = store.list_phases("alpha").unwrap();
+        let listed = store.list_phases(&phase_filter_for("alpha")).unwrap();
         let slugs: Vec<&str> = listed.iter().map(|p| p.slug.as_str()).collect();
         assert_eq!(slugs, vec!["spec", "build", "ship"]);
     }
@@ -1576,7 +1860,7 @@ mod tests {
             .unwrap();
         assert_eq!(inserted.order, 2);
 
-        let listed = store.list_phases("alpha").unwrap();
+        let listed = store.list_phases(&phase_filter_for("alpha")).unwrap();
         let pairs: Vec<(&str, i32)> = listed.iter().map(|p| (p.slug.as_str(), p.order)).collect();
         assert_eq!(
             pairs,
@@ -1694,7 +1978,7 @@ mod tests {
         assert_eq!(updated.status, PhaseStatus::Active);
 
         // Confirm round-trip.
-        let listed = store.list_phases("alpha").unwrap();
+        let listed = store.list_phases(&phase_filter_for("alpha")).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].title, "Spec v2");
         assert_eq!(listed[0].status, PhaseStatus::Active);
@@ -1763,7 +2047,7 @@ mod tests {
         assert!(task.claimed_at.is_none());
         assert!(task.completed_at.is_none());
 
-        let listed = store.list_tasks("alpha").unwrap();
+        let listed = store.list_tasks(&task_filter_for("alpha")).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, task.id);
         assert!(listed[0].body.contains("spec body"));
@@ -1948,7 +2232,7 @@ mod tests {
             })
             .unwrap();
 
-        let tasks = store.list_tasks("alpha").unwrap();
+        let tasks = store.list_tasks(&task_filter_for("alpha")).unwrap();
         let logged = tasks
             .iter()
             .find(|t| t.id == task.id)
@@ -2811,6 +3095,675 @@ mod tests {
                 err.to_string().contains("single-line"),
                 "field={field}, got: {err}"
             );
+        }
+    }
+
+    // =========================================================================
+    // Filter expansion: per-predicate, combo, validation, dogfood
+    // =========================================================================
+
+    /// Overwrite a single frontmatter field on a task file. Used by
+    /// filter tests to seed precise timestamps / assignees / bodies
+    /// without driving the full state machine.
+    fn set_task_field(store: &FsStore, task_id: &str, field: &str, value: &str) {
+        use std::fmt::Write as _;
+        let (_proj, path) = store.find_task_path(task_id).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        // Replace `<field>: <whatever>\n` lines in the frontmatter; insert
+        // before `---` if the field is absent.
+        let needle = format!("{field}: ");
+        let parts: Vec<&str> = raw.splitn(3, "---").collect();
+        assert_eq!(parts.len(), 3, "task file missing frontmatter delimiters");
+        let front = parts[1];
+        let mut new_front = String::new();
+        let mut replaced = false;
+        for line in front.lines() {
+            if line.starts_with(&needle) {
+                let _ = writeln!(new_front, "{field}: {value}");
+                replaced = true;
+            } else {
+                new_front.push_str(line);
+                new_front.push('\n');
+            }
+        }
+        if !replaced {
+            let _ = writeln!(new_front, "{field}: {value}");
+        }
+        let body = parts[2].trim_start_matches('\n');
+        let new_raw = format!("---{new_front}---\n{body}");
+        fs::write(&path, new_raw).unwrap();
+    }
+
+    /// Overwrite the spec body of a task file (the part between the
+    /// closing `---` and any `## Notes` section).
+    fn set_task_body(store: &FsStore, task_id: &str, body: &str) {
+        let (_proj, path) = store.find_task_path(task_id).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        let parts: Vec<&str> = raw.splitn(3, "---").collect();
+        assert_eq!(parts.len(), 3, "task file missing frontmatter delimiters");
+        let after_front = parts[2];
+        // Preserve the `## Notes` section if present.
+        let notes = after_front
+            .find("## Notes")
+            .map_or("", |i| &after_front[i..]);
+        let front = parts[1];
+        let new_raw = if notes.is_empty() {
+            format!("---{front}---\n\n{body}\n")
+        } else {
+            format!("---{front}---\n\n{body}\n\n{notes}")
+        };
+        fs::write(&path, new_raw).unwrap();
+    }
+
+    /// Seed a phase with a controlled body for `body_contains` tests.
+    fn set_phase_body(store: &FsStore, project_slug: &str, phase_slug: &str, body: &str) {
+        store
+            .update_phase(UpdatePhase {
+                project: project_slug.to_owned(),
+                slug: phase_slug.to_owned(),
+                body: Some(body.to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+    }
+
+    fn t(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    // ----- task.list per-predicate -----
+
+    #[test]
+    fn list_tasks_filter_by_assignee() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let a = seed_task(&store, "alpha", "alpha-task");
+        let b = seed_task(&store, "alpha", "beta-task");
+        set_task_field(&store, &a.id, "assignee", "human:mh");
+        set_task_field(&store, &b.id, "assignee", "ship");
+
+        let out = store
+            .list_tasks(&TaskListFilter {
+                project: Some("alpha".to_owned()),
+                assignee: Some("human:mh".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, a.id);
+    }
+
+    #[test]
+    fn list_tasks_filter_by_body_contains_case_insensitive() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let a = seed_task(&store, "alpha", "task-a");
+        let b = seed_task(&store, "alpha", "task-b");
+        set_task_body(&store, &a.id, "Look into Auth flows for OIDC");
+        set_task_body(&store, &b.id, "Tune the build cache");
+
+        let hits = store
+            .list_tasks(&TaskListFilter {
+                project: Some("alpha".to_owned()),
+                body_contains: Some("auth".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, a.id);
+
+        // Empty string is a no-op match (returns everything).
+        let all = store
+            .list_tasks(&TaskListFilter {
+                project: Some("alpha".to_owned()),
+                body_contains: Some(String::new()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn list_tasks_filter_by_created_range() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let a = seed_task(&store, "alpha", "early");
+        let b = seed_task(&store, "alpha", "mid");
+        let c = seed_task(&store, "alpha", "late");
+        set_task_field(&store, &a.id, "created_at", "2026-01-01T00:00:00Z");
+        set_task_field(&store, &b.id, "created_at", "2026-03-01T00:00:00Z");
+        set_task_field(&store, &c.id, "created_at", "2026-05-01T00:00:00Z");
+
+        let hits = store
+            .list_tasks(&TaskListFilter {
+                project: Some("alpha".to_owned()),
+                created_after: Some(t("2026-02-01T00:00:00Z")),
+                created_before: Some(t("2026-04-01T00:00:00Z")),
+                ..Default::default()
+            })
+            .unwrap();
+        let ids: Vec<&str> = hits.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec![b.id.as_str()]);
+    }
+
+    #[test]
+    fn list_tasks_filter_by_updated_range() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let a = seed_task(&store, "alpha", "stale");
+        let b = seed_task(&store, "alpha", "fresh");
+        set_task_field(&store, &a.id, "updated_at", "2026-01-01T00:00:00Z");
+        set_task_field(&store, &b.id, "updated_at", "2026-05-10T00:00:00Z");
+
+        let hits = store
+            .list_tasks(&TaskListFilter {
+                project: Some("alpha".to_owned()),
+                updated_after: Some(t("2026-05-01T00:00:00Z")),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, b.id);
+    }
+
+    #[test]
+    fn list_tasks_filter_by_completed_range_drops_nulls() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let a = seed_task(&store, "alpha", "done");
+        let _b = seed_task(&store, "alpha", "still-open");
+        set_task_field(&store, &a.id, "completed_at", "2026-05-10T00:00:00Z");
+        // _b has no completed_at — should be dropped from a completed-range query.
+
+        let hits = store
+            .list_tasks(&TaskListFilter {
+                project: Some("alpha".to_owned()),
+                completed_after: Some(t("2026-05-01T00:00:00Z")),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, a.id);
+    }
+
+    #[test]
+    fn list_tasks_filter_by_claimed_range_drops_nulls() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let a = seed_task(&store, "alpha", "claimed");
+        let _b = seed_task(&store, "alpha", "todo");
+        set_task_field(&store, &a.id, "claimed_at", "2026-05-10T00:00:00Z");
+
+        let hits = store
+            .list_tasks(&TaskListFilter {
+                project: Some("alpha".to_owned()),
+                claimed_after: Some(t("2026-05-01T00:00:00Z")),
+                claimed_before: Some(t("2026-05-15T00:00:00Z")),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, a.id);
+    }
+
+    #[test]
+    fn list_tasks_status_is_or_of_list() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let a = seed_task(&store, "alpha", "todo-1");
+        let b = seed_task(&store, "alpha", "ip-1");
+        let c = seed_task(&store, "alpha", "blocked-1");
+        set_task_field(&store, &b.id, "status", "in_progress");
+        set_task_field(&store, &b.id, "assignee", "ship");
+        set_task_field(&store, &c.id, "status", "blocked");
+        set_task_field(&store, &c.id, "assignee", "ship");
+
+        let hits = store
+            .list_tasks(&TaskListFilter {
+                project: Some("alpha".to_owned()),
+                status: Some(vec![TaskStatus::InProgress, TaskStatus::Blocked]),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut ids: Vec<&str> = hits.iter().map(|t| t.id.as_str()).collect();
+        ids.sort_unstable();
+        let mut want = vec![b.id.as_str(), c.id.as_str()];
+        want.sort_unstable();
+        assert_eq!(ids, want);
+        assert!(!ids.contains(&a.id.as_str()));
+    }
+
+    #[test]
+    fn list_tasks_order_by_updated_at_desc_with_limit() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let a = seed_task(&store, "alpha", "old");
+        let b = seed_task(&store, "alpha", "mid");
+        let c = seed_task(&store, "alpha", "new");
+        set_task_field(&store, &a.id, "updated_at", "2026-01-01T00:00:00Z");
+        set_task_field(&store, &b.id, "updated_at", "2026-03-01T00:00:00Z");
+        set_task_field(&store, &c.id, "updated_at", "2026-05-01T00:00:00Z");
+
+        let hits = store
+            .list_tasks(&TaskListFilter {
+                project: Some("alpha".to_owned()),
+                order_by: Some(TaskOrderField::UpdatedAt),
+                desc: Some(true),
+                limit: Some(2),
+                ..Default::default()
+            })
+            .unwrap();
+        let ids: Vec<&str> = hits.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec![c.id.as_str(), b.id.as_str()]);
+    }
+
+    #[test]
+    fn list_tasks_order_by_completed_at_drops_nulls() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let a = seed_task(&store, "alpha", "completed");
+        let _b = seed_task(&store, "alpha", "never-completed");
+        set_task_field(&store, &a.id, "completed_at", "2026-05-10T00:00:00Z");
+
+        let hits = store
+            .list_tasks(&TaskListFilter {
+                project: Some("alpha".to_owned()),
+                order_by: Some(TaskOrderField::CompletedAt),
+                ..Default::default()
+            })
+            .unwrap();
+        // b is dropped because completed_at is null.
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, a.id);
+    }
+
+    #[test]
+    fn list_tasks_cross_project_when_project_is_none() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        seed_project(&store, "beta");
+        let a = seed_task(&store, "alpha", "a-task");
+        let b = seed_task(&store, "beta", "b-task");
+
+        let hits = store.list_tasks(&TaskListFilter::default()).unwrap();
+        let ids: std::collections::HashSet<&str> = hits.iter().map(|t| t.id.as_str()).collect();
+        assert!(ids.contains(a.id.as_str()));
+        assert!(ids.contains(b.id.as_str()));
+        assert_eq!(hits.len(), 2);
+    }
+
+    // ----- task.list combo -----
+
+    #[test]
+    fn list_tasks_combo_assignee_status_date() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let a = seed_task(&store, "alpha", "match");
+        let b = seed_task(&store, "alpha", "wrong-assignee");
+        let c = seed_task(&store, "alpha", "wrong-status");
+        let d = seed_task(&store, "alpha", "wrong-date");
+        // All four become candidates; only one survives all three filters.
+        for (task, status, assignee, completed_at) in [
+            (&a, "done", "human:mh", "2026-05-10T00:00:00Z"),
+            (&b, "done", "ship", "2026-05-10T00:00:00Z"),
+            (&c, "in_progress", "human:mh", "2026-05-10T00:00:00Z"),
+            (&d, "done", "human:mh", "2026-01-01T00:00:00Z"),
+        ] {
+            set_task_field(&store, &task.id, "status", status);
+            set_task_field(&store, &task.id, "assignee", assignee);
+            set_task_field(&store, &task.id, "completed_at", completed_at);
+        }
+
+        let hits = store
+            .list_tasks(&TaskListFilter {
+                project: Some("alpha".to_owned()),
+                status: Some(vec![TaskStatus::Done]),
+                assignee: Some("human:mh".to_owned()),
+                completed_after: Some(t("2026-05-01T00:00:00Z")),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, a.id);
+    }
+
+    #[test]
+    fn list_tasks_combo_cross_project_body_contains() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        seed_project(&store, "beta");
+        let a = seed_task(&store, "alpha", "auth-a");
+        let b = seed_task(&store, "beta", "auth-b");
+        let c = seed_task(&store, "alpha", "unrelated");
+        set_task_body(&store, &a.id, "Adds OIDC AUTH flow");
+        set_task_body(&store, &b.id, "Migrates auth tokens to new format");
+        set_task_body(&store, &c.id, "Spike on caching");
+
+        let hits = store
+            .list_tasks(&TaskListFilter {
+                body_contains: Some("auth".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        let ids: std::collections::HashSet<&str> = hits.iter().map(|t| t.id.as_str()).collect();
+        assert!(ids.contains(a.id.as_str()));
+        assert!(ids.contains(b.id.as_str()));
+        assert!(!ids.contains(c.id.as_str()));
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn list_tasks_combo_sort_and_limit_interact() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let a = seed_task(&store, "alpha", "first");
+        let b = seed_task(&store, "alpha", "second");
+        let c = seed_task(&store, "alpha", "third");
+        set_task_field(&store, &a.id, "created_at", "2026-01-01T00:00:00Z");
+        set_task_field(&store, &b.id, "created_at", "2026-02-01T00:00:00Z");
+        set_task_field(&store, &c.id, "created_at", "2026-03-01T00:00:00Z");
+
+        // Default sort ASC, limit 2 → first, second.
+        let hits = store
+            .list_tasks(&TaskListFilter {
+                project: Some("alpha".to_owned()),
+                limit: Some(2),
+                ..Default::default()
+            })
+            .unwrap();
+        let ids: Vec<&str> = hits.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec![a.id.as_str(), b.id.as_str()]);
+
+        // DESC + limit 1 → third only.
+        let hits = store
+            .list_tasks(&TaskListFilter {
+                project: Some("alpha".to_owned()),
+                desc: Some(true),
+                limit: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, c.id);
+    }
+
+    #[test]
+    fn list_tasks_filter_by_phase_resolves_slug() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let spec = add_phase_simple(&store, "alpha", "spec");
+        let build = add_phase_simple(&store, "alpha", "build");
+
+        let in_spec = store
+            .create_task(NewTask {
+                project: "alpha".to_owned(),
+                phase: Some("spec".to_owned()),
+                slug: "draft-spec".to_owned(),
+                title: "Draft spec".to_owned(),
+                body: String::new(),
+                actor: "human:test".to_owned(),
+            })
+            .unwrap();
+        let _in_build = store
+            .create_task(NewTask {
+                project: "alpha".to_owned(),
+                phase: Some("build".to_owned()),
+                slug: "wire-up".to_owned(),
+                title: "Wire up".to_owned(),
+                body: String::new(),
+                actor: "human:test".to_owned(),
+            })
+            .unwrap();
+
+        let hits = store
+            .list_tasks(&TaskListFilter {
+                project: Some("alpha".to_owned()),
+                phase: Some("spec".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, in_spec.id);
+        assert_eq!(hits[0].phase, spec.id);
+        assert_ne!(hits[0].phase, build.id);
+    }
+
+    // ----- phase.list per-predicate + combo -----
+
+    #[test]
+    fn list_phases_filter_by_status_and_body_contains() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        add_phase_simple(&store, "alpha", "spec");
+        add_phase_simple(&store, "alpha", "build");
+        set_phase_body(&store, "alpha", "spec", "Design OIDC auth handshake");
+        set_phase_body(&store, "alpha", "build", "Implement the cache layer");
+        store
+            .update_phase(UpdatePhase {
+                project: "alpha".to_owned(),
+                slug: "spec".to_owned(),
+                status: Some(PhaseStatus::Active),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let hits = store
+            .list_phases(&PhaseListFilter {
+                project: Some("alpha".to_owned()),
+                body_contains: Some("AUTH".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].slug, "spec");
+
+        let active = store
+            .list_phases(&PhaseListFilter {
+                project: Some("alpha".to_owned()),
+                status: Some(vec![PhaseStatus::Active]),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].slug, "spec");
+    }
+
+    #[test]
+    fn list_phases_cross_project_when_project_is_none() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        seed_project(&store, "beta");
+        add_phase_simple(&store, "alpha", "spec");
+        add_phase_simple(&store, "beta", "spec");
+
+        let hits = store.list_phases(&PhaseListFilter::default()).unwrap();
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn list_phases_order_by_updated_at_desc_limit_1() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        add_phase_simple(&store, "alpha", "spec");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        add_phase_simple(&store, "alpha", "build");
+        // build is newer.
+
+        let hits = store
+            .list_phases(&PhaseListFilter {
+                project: Some("alpha".to_owned()),
+                order_by: Some(PhaseOrderField::UpdatedAt),
+                desc: Some(true),
+                limit: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].slug, "build");
+    }
+
+    // ----- project.list per-predicate + combo -----
+
+    #[test]
+    fn list_projects_filter_by_status_and_body_contains() {
+        let (_tmp, store) = fresh_corpus();
+        store
+            .create_project(NewProject {
+                slug: "alpha".to_owned(),
+                title: "Alpha".to_owned(),
+                description: "auth flows for HYROX dashboards".to_owned(),
+                actor: "human:test".to_owned(),
+            })
+            .unwrap();
+        store
+            .create_project(NewProject {
+                slug: "beta".to_owned(),
+                title: "Beta".to_owned(),
+                description: "unrelated caching tier".to_owned(),
+                actor: "human:test".to_owned(),
+            })
+            .unwrap();
+        store
+            .update_project(UpdateProject {
+                slug: "beta".to_owned(),
+                status: Some(ProjectStatus::Paused),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let hits = store
+            .list_projects(&ProjectListFilter {
+                body_contains: Some("AUTH".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].slug, "alpha");
+
+        let paused = store
+            .list_projects(&ProjectListFilter {
+                status: Some(vec![ProjectStatus::Paused]),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(paused.len(), 1);
+        assert_eq!(paused[0].slug, "beta");
+    }
+
+    #[test]
+    fn list_projects_order_by_updated_at_desc_limit_1() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        seed_project(&store, "beta");
+
+        let hits = store
+            .list_projects(&ProjectListFilter {
+                order_by: Some(ProjectOrderField::UpdatedAt),
+                desc: Some(true),
+                limit: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].slug, "beta");
+    }
+
+    // ----- Dogfood acceptance queries -----
+    //
+    // Mirror the six acceptance queries from
+    // docs/features/filter-expansion/spec.md against the in-repo
+    // projects/dossier/ fixture. The fixture content is fixed (commit-
+    // controlled), so the row counts here pin the verbs to the spec.
+
+    #[test]
+    fn dogfood_acceptance_queries() {
+        let store = FsStore::open(repo_root()).expect("open corpus");
+
+        // Q1: what's open in dossier right now? (no claimed/in_progress
+        // in the fixture today — assert it doesn't error and the result
+        // shape is sane.)
+        let open = store
+            .list_tasks(&TaskListFilter {
+                project: Some("dossier".to_owned()),
+                status: Some(vec![TaskStatus::Claimed, TaskStatus::InProgress]),
+                ..Default::default()
+            })
+            .expect("open tasks query");
+        for t in &open {
+            assert!(matches!(
+                t.status,
+                TaskStatus::Claimed | TaskStatus::InProgress
+            ));
+        }
+
+        // Q2: what did claude-code:michael close? — fixture has 3 done
+        // tasks assigned to claude-code:michael.
+        let closed = store
+            .list_tasks(&TaskListFilter {
+                assignee: Some("claude-code:michael".to_owned()),
+                status: Some(vec![TaskStatus::Done]),
+                completed_after: Some(t("2026-01-01T00:00:00Z")),
+                ..Default::default()
+            })
+            .expect("closed tasks query");
+        assert!(
+            closed.len() >= 3,
+            "expected >=3 done tasks for claude-code:michael, got {}",
+            closed.len()
+        );
+        for t in &closed {
+            assert_eq!(t.status, TaskStatus::Done);
+            assert_eq!(t.assignee, "claude-code:michael");
+        }
+
+        // Q3: design phases mentioning "protocol" — fixture has at least
+        // the 01-protocol-spec phase.
+        let proto = store
+            .list_phases(&PhaseListFilter {
+                body_contains: Some("protocol".to_owned()),
+                ..Default::default()
+            })
+            .expect("body_contains phase query");
+        assert!(
+            !proto.is_empty(),
+            "expected >=1 phase mentioning 'protocol'"
+        );
+
+        // Q4: latest phase by updated_at, limit 1.
+        let latest = store
+            .list_phases(&PhaseListFilter {
+                order_by: Some(PhaseOrderField::UpdatedAt),
+                desc: Some(true),
+                limit: Some(1),
+                ..Default::default()
+            })
+            .expect("latest phase query");
+        assert_eq!(latest.len(), 1);
+
+        // Q5: paused projects — fixture has zero, query must not error.
+        let paused = store
+            .list_projects(&ProjectListFilter {
+                status: Some(vec![ProjectStatus::Paused]),
+                ..Default::default()
+            })
+            .expect("paused projects query");
+        for p in &paused {
+            assert_eq!(p.status, ProjectStatus::Paused);
+        }
+
+        // Q6: cross-portfolio in-flight tasks.
+        let in_flight = store
+            .list_tasks(&TaskListFilter {
+                status: Some(vec![TaskStatus::Claimed, TaskStatus::InProgress]),
+                ..Default::default()
+            })
+            .expect("in-flight cross-project query");
+        for t in &in_flight {
+            assert!(matches!(
+                t.status,
+                TaskStatus::Claimed | TaskStatus::InProgress
+            ));
         }
     }
 }

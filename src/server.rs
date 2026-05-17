@@ -7,6 +7,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use chrono::{DateTime, Utc};
 use rmcp::{
     handler::server::wrapper::{Json, Parameters},
     model::ErrorData,
@@ -15,7 +16,10 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{Artifact, Phase, PhaseStatus, Project, ProjectStatus, Task, TaskStatus};
+use crate::domain::{
+    Artifact, Phase, PhaseListFilter, PhaseOrderField, PhaseStatus, Project, ProjectListFilter,
+    ProjectOrderField, ProjectStatus, Task, TaskListFilter, TaskOrderField, TaskStatus,
+};
 use crate::store::{
     ClaimTask, CompleteTask, FsStore, LinkArtifact, NewPhase, NewProject, NewTask, UpdatePhase,
     UpdateProject, UpdateTask,
@@ -64,10 +68,78 @@ pub struct ProjectView {
     pub artifacts: Vec<Artifact>,
 }
 
-#[derive(Deserialize, JsonSchema)]
+/// Predicate-shaped arguments for `project.list`. Every field is
+/// optional; an empty arg set returns every project in the corpus
+/// sorted by `created_at` ASC.
+#[derive(Deserialize, JsonSchema, Default)]
+pub struct ProjectListArgs {
+    /// if set, only projects whose status is in this list
+    /// (`planning` | `active` | `paused` | `done` | `abandoned`)
+    #[serde(default)]
+    pub status: Option<Vec<ProjectStatus>>,
+    /// case-insensitive literal substring matched against the project's
+    /// description body
+    #[serde(default)]
+    pub body_contains: Option<String>,
+    /// RFC 3339 timestamp; matches rows with `created_at >= this`
+    #[serde(default)]
+    pub created_after: Option<DateTime<Utc>>,
+    /// RFC 3339 timestamp; matches rows with `created_at < this`
+    #[serde(default)]
+    pub created_before: Option<DateTime<Utc>>,
+    /// RFC 3339 timestamp; matches rows with `updated_at >= this`
+    #[serde(default)]
+    pub updated_after: Option<DateTime<Utc>>,
+    /// RFC 3339 timestamp; matches rows with `updated_at < this`
+    #[serde(default)]
+    pub updated_before: Option<DateTime<Utc>>,
+    /// sort key (`created_at` | `updated_at`); default `created_at`
+    #[serde(default)]
+    pub order_by: Option<ProjectOrderField>,
+    /// reverse the sort (descending); default `false` (ascending)
+    #[serde(default)]
+    pub desc: Option<bool>,
+    /// cap the number of returned rows
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// Predicate-shaped arguments for `phase.list`. `project = None`
+/// (omitted or explicit `null`) walks every project in the corpus.
+#[derive(Deserialize, JsonSchema, Default)]
 pub struct PhaseListArgs {
-    /// project slug
-    pub project: String,
+    /// project slug; omit or pass `null` to list phases across every project
+    #[serde(default)]
+    pub project: Option<String>,
+    /// if set, only phases whose status is in this list
+    /// (`pending` | `active` | `done` | `skipped`)
+    #[serde(default)]
+    pub status: Option<Vec<PhaseStatus>>,
+    /// case-insensitive literal substring matched against the phase body
+    #[serde(default)]
+    pub body_contains: Option<String>,
+    /// RFC 3339 timestamp; matches rows with `created_at >= this`
+    #[serde(default)]
+    pub created_after: Option<DateTime<Utc>>,
+    /// RFC 3339 timestamp; matches rows with `created_at < this`
+    #[serde(default)]
+    pub created_before: Option<DateTime<Utc>>,
+    /// RFC 3339 timestamp; matches rows with `updated_at >= this`
+    #[serde(default)]
+    pub updated_after: Option<DateTime<Utc>>,
+    /// RFC 3339 timestamp; matches rows with `updated_at < this`
+    #[serde(default)]
+    pub updated_before: Option<DateTime<Utc>>,
+    /// sort key (`created_at` | `updated_at` | `order`); default `order`
+    /// (linear position within a project, the existing on-disk ordering)
+    #[serde(default)]
+    pub order_by: Option<PhaseOrderField>,
+    /// reverse the sort (descending); default `false` (ascending)
+    #[serde(default)]
+    pub desc: Option<bool>,
+    /// cap the number of returned rows
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -75,22 +147,129 @@ pub struct PhaseListResult {
     pub phases: Vec<Phase>,
 }
 
-#[derive(Deserialize, JsonSchema)]
+/// Predicate-shaped arguments for `task.list`.
+///
+/// `project = None` (omitted or explicit `null`) walks every project in
+/// the corpus. `phase` requires `project` (validation error otherwise)
+/// because phase slugs are unique within a project, not across the corpus.
+#[derive(Deserialize, JsonSchema, Default)]
 pub struct TaskListArgs {
-    /// project slug
-    pub project: String,
-    /// if set, only tasks in this phase (matched by phase id)
+    /// project slug; omit or pass `null` to list tasks across every project
     #[serde(default)]
-    pub phase: String,
-    /// if set, only tasks with this status (`todo`, `claimed`,
-    /// `in_progress`, `blocked`, `done`, `cancelled`)
+    pub project: Option<String>,
+    /// phase slug; requires `project` (validation error otherwise)
     #[serde(default)]
-    pub status: String,
+    pub phase: Option<String>,
+    /// if set, only tasks whose status is in this list
+    /// (`todo` | `claimed` | `in_progress` | `blocked` | `done` | `cancelled`)
+    #[serde(default)]
+    pub status: Option<Vec<TaskStatus>>,
+    /// exact match against the task's `assignee` frontmatter field
+    #[serde(default)]
+    pub assignee: Option<String>,
+    /// case-insensitive literal substring matched against the task body
+    #[serde(default)]
+    pub body_contains: Option<String>,
+    /// RFC 3339 timestamp; matches rows with `created_at >= this`
+    #[serde(default)]
+    pub created_after: Option<DateTime<Utc>>,
+    /// RFC 3339 timestamp; matches rows with `created_at < this`
+    #[serde(default)]
+    pub created_before: Option<DateTime<Utc>>,
+    /// RFC 3339 timestamp; matches rows with `updated_at >= this`
+    #[serde(default)]
+    pub updated_after: Option<DateTime<Utc>>,
+    /// RFC 3339 timestamp; matches rows with `updated_at < this`
+    #[serde(default)]
+    pub updated_before: Option<DateTime<Utc>>,
+    /// RFC 3339 timestamp; matches rows with `completed_at >= this`
+    /// (drops rows where `completed_at` is null)
+    #[serde(default)]
+    pub completed_after: Option<DateTime<Utc>>,
+    /// RFC 3339 timestamp; matches rows with `completed_at < this`
+    /// (drops rows where `completed_at` is null)
+    #[serde(default)]
+    pub completed_before: Option<DateTime<Utc>>,
+    /// RFC 3339 timestamp; matches rows with `claimed_at >= this`
+    /// (drops rows where `claimed_at` is null)
+    #[serde(default)]
+    pub claimed_after: Option<DateTime<Utc>>,
+    /// RFC 3339 timestamp; matches rows with `claimed_at < this`
+    /// (drops rows where `claimed_at` is null)
+    #[serde(default)]
+    pub claimed_before: Option<DateTime<Utc>>,
+    /// sort key (`created_at` | `updated_at` | `completed_at` |
+    /// `claimed_at`); default `created_at`. Sorting by a nullable field
+    /// (`completed_at`, `claimed_at`) drops rows where that field is null.
+    #[serde(default)]
+    pub order_by: Option<TaskOrderField>,
+    /// reverse the sort (descending); default `false` (ascending)
+    #[serde(default)]
+    pub desc: Option<bool>,
+    /// cap the number of returned rows
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
 
 #[derive(Serialize, JsonSchema)]
 pub struct TaskListResult {
     pub tasks: Vec<Task>,
+}
+
+impl From<ProjectListArgs> for ProjectListFilter {
+    fn from(a: ProjectListArgs) -> Self {
+        Self {
+            status: a.status,
+            body_contains: a.body_contains,
+            created_after: a.created_after,
+            created_before: a.created_before,
+            updated_after: a.updated_after,
+            updated_before: a.updated_before,
+            order_by: a.order_by,
+            desc: a.desc,
+            limit: a.limit,
+        }
+    }
+}
+
+impl From<PhaseListArgs> for PhaseListFilter {
+    fn from(a: PhaseListArgs) -> Self {
+        Self {
+            project: a.project,
+            status: a.status,
+            body_contains: a.body_contains,
+            created_after: a.created_after,
+            created_before: a.created_before,
+            updated_after: a.updated_after,
+            updated_before: a.updated_before,
+            order_by: a.order_by,
+            desc: a.desc,
+            limit: a.limit,
+        }
+    }
+}
+
+impl From<TaskListArgs> for TaskListFilter {
+    fn from(a: TaskListArgs) -> Self {
+        Self {
+            project: a.project,
+            phase: a.phase,
+            status: a.status,
+            assignee: a.assignee,
+            body_contains: a.body_contains,
+            created_after: a.created_after,
+            created_before: a.created_before,
+            updated_after: a.updated_after,
+            updated_before: a.updated_before,
+            completed_after: a.completed_after,
+            completed_before: a.completed_before,
+            claimed_after: a.claimed_after,
+            claimed_before: a.claimed_before,
+            order_by: a.order_by,
+            desc: a.desc,
+            limit: a.limit,
+        }
+    }
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -259,10 +438,16 @@ pub struct ArtifactLinkArgs {
 impl MeshService {
     #[tool(
         name = "project.list",
-        description = "List every project in the corpus, sorted by slug. Returns metadata only — call project.get for the full description body."
+        description = "List projects subject to a predicate filter. Every argument is optional; an empty arg set returns every project in the corpus, sorted by `created_at` ASC. Filters AND-together.\n\nFilters: `status` is a list of statuses (`planning` | `active` | `paused` | `done` | `abandoned`) — OR-of-statuses. `body_contains` is a case-insensitive literal substring against the project's description body. `created_after` / `created_before` and `updated_after` / `updated_before` are RFC 3339 timestamps; `_after` is inclusive (>=), `_before` is exclusive (<). Malformed timestamps are rejected.\n\nOrdering: `order_by` is `created_at` | `updated_at` (default `created_at`); `desc: true` reverses (default ascending). `limit` caps the rows.\n\nReturns metadata only — call `project.get` for the full description body."
     )]
-    fn project_list(&self) -> Result<Json<ProjectListResult>, ErrorData> {
-        let projects = self.store.list_projects().map_err(internal)?;
+    fn project_list(
+        &self,
+        Parameters(args): Parameters<ProjectListArgs>,
+    ) -> Result<Json<ProjectListResult>, ErrorData> {
+        let projects = self
+            .store
+            .list_projects(&ProjectListFilter::from(args))
+            .map_err(internal)?;
         Ok(Json(ProjectListResult { projects }))
     }
 
@@ -323,8 +508,16 @@ impl MeshService {
         Parameters(args): Parameters<ProjectGetArgs>,
     ) -> Result<Json<ProjectView>, ErrorData> {
         let project = self.store.get_project(&args.slug).map_err(internal)?;
-        let phases = self.store.list_phases(&args.slug).map_err(internal)?;
-        let tasks = self.store.list_tasks(&args.slug).map_err(internal)?;
+        let phase_filter = PhaseListFilter {
+            project: Some(args.slug.clone()),
+            ..Default::default()
+        };
+        let task_filter = TaskListFilter {
+            project: Some(args.slug.clone()),
+            ..Default::default()
+        };
+        let phases = self.store.list_phases(&phase_filter).map_err(internal)?;
+        let tasks = self.store.list_tasks(&task_filter).map_err(internal)?;
         let artifacts = self.store.list_artifacts(&args.slug).map_err(internal)?;
         Ok(Json(ProjectView {
             project,
@@ -509,37 +702,33 @@ impl MeshService {
 
     #[tool(
         name = "phase.list",
-        description = "List the phases of a project in order. Phase bodies are included."
+        description = "List phases subject to a predicate filter. Phase bodies are included.\n\nCross-project: `project` is optional — omit it (or pass `null`) to scan every project in the corpus. A cross-project listing groups by project, then by `order` within each project, so the linear-position ordering stays meaningful.\n\nFilters: `status` is a list (`pending` | `active` | `done` | `skipped`) — OR-of-statuses. `body_contains` is a case-insensitive literal substring against the phase body. `created_after` / `created_before` and `updated_after` / `updated_before` are RFC 3339 timestamps; `_after` is inclusive (>=), `_before` is exclusive (<). Malformed timestamps are rejected.\n\nOrdering: `order_by` is `created_at` | `updated_at` | `order` (default `order` — the linear-position frontmatter field). `desc: true` reverses (default ascending). `limit` caps the rows. Filters AND-together."
     )]
     fn phase_list(
         &self,
         Parameters(args): Parameters<PhaseListArgs>,
     ) -> Result<Json<PhaseListResult>, ErrorData> {
-        let phases = self.store.list_phases(&args.project).map_err(internal)?;
+        let filter = PhaseListFilter::from(args);
+        let phases = self.store.list_phases(&filter).map_err(internal)?;
         Ok(Json(PhaseListResult { phases }))
     }
 
     #[tool(
         name = "task.list",
-        description = "List the tasks of a project. Optionally filter by status or phase ID."
+        description = "List tasks subject to a predicate filter. Every argument is optional; an empty arg set returns every task in the corpus, sorted by `created_at` ASC. Filters AND-together.\n\nCross-project: `project` is optional — omit it (or pass `null`) to scan every project in the corpus. `phase` is a phase slug and REQUIRES `project` (validation error otherwise — phase slugs are unique per project, not globally).\n\nFilters: `status` is a list (`todo` | `claimed` | `in_progress` | `blocked` | `done` | `cancelled`) — OR-of-statuses. `assignee` is an exact match against the task's `assignee` frontmatter (e.g. `human:michael`, `ship`). `body_contains` is a case-insensitive literal substring against the task body. The four date-range pairs — `created`, `updated`, `completed`, `claimed` — each take `_after` (inclusive, >=) and `_before` (exclusive, <) RFC 3339 timestamps. Filtering on `completed_*` or `claimed_*` drops rows where that timestamp is null. Malformed timestamps are rejected.\n\nOrdering: `order_by` is `created_at` | `updated_at` | `completed_at` | `claimed_at` (default `created_at`); sorting by a nullable field (`completed_at`, `claimed_at`) drops rows where that field is null. `desc: true` reverses (default ascending). `limit` caps the rows."
     )]
     fn task_list(
         &self,
         Parameters(args): Parameters<TaskListArgs>,
     ) -> Result<Json<TaskListResult>, ErrorData> {
-        let all = self.store.list_tasks(&args.project).map_err(internal)?;
-        let tasks = all
-            .into_iter()
-            .filter(|t| args.phase.is_empty() || t.phase == args.phase)
-            .filter(|t| {
-                args.status.is_empty()
-                    || serde_json::to_value(t.status)
-                        .ok()
-                        .and_then(|v| v.as_str().map(str::to_owned))
-                        .as_deref()
-                        == Some(&args.status)
-            })
-            .collect();
+        if args.phase.is_some() && args.project.is_none() {
+            return Err(ErrorData::invalid_params(
+                "phase requires project (phase slugs are unique per project, not across the corpus)",
+                None,
+            ));
+        }
+        let filter = TaskListFilter::from(args);
+        let tasks = self.store.list_tasks(&filter).map_err(internal)?;
         Ok(Json(TaskListResult { tasks }))
     }
 
@@ -568,4 +757,172 @@ impl MeshService {
 #[allow(clippy::needless_pass_by_value)]
 fn internal<E: ToString>(e: E) -> ErrorData {
     ErrorData::internal_error(e.to_string(), None)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
+
+    use super::*;
+
+    fn fresh_service() -> (tempfile::TempDir, MeshService) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".dossier")).expect("mkdir .dossier");
+        let store = FsStore::open(tmp.path()).expect("open fresh corpus");
+        let service = MeshService::new(store);
+        (tmp, service)
+    }
+
+    #[test]
+    fn task_list_rejects_phase_without_project() {
+        let (_tmp, svc) = fresh_service();
+        let args = TaskListArgs {
+            phase: Some("spec".to_owned()),
+            ..Default::default()
+        };
+        match svc.task_list(Parameters(args)) {
+            Err(err) => assert!(
+                err.message.contains("phase requires project"),
+                "unexpected error message: {}",
+                err.message
+            ),
+            Ok(_) => panic!("phase without project must be rejected"),
+        }
+    }
+
+    #[test]
+    fn task_list_accepts_phase_with_project() {
+        let (_tmp, svc) = fresh_service();
+        let args = TaskListArgs {
+            project: Some("nonexistent".to_owned()),
+            phase: Some("spec".to_owned()),
+            ..Default::default()
+        };
+        // Project doesn't exist → empty result (the corpus is empty).
+        let out = match svc.task_list(Parameters(args)) {
+            Ok(Json(out)) => out,
+            Err(err) => panic!("phase+project must be accepted: {}", err.message),
+        };
+        assert!(out.tasks.is_empty());
+    }
+
+    #[test]
+    fn task_list_rejects_malformed_date() {
+        // Malformed RFC 3339 strings fail at serde deserialization, which
+        // is the spec's documented "typed validation error rather than
+        // silent coercion" behavior. We don't pin a particular chrono
+        // error message — only that the input is rejected, since the
+        // message wording is upstream's choice and may change.
+        let raw = r#"{
+            "project": "alpha",
+            "created_after": "not-a-real-date"
+        }"#;
+        assert!(
+            serde_json::from_str::<TaskListArgs>(raw).is_err(),
+            "malformed date must be rejected at deserialization"
+        );
+
+        // A well-formed RFC 3339 timestamp must deserialize cleanly.
+        let ok_raw = r#"{
+            "project": "alpha",
+            "created_after": "2026-05-01T00:00:00Z"
+        }"#;
+        let args: TaskListArgs = match serde_json::from_str(ok_raw) {
+            Ok(a) => a,
+            Err(e) => panic!("well-formed timestamp must deserialize: {e}"),
+        };
+        assert!(args.created_after.is_some());
+    }
+
+    #[test]
+    fn task_list_rejects_unknown_order_by() {
+        let raw = r#"{
+            "project": "alpha",
+            "order_by": "title"
+        }"#;
+        let Err(err) = serde_json::from_str::<TaskListArgs>(raw) else {
+            panic!("unknown order_by must be rejected");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("order_by") || msg.contains("variant"),
+            "expected mention of order_by or variant; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn phase_list_rejects_unknown_order_by() {
+        let raw = r#"{
+            "project": "alpha",
+            "order_by": "title"
+        }"#;
+        let Err(err) = serde_json::from_str::<PhaseListArgs>(raw) else {
+            panic!("unknown order_by must be rejected");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("order_by") || msg.contains("variant"),
+            "expected mention of order_by or variant; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn project_list_rejects_unknown_order_by() {
+        let raw = r#"{
+            "order_by": "completed_at"
+        }"#;
+        let Err(err) = serde_json::from_str::<ProjectListArgs>(raw) else {
+            panic!("project.list has no completed_at order_by");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("order_by") || msg.contains("variant"),
+            "expected mention of order_by or variant; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn task_list_status_accepts_multiple_values() {
+        let raw = r#"{
+            "project": "alpha",
+            "status": ["claimed", "in_progress"]
+        }"#;
+        let args: TaskListArgs = match serde_json::from_str(raw) {
+            Ok(a) => a,
+            Err(e) => panic!("multi-status must deserialize: {e}"),
+        };
+        let statuses = args.status.unwrap_or_default();
+        assert_eq!(statuses.len(), 2);
+        assert!(statuses.contains(&TaskStatus::Claimed));
+        assert!(statuses.contains(&TaskStatus::InProgress));
+    }
+
+    #[test]
+    fn task_list_accepts_explicit_null_project() {
+        let raw = r#"{
+            "project": null,
+            "status": ["in_progress"]
+        }"#;
+        let args: TaskListArgs = match serde_json::from_str(raw) {
+            Ok(a) => a,
+            Err(e) => panic!("explicit null project must deserialize: {e}"),
+        };
+        assert!(args.project.is_none());
+    }
+
+    #[test]
+    fn project_list_accepts_empty_args() {
+        // Smoke: a completely empty arg set is a valid call (list everything).
+        let (_tmp, svc) = fresh_service();
+        let out = match svc.project_list(Parameters(ProjectListArgs::default())) {
+            Ok(Json(out)) => out,
+            Err(err) => panic!("empty args must succeed: {}", err.message),
+        };
+        assert!(out.projects.is_empty());
+    }
 }
