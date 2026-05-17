@@ -970,8 +970,7 @@ mod tests {
         };
         match svc.search(Parameters(args)) {
             Err(e) => assert!(
-                e.message.to_lowercase().contains("query")
-                    || e.message.contains("non-empty"),
+                e.message.to_lowercase().contains("query") || e.message.contains("non-empty"),
                 "{}",
                 e.message
             ),

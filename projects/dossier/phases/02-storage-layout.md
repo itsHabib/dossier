@@ -22,7 +22,3 @@ Acceptance:
 - [x] Concurrency model documented (single-writer assumption)
 - [x] Index/cache directory marked as gitignored
 - [x] Migration story sketched (mesh_version field)
-
-## follow-ups
-
-Track storage **follow-ups** (compression, watch mode) separately from protocol work.

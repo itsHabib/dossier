@@ -11,8 +11,7 @@ updated_at: 2026-05-10T00:00:00Z
 
 ship's kickoff/handoff outputs become structured writes through the dossier
 mesh. ship stays in TS — it talks to the mesh as an MCP client. First
-real-world consumer of the protocol. Consider **Cheney-style clippy** lints
-for task bodies so ship never invents frontmatter keys.
+real-world consumer of the protocol.
 
 Acceptance:
 

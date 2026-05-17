@@ -69,13 +69,15 @@ search {
 
 ## Acceptance
 
-- `search { query: "auth" }` returns project / phase / task rows where "auth" appears in title or body, ranked.
-- `search { query: "Cheney" }` finds the "Cheney-style clippy" phase in the dossier dogfood corpus.
-- `search { query: "follow-ups" }` returns multiple hits across phase + tasks.
-- `search { query: "nonexistent-zzzz" }` returns `[]`, not an error.
-- `search { query: "" }` returns a typed validation error.
-- `search { query: "auth", kinds: ["task"] }` returns only task hits.
-- `search { query: "auth", project: "wellness-ai" }` restricts to one project.
+Covered by `search_title_and_body_hits_in_temp_corpus` and `search_filters_in_temp_corpus` in `src/store.rs`, plus the dogfood smoke test against the real corpus. Synthetic-corpus tests pin contract behavior with fully-controlled fixtures so PM renames of unrelated content can't break the suite. The dogfood smoke checks only that the on-disk pipeline returns a non-empty result for a known project name (`"dossier"`), an empty result for a nonexistent query, and a typed error for an empty query.
+
+- Cross-primitive query returns project / phase / task rows where the literal appears in title or body, ranked.
+- `kinds: [Task]` returns only task hits.
+- `project: "<slug>"` restricts to that one project.
+- Filter composition (`project` + `kinds`) narrows on both axes.
+- Empty `query` is a typed validation error.
+- Nonexistent query returns `[]`, not an error.
+- `## Notes` content is excluded from the index.
 
 ## Test plan
 
@@ -87,7 +89,7 @@ search {
 - **Validation**: empty `query` → typed error; bad `kinds` value → typed error.
 - **No-match**: empty array, not an error.
 - **`limit`**: top-N respected after ranking.
-- **Dogfood corpus**: searches over `projects/dossier/` for the acceptance queries above; asserts expected rows.
+- **Dogfood smoke**: a known project-name query against the real corpus returns at least one hit; spec acceptance queries themselves run against synthetic fixtures, not real corpus content.
 
 ## Implementation sketch
 

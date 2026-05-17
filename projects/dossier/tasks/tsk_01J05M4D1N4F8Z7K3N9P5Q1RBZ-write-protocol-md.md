@@ -16,7 +16,7 @@ updated_at: 2026-05-10T00:00:00Z
 
 First draft of the wire protocol. Cover primitives, verbs, state machine,
 identity, versioning, and an explicit out-of-scope list. Strict over
-permissive. Maintain a short list of spec **follow-ups** for deferred verbs.
+permissive.
 
 ## Notes
 
