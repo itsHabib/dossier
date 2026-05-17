@@ -105,14 +105,14 @@ writes are idempotent on `(actor, request_id)` if `request_id` is supplied.
 
 - `project.create` — `{ slug, title, description }` → Project
 - `project.get` — `{ id | slug }` → Project (with phases, tasks, artifacts inlined)
-- `project.list` — `{ status?, limit?, cursor? }` → list of Project (without children)
+- `project.list` — `{ status?, body_contains?, created_after?, created_before?, updated_after?, updated_before?, order_by?, desc?, limit? }` → list of Project (without children)
 - `project.update` — `{ id, title?, description?, status? }` → Project
 
 ### Phase
 
 - `phase.add` — `{ project_id, title, body, after_phase_id? }` → Phase
 - `phase.update` — `{ id, title?, body?, status? }` → Phase
-- `phase.list` — `{ project_id }` → ordered list of Phase
+- `phase.list` — `{ project?, status?, body_contains?, created_after?, created_before?, updated_after?, updated_before?, order_by?, desc?, limit? }` → list of Phase. `project` is optional — omit (or pass `null`) for a cross-corpus listing. Default `order_by` is `order` (linear position within a project).
 
 ### Task
 
@@ -120,7 +120,7 @@ writes are idempotent on `(actor, request_id)` if `request_id` is supplied.
 - `task.claim` — `{ id, actor }` → Task (status=`claimed`, assignee=actor). Fails if already claimed by another actor.
 - `task.update` — `{ id, body?, status?, note? }` → Task. `note` appends to log.
 - `task.complete` — `{ id, note? }` → Task (status=`done`, completed_at=now)
-- `task.list` — `{ project_id?, phase_id?, status?, assignee? }` → list of Task
+- `task.list` — `{ project?, phase?, status?, assignee?, body_contains?, created_after?, created_before?, updated_after?, updated_before?, completed_after?, completed_before?, claimed_after?, claimed_before?, order_by?, desc?, limit? }` → list of Task. `project` is optional (omit / `null` = cross-corpus); `phase` is a slug and requires `project`. `status` is a list (OR-of-statuses). `body_contains` is a case-insensitive literal substring. Date params are RFC 3339; `_after` is inclusive, `_before` is exclusive. `order_by` on a nullable field (`completed_at`, `claimed_at`) drops rows where that field is null.
 
 ### Artifact
 
