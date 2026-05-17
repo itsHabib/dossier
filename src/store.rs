@@ -50,12 +50,12 @@ impl FsStore {
     ///
     /// An empty filter (`ProjectListFilter::default()`) returns every
     /// project in the corpus, sorted by `created_at` ASC. Description
-    /// bodies are loaded only when needed (a `body_contains` predicate
-    /// is set or `created_by` provenance is referenced); the default
-    /// path stays as cheap as the pre-filter version. Description
-    /// fields are always blanked before return so the response shape
-    /// is uniform regardless of which filters fired — `body_contains`
-    /// matches against the full body first, then the field is dropped.
+    /// bodies are loaded only when needed (when a `body_contains`
+    /// predicate is set); the default path stays as cheap as the
+    /// pre-filter version. Description fields are always blanked
+    /// before return so the response shape is uniform regardless of
+    /// which filters fired — `body_contains` matches against the full
+    /// body first, then the field is dropped.
     pub fn list_projects(&self, filter: &ProjectListFilter) -> Result<Vec<Project>> {
         let dir = self.root.join("projects");
         if !dir.exists() {
