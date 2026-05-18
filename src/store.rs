@@ -660,7 +660,14 @@ impl FsStore {
         if args.slug.is_empty() {
             bail!("slug is required");
         }
-        self.project_dir(&args.slug)?;
+        let project_dir = self.project_dir(&args.slug)?;
+        if !project_dir.exists() {
+            bail!("project not found: {}", args.slug);
+        }
+        let project_md = project_dir.join("project.md");
+        if !project_md.is_file() {
+            bail!("project not found: {}", args.slug);
+        }
         let mut project = self.load_project(&args.slug, true)?;
         if let Some(title) = args.title {
             project.title = title;
@@ -2054,6 +2061,22 @@ mod tests {
             })
             .expect_err("invalid slug");
         assert!(err.to_string().contains("invalid slug"), "got: {err}");
+    }
+
+    #[test]
+    fn update_project_errors_on_nonexistent_slug() {
+        let (_tmp, store) = fresh_corpus();
+        let slug = "ghost";
+        let err = store
+            .update_project(UpdateProject {
+                slug: slug.to_owned(),
+                title: Some("x".to_owned()),
+                ..Default::default()
+            })
+            .expect_err("unknown project");
+        let msg = err.to_string();
+        assert!(msg.contains("project not found"), "got: {err}");
+        assert!(msg.contains(slug), "got: {err}");
     }
 
     #[test]
