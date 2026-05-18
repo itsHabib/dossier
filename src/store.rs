@@ -1785,7 +1785,7 @@ mod tests {
     )]
 
     use super::*;
-    use crate::domain::{SearchArgs, SearchKind};
+    use crate::domain::{Note, SearchArgs, SearchKind};
 
     fn repo_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -5069,5 +5069,304 @@ mod tests {
             hits.is_empty(),
             "notes must not be searchable, got {hits:?}"
         );
+    }
+
+    /// Exhaustive field comparison after project.md write + read. If a new
+    /// `Project` field is added, this list must grow — otherwise drift from
+    /// `ProjectFrontmatter` goes uncaught.
+    fn assert_project_all_fields_persisted(want: &Project, got: &Project) {
+        assert_eq!(
+            want.id, got.id,
+            "field `id` not persisted (project frontmatter round-trip)"
+        );
+        assert_eq!(
+            want.slug, got.slug,
+            "field `slug` not persisted (project frontmatter round-trip)"
+        );
+        assert_eq!(
+            want.title, got.title,
+            "field `title` not persisted (project frontmatter round-trip)"
+        );
+        assert_eq!(
+            want.description, got.description,
+            "field `description` not persisted (project markdown body round-trip)"
+        );
+        assert_eq!(
+            want.status, got.status,
+            "field `status` not persisted (project frontmatter round-trip)"
+        );
+        assert_eq!(
+            want.created_at, got.created_at,
+            "field `created_at` not persisted (project frontmatter round-trip)"
+        );
+        assert_eq!(
+            want.updated_at, got.updated_at,
+            "field `updated_at` not persisted (project frontmatter round-trip)"
+        );
+        assert_eq!(
+            want.created_by, got.created_by,
+            "field `created_by` not persisted (project frontmatter round-trip)"
+        );
+    }
+
+    fn assert_phase_all_fields_persisted(want: &Phase, got: &Phase) {
+        assert_eq!(
+            want.id, got.id,
+            "field `id` not persisted (phase frontmatter round-trip)"
+        );
+        assert_eq!(
+            want.project, got.project,
+            "field `project` not persisted (phase frontmatter round-trip)"
+        );
+        assert_eq!(
+            want.slug, got.slug,
+            "field `slug` not persisted (phase frontmatter round-trip)"
+        );
+        assert_eq!(
+            want.title, got.title,
+            "field `title` not persisted (phase frontmatter round-trip)"
+        );
+        assert_eq!(
+            want.body, got.body,
+            "field `body` not persisted (phase markdown body round-trip)"
+        );
+        assert_eq!(
+            want.order, got.order,
+            "field `order` not persisted (phase frontmatter round-trip)"
+        );
+        assert_eq!(
+            want.status, got.status,
+            "field `status` not persisted (phase frontmatter round-trip)"
+        );
+        assert_eq!(
+            want.created_at, got.created_at,
+            "field `created_at` not persisted (phase frontmatter round-trip)"
+        );
+        assert_eq!(
+            want.updated_at, got.updated_at,
+            "field `updated_at` not persisted (phase frontmatter round-trip)"
+        );
+        assert_eq!(
+            want.created_by, got.created_by,
+            "field `created_by` not persisted (phase frontmatter round-trip)"
+        );
+    }
+
+    fn assert_task_all_fields_persisted(want: &Task, got: &Task) {
+        assert_eq!(
+            want.id, got.id,
+            "field `id` not persisted (task frontmatter round-trip)"
+        );
+        assert_eq!(
+            want.project, got.project,
+            "field `project` not persisted (task frontmatter round-trip)"
+        );
+        assert_eq!(
+            want.phase, got.phase,
+            "field `phase` not persisted (task frontmatter round-trip)"
+        );
+        assert_eq!(
+            want.slug, got.slug,
+            "field `slug` not persisted (task frontmatter round-trip)"
+        );
+        assert_eq!(
+            want.title, got.title,
+            "field `title` not persisted (task frontmatter round-trip)"
+        );
+        assert_eq!(
+            want.body, got.body,
+            "field `body` not persisted (task markdown body round-trip)"
+        );
+        assert_eq!(
+            want.status, got.status,
+            "field `status` not persisted (task frontmatter round-trip)"
+        );
+        assert_eq!(
+            want.assignee, got.assignee,
+            "field `assignee` not persisted (task frontmatter round-trip)"
+        );
+        assert_eq!(
+            want.claimed_at, got.claimed_at,
+            "field `claimed_at` not persisted (task frontmatter round-trip)"
+        );
+        assert_eq!(
+            want.completed_at, got.completed_at,
+            "field `completed_at` not persisted (task frontmatter round-trip)"
+        );
+        assert_eq!(
+            want.created_at, got.created_at,
+            "field `created_at` not persisted (task frontmatter round-trip)"
+        );
+        assert_eq!(
+            want.updated_at, got.updated_at,
+            "field `updated_at` not persisted (task frontmatter round-trip)"
+        );
+        assert_eq!(
+            want.notes.len(),
+            got.notes.len(),
+            "field `notes` count not persisted (`## Notes` section round-trip)"
+        );
+        for (i, (wn, gn)) in want.notes.iter().zip(got.notes.iter()).enumerate() {
+            assert_eq!(
+                wn.actor, gn.actor,
+                "field `notes[{i}].actor` not persisted (`## Notes` section round-trip)",
+            );
+            assert_eq!(
+                wn.body, gn.body,
+                "field `notes[{i}].body` not persisted (`## Notes` section round-trip)",
+            );
+            assert_eq!(
+                wn.posted_at, gn.posted_at,
+                "field `notes[{i}].posted_at` not persisted (`## Notes` section round-trip)",
+            );
+        }
+    }
+
+    #[test]
+    fn project_frontmatter_roundtrip_all_fields() {
+        let ts_create = DateTime::parse_from_rfc3339("2025-03-03T03:03:03Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let ts_upd = DateTime::parse_from_rfc3339("2025-04-04T04:04:04Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let (tmp, store) = fresh_corpus();
+        let slug = "fm_rt_proj";
+        let proj_dir = tmp.path().join("projects").join(slug);
+        fs::create_dir_all(&proj_dir).expect("mkdir project");
+
+        let want = Project {
+            id: new_id("prj"),
+            slug: slug.to_owned(),
+            title: "fm-rt:title with spaces & symbols".to_owned(),
+            description: "First paragraph persisted.\n\nSecond line `: # yaml-ish` chars."
+                .to_owned(),
+            status: ProjectStatus::Paused,
+            created_at: ts_create,
+            updated_at: ts_upd,
+            created_by: "human:roundtrip_tester".to_owned(),
+        };
+
+        let content = serialize_project_file(&want).expect("serialize");
+        write_atomic(&proj_dir.join("project.md"), content.as_bytes()).expect("write");
+
+        let got = store.get_project(slug).expect("read back");
+        assert_project_all_fields_persisted(&want, &got);
+    }
+
+    #[test]
+    fn phase_frontmatter_roundtrip_all_fields() {
+        let ts_create = DateTime::parse_from_rfc3339("2025-05-05T05:05:05Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let ts_upd = DateTime::parse_from_rfc3339("2025-06-06T06:06:06Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let (tmp, store) = fresh_corpus();
+        let proj_slug = "fm_rt_phase_proj";
+        let phase_slug = "fm_rt_phase";
+        let prj_id = new_id("prj");
+        let phs_id = new_id("phs");
+
+        let proj_dir = tmp.path().join("projects").join(proj_slug);
+        let phases_dir = proj_dir.join("phases");
+        fs::create_dir_all(&phases_dir).expect("mkdir phases");
+
+        let want = Phase {
+            id: phs_id,
+            project: prj_id,
+            slug: phase_slug.to_owned(),
+            title: "Phase title — persisted".to_owned(),
+            body: "Phase body line one.\n\n### Not the notes delimiter".to_owned(),
+            order: 7_i32,
+            status: PhaseStatus::Skipped,
+            created_at: ts_create,
+            updated_at: ts_upd,
+            created_by: "agent:test-roundtrip".to_owned(),
+        };
+
+        let path = phases_dir.join(phase_filename(want.order, phase_slug));
+        let content = serialize_phase_file(&want).expect("serialize phase");
+        write_atomic(&path, content.as_bytes()).expect("write phase");
+
+        let phases = store
+            .list_phases(&phase_filter_for(proj_slug))
+            .expect("list phases");
+        let got = phases
+            .iter()
+            .find(|p| p.slug == phase_slug)
+            .expect("phase readable");
+        assert_phase_all_fields_persisted(&want, got);
+    }
+
+    #[test]
+    fn task_frontmatter_roundtrip_all_fields() {
+        let ts_create = DateTime::parse_from_rfc3339("2025-07-07T07:07:07Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let ts_upd = DateTime::parse_from_rfc3339("2025-08-08T08:08:08Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let ts_claim = DateTime::parse_from_rfc3339("2025-09-09T09:09:09Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let ts_done = DateTime::parse_from_rfc3339("2025-10-10T10:10:10Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let (tmp, store) = fresh_corpus();
+        let proj_slug = "fm_rt_task_proj";
+        let task_slug = "fm_rt_task";
+        let prj_id = new_id("prj");
+        let phs_id = new_id("phs");
+
+        let proj_dir = tmp.path().join("projects").join(proj_slug);
+        let tasks_dir = proj_dir.join("tasks");
+        fs::create_dir_all(&tasks_dir).expect("mkdir tasks");
+
+        let note = Note {
+            actor: "human:memo".to_owned(),
+            body: "Note body survives round-trip".to_owned(),
+            posted_at: DateTime::parse_from_rfc3339("2025-11-11T11:11:11Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let notes_lines = vec![format_note_line(
+            note.posted_at,
+            note.actor.as_str(),
+            note.body.as_str(),
+        )];
+
+        let tsk_id = new_id("tsk");
+        let want = Task {
+            id: tsk_id.clone(),
+            project: prj_id,
+            phase: phs_id,
+            slug: task_slug.to_owned(),
+            title: "Task title persisted".to_owned(),
+            body: "Spec uses ### Notes not ## Notes.".to_owned(),
+            status: TaskStatus::Blocked,
+            assignee: "human:blocked_holder".to_owned(),
+            claimed_at: Some(ts_claim),
+            completed_at: Some(ts_done),
+            created_at: ts_create,
+            updated_at: ts_upd,
+            notes: vec![note],
+        };
+
+        let path = tasks_dir.join(task_filename(&tsk_id, task_slug));
+        let content = serialize_task_file(&want, &notes_lines).expect("serialize task");
+        write_atomic(&path, content.as_bytes()).expect("write task");
+
+        let tasks = store
+            .list_tasks(&task_filter_for(proj_slug))
+            .expect("list tasks");
+        let got = tasks
+            .iter()
+            .find(|t| t.slug == task_slug)
+            .expect("task readable");
+        assert_task_all_fields_persisted(&want, got);
     }
 }
