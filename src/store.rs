@@ -661,11 +661,7 @@ impl FsStore {
             bail!("slug is required");
         }
         let project_dir = self.project_dir(&args.slug)?;
-        if !project_dir.exists() {
-            bail!("project not found: {}", args.slug);
-        }
-        let project_md = project_dir.join("project.md");
-        if !project_md.is_file() {
+        if !project_dir.try_exists()? {
             bail!("project not found: {}", args.slug);
         }
         let mut project = self.load_project(&args.slug, true)?;
