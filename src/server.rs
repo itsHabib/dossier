@@ -825,7 +825,6 @@ const USER_ERROR_MARKERS: &[&str] = &[
     "cannot claim task in terminal state",
     "task already claimed by",
     "task must be in_progress to complete",
-    "duplicate task id",
     "kind is required",
     "ref is required",
     "label is required",
