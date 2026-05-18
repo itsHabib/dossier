@@ -25,7 +25,7 @@ Add a secondary `id` key on every sort branch. ULIDs are time-sortable and uniqu
 
 ```rust
 TaskOrderField::CreatedAt => out.sort_by(|a, b| {
-    a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id))
+    a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id))
 }),
 ```
 
