@@ -660,6 +660,7 @@ impl FsStore {
         if args.slug.is_empty() {
             bail!("slug is required");
         }
+        self.project_dir(&args.slug)?;
         let mut project = self.load_project(&args.slug, true)?;
         if let Some(title) = args.title {
             project.title = title;
@@ -2057,6 +2058,20 @@ mod tests {
                 project: BAD_PROJECT_SLUG.to_owned(),
                 slug: "spec".to_owned(),
                 title: Some("x".to_owned()),
+                ..Default::default()
+            })
+            .expect_err("invalid slug");
+        assert!(err.to_string().contains("invalid slug"), "got: {err}");
+    }
+
+    #[test]
+    fn add_phase_rejects_invalid_project_slug() {
+        let (_tmp, store) = fresh_corpus();
+        let err = store
+            .add_phase(NewPhase {
+                project: BAD_PROJECT_SLUG.to_owned(),
+                slug: "spec".to_owned(),
+                title: "x".to_owned(),
                 ..Default::default()
             })
             .expect_err("invalid slug");
