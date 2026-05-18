@@ -127,14 +127,19 @@ batches:
   - id: 6
     label: after batch 5
     depends_on: [5]
-    status: pending
+    status: done
+    completed_at: 2026-05-18T06:04:10Z
     streams:
       - task_id: tsk_01KRW29PGBCV2MDQ7KJTMJ27EJ
         task_slug: task-get-by-id-verb
         spec_path: docs/features/hygiene-followups/task-get-by-id-verb.md
         branch_name: tower/hygiene-task-get-by-id
         touches: [src/store.rs, src/server.rs, src/domain.rs]
-        status: pending
+        status: done
+        pr_number: 36
+        merge_commit: baad7bdeb4284c1f52b6088b2a1adcbd12b123ac
+        merged_at: 2026-05-18T06:04:10Z
+        cycles: 1
 
 conflict_notes:
   - kind: file_overlap
