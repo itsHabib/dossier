@@ -79,6 +79,7 @@ order: 1
 status: done          # pending | active | done | skipped
 created_at: 2026-05-10T14:30:00Z
 updated_at: 2026-05-10T15:10:00Z
+created_by: human:mh
 ---
 
 Acceptance: PROTOCOL.md exists and covers primitives, verbs, state
