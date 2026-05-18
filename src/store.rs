@@ -1644,8 +1644,8 @@ fn project_matches(p: &Project, f: &ProjectListFilter) -> bool {
 fn sort_projects(out: &mut [Project], f: &ProjectListFilter) {
     let order = f.order_by.unwrap_or(ProjectOrderField::CreatedAt);
     out.sort_by(|a, b| match order {
-        ProjectOrderField::CreatedAt => a.created_at.cmp(&b.created_at),
-        ProjectOrderField::UpdatedAt => a.updated_at.cmp(&b.updated_at),
+        ProjectOrderField::CreatedAt => a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)),
+        ProjectOrderField::UpdatedAt => a.updated_at.cmp(&b.updated_at).then(a.id.cmp(&b.id)),
     });
     if f.desc.unwrap_or(false) {
         out.reverse();
@@ -1670,11 +1670,15 @@ fn phase_matches(p: &Phase, f: &PhaseListFilter) -> bool {
 fn sort_phases(out: &mut [Phase], f: &PhaseListFilter) {
     let order = f.order_by.unwrap_or(PhaseOrderField::Order);
     out.sort_by(|a, b| match order {
-        PhaseOrderField::CreatedAt => a.created_at.cmp(&b.created_at),
-        PhaseOrderField::UpdatedAt => a.updated_at.cmp(&b.updated_at),
+        PhaseOrderField::CreatedAt => a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)),
+        PhaseOrderField::UpdatedAt => a.updated_at.cmp(&b.updated_at).then(a.id.cmp(&b.id)),
         // Cross-project listings group by project so the linear `order`
         // sort stays meaningful — phase order is per-project, not global.
-        PhaseOrderField::Order => a.project.cmp(&b.project).then(a.order.cmp(&b.order)),
+        PhaseOrderField::Order => a
+            .project
+            .cmp(&b.project)
+            .then(a.order.cmp(&b.order))
+            .then(a.id.cmp(&b.id)),
     });
     if f.desc.unwrap_or(false) {
         out.reverse();
@@ -1734,15 +1738,19 @@ fn sort_tasks(out: &mut Vec<Task>, f: &TaskListFilter) {
     // almost certainly not what the caller wants. This mirrors the
     // documented behavior in the spec.
     match order {
-        TaskOrderField::CreatedAt => out.sort_by_key(|t| t.created_at),
-        TaskOrderField::UpdatedAt => out.sort_by_key(|t| t.updated_at),
+        TaskOrderField::CreatedAt => {
+            out.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+        }
+        TaskOrderField::UpdatedAt => {
+            out.sort_by(|a, b| a.updated_at.cmp(&b.updated_at).then(a.id.cmp(&b.id)));
+        }
         TaskOrderField::CompletedAt => {
             out.retain(|t| t.completed_at.is_some());
-            out.sort_by_key(|t| t.completed_at);
+            out.sort_by(|a, b| a.completed_at.cmp(&b.completed_at).then(a.id.cmp(&b.id)));
         }
         TaskOrderField::ClaimedAt => {
             out.retain(|t| t.claimed_at.is_some());
-            out.sort_by_key(|t| t.claimed_at);
+            out.sort_by(|a, b| a.claimed_at.cmp(&b.claimed_at).then(a.id.cmp(&b.id)));
         }
     }
     if f.desc.unwrap_or(false) {
@@ -3447,6 +3455,102 @@ mod tests {
 
     fn t(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    fn stub_task(id: &str, created_at: DateTime<Utc>) -> Task {
+        Task {
+            id: id.to_owned(),
+            project: "alpha".to_owned(),
+            phase: String::new(),
+            slug: "stub".to_owned(),
+            title: "stub".to_owned(),
+            body: String::new(),
+            status: TaskStatus::Todo,
+            assignee: String::new(),
+            claimed_at: None,
+            completed_at: None,
+            created_at,
+            updated_at: created_at,
+            notes: Vec::new(),
+        }
+    }
+
+    fn stub_phase(id: &str, project_slug: &str, created_at: DateTime<Utc>) -> Phase {
+        Phase {
+            id: id.to_owned(),
+            project: project_slug.to_owned(),
+            slug: "stub".to_owned(),
+            title: "stub".to_owned(),
+            body: String::new(),
+            order: 1_i32,
+            status: PhaseStatus::Pending,
+            created_at,
+            updated_at: created_at,
+        }
+    }
+
+    fn stub_project(id: &str, slug: &str, created_at: DateTime<Utc>) -> Project {
+        Project {
+            id: id.to_owned(),
+            slug: slug.to_owned(),
+            title: "stub".to_owned(),
+            description: String::new(),
+            status: ProjectStatus::Planning,
+            created_at,
+            updated_at: created_at,
+            created_by: String::new(),
+        }
+    }
+
+    #[test]
+    fn sort_tasks_ties_break_on_id_asc() {
+        let ts = t("2026-06-06T06:06:06Z");
+        let higher_id_first = stub_task("tsk_ZZZZZZZZZZZZZZZZZZZZZZZZ", ts);
+        let lower_id_second = stub_task("tsk_AAAAAAAAAAAAAAAAAAAAAAAA", ts);
+        let mut rows = vec![higher_id_first, lower_id_second];
+        sort_tasks(
+            &mut rows,
+            &TaskListFilter {
+                order_by: Some(TaskOrderField::CreatedAt),
+                ..TaskListFilter::default()
+            },
+        );
+        assert_eq!(rows[0].id.as_str(), "tsk_AAAAAAAAAAAAAAAAAAAAAAAA");
+        assert_eq!(rows[1].id.as_str(), "tsk_ZZZZZZZZZZZZZZZZZZZZZZZZ");
+    }
+
+    #[test]
+    fn sort_phases_ties_break_on_id_asc() {
+        let ts = t("2026-06-06T06:06:06Z");
+        let higher_id_first = stub_phase("phs_ZZZZZZZZZZZZZZZZZZZZZZZZ", "alpha", ts);
+        let lower_id_second = stub_phase("phs_AAAAAAAAAAAAAAAAAAAAAAAA", "alpha", ts);
+        let mut rows = vec![higher_id_first, lower_id_second];
+        sort_phases(
+            &mut rows,
+            &PhaseListFilter {
+                order_by: Some(PhaseOrderField::CreatedAt),
+                ..PhaseListFilter::default()
+            },
+        );
+        assert_eq!(rows[0].id.as_str(), "phs_AAAAAAAAAAAAAAAAAAAAAAAA");
+        assert_eq!(rows[1].id.as_str(), "phs_ZZZZZZZZZZZZZZZZZZZZZZZZ");
+    }
+
+    #[test]
+    fn sort_projects_ties_break_on_id_asc() {
+        let ts = t("2026-06-06T06:06:06Z");
+        let higher_id_first = stub_project("prj_ZZZZZZZZZZZZZZZZZZZZZZZZ", "zed", ts);
+        let lower_id_second = stub_project("prj_AAAAAAAAAAAAAAAAAAAAAAAA", "alef", ts);
+        let mut rows = vec![higher_id_first, lower_id_second];
+        sort_projects(
+            &mut rows,
+            &ProjectListFilter {
+                order_by: Some(ProjectOrderField::CreatedAt),
+                ..ProjectListFilter::default()
+            },
+        );
+        assert_eq!(rows[0].id.as_str(), "prj_AAAAAAAAAAAAAAAAAAAAAAAA");
+        assert_eq!(rows[1].id.as_str(), "prj_ZZZZZZZZZZZZZZZZZZZZZZZZ");
     }
 
     #[test]
