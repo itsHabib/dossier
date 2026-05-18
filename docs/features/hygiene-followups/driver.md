@@ -49,20 +49,29 @@ batches:
   - id: 2
     label: after batch 1
     depends_on: [1]
-    status: pending
+    status: done
+    completed_at: 2026-05-18T03:13:45Z
     streams:
       - task_id: tsk_01KRSZG60JG3S0JF294AA3459V
         task_slug: uniform-error-data-taxonomy
         spec_path: docs/features/hygiene-followups/uniform-error-data-taxonomy.md
         branch_name: tower/hygiene-uniform-errors
         touches: [src/server.rs]
-        status: pending
+        status: done
+        pr_number: 28
+        merge_commit: da40087f83bfe9e8d009a63eb973c99de67c8bf7
+        merged_at: 2026-05-18T03:13:32Z
+        cycles: 2
       - task_id: tsk_01KRSZFQNBR0HNTV12D2D97MTH
         task_slug: slug-validation-remaining-paths
         spec_path: docs/features/hygiene-followups/slug-validation-remaining-paths.md
         branch_name: tower/hygiene-slug-validation
         touches: [src/store.rs]
-        status: pending
+        status: done
+        pr_number: 29
+        merge_commit: c17ba6f82e4ce755db47466ae46d7a05c6713050
+        merged_at: 2026-05-18T03:13:45Z
+        cycles: 2
 
   - id: 3
     label: after batch 2
