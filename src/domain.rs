@@ -122,6 +122,12 @@ pub struct Artifact {
     pub actor: String,
 }
 
+/// Arguments for `task.get` — fetch one task by id without project context.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TaskGetArgs {
+    pub id: String,
+}
+
 /// Predicate set for `FsStore::list_tasks`. Every field is optional; an
 /// empty filter returns every task. Predicates AND-together.
 ///
