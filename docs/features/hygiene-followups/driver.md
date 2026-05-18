@@ -12,26 +12,39 @@ batches:
   - id: 1
     label: ready now
     depends_on: []
-    status: pending
+    status: done
+    completed_at: 2026-05-18T02:25:30Z
     streams:
       - task_id: tsk_01KRSZFXMNZYKCMWYV3Z85E6XJ
         task_slug: actor-on-update-verbs
         spec_path: docs/features/hygiene-followups/actor-on-update-verbs.md
         branch_name: tower/hygiene-actor-on-update-verbs
         touches: [src/server.rs]
-        status: pending
+        status: done
+        pr_number: 24
+        merge_commit: e966e87ddf963f19b0e7e13e5424cd9162893532
+        merged_at: 2026-05-18T02:22:26Z
+        cycles: 2
       - task_id: tsk_01KRV8788KM9JCS9YDWD0H6WJ5
         task_slug: sort-determinism-secondary-key
         spec_path: docs/features/hygiene-followups/sort-determinism-secondary-key.md
         branch_name: tower/hygiene-sort-determinism
         touches: [src/store.rs]
-        status: pending
+        status: done
+        pr_number: 25
+        merge_commit: d6085a7f1c4f7603f174170e5a1ee81423fc4792
+        merged_at: 2026-05-18T02:24:10Z
+        cycles: 2
       - task_id: tsk_01KRW29YMNAG063612PHZY4EH6
         task_slug: phase-slug-cross-project-collision
         spec_path: docs/features/hygiene-followups/phase-slug-cross-project-collision.md
         branch_name: tower/hygiene-phase-slug-collision
         touches: [PROTOCOL.md]
-        status: pending
+        status: done
+        pr_number: 26
+        merge_commit: 4cdcf075cf3716d1e249a5de3d5af2da0bf2fa18
+        merged_at: 2026-05-18T02:23:28Z
+        cycles: 2
 
   - id: 2
     label: after batch 1
