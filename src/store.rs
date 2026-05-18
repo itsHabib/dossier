@@ -689,6 +689,9 @@ impl FsStore {
         if args.project.is_empty() {
             bail!("project is required");
         }
+        if args.actor.is_empty() {
+            bail!("actor is required to add a phase");
+        }
         if !is_valid_slug(&args.slug) {
             bail!(
                 "slug must be lowercase ascii (a-z, 0-9, -, _): {}",
@@ -2194,6 +2197,24 @@ mod tests {
     }
 
     #[test]
+    fn add_phase_rejects_empty_actor() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+
+        let err = store
+            .add_phase(NewPhase {
+                project: "alpha".to_owned(),
+                slug: "spec".to_owned(),
+                title: "Spec phase".to_owned(),
+                body: String::new(),
+                after_phase: None,
+                actor: String::new(),
+            })
+            .expect_err("empty actor");
+        assert!(err.to_string().contains("actor is required"), "got: {err}");
+    }
+
+    #[test]
     fn read_phase_with_missing_created_by_defaults_gracefully() {
         let (tmp, store) = fresh_corpus();
         let project = seed_project(&store, "alpha");
@@ -3646,7 +3667,7 @@ mod tests {
             status: PhaseStatus::Pending,
             created_at,
             updated_at: created_at,
-            created_by: String::new(),
+            created_by: "unknown".to_owned(),
         }
     }
 
