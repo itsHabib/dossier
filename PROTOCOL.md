@@ -96,6 +96,15 @@ A pointer to something concrete the work produced or depends on.
 | `label`       | string                                                        | short human-readable                |
 | `linked_at`   | timestamp                                                     |                                     |
 
+## Slug scope
+
+Phase and task slugs are unique **within their parent project**, not globally. Two projects can both have phases named
+`write-side` (and several in the dossier portfolio do). Use the project slug +
+phase slug as the addressing tuple at the MCP boundary; the ULID is the
+corpus-global identifier. Tooling that takes a bare `phase:<slug>` argument
+must disambiguate across projects (or require a project hint). The same
+observation applies to task slugs.
+
 ## Verbs (MCP tools)
 
 Names are dot-segmented. All return the affected resource on success. All
