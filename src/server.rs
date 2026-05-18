@@ -1014,6 +1014,27 @@ mod tests {
     }
 
     #[test]
+    fn project_update_args_ignores_actor_from_old_clients() {
+        let raw = r#"{"slug": "alpha", "actor": "human:legacy"}"#;
+        let args: ProjectUpdateArgs = serde_json::from_str(raw).expect("deserialize");
+        assert_eq!(args.slug, "alpha");
+        assert!(args.title.is_none());
+        assert!(args.description.is_none());
+        assert!(args.status.is_none());
+    }
+
+    #[test]
+    fn phase_update_args_ignores_actor_from_old_clients() {
+        let raw = r#"{"project": "alpha", "slug": "spec", "actor": "human:legacy"}"#;
+        let args: PhaseUpdateArgs = serde_json::from_str(raw).expect("deserialize");
+        assert_eq!(args.project, "alpha");
+        assert_eq!(args.slug, "spec");
+        assert!(args.title.is_none());
+        assert!(args.body.is_none());
+        assert!(args.status.is_none());
+    }
+
+    #[test]
     fn project_update_and_phase_update_succeed_without_actor() {
         let (_tmp, svc) = fresh_service();
 
