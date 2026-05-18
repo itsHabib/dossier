@@ -2072,7 +2072,25 @@ mod tests {
                 project: BAD_PROJECT_SLUG.to_owned(),
                 slug: "spec".to_owned(),
                 title: "x".to_owned(),
-                ..Default::default()
+                body: String::new(),
+                after_phase: None,
+                actor: "human:test".to_owned(),
+            })
+            .expect_err("invalid slug");
+        assert!(err.to_string().contains("invalid slug"), "got: {err}");
+    }
+
+    #[test]
+    fn link_artifact_rejects_invalid_project_slug() {
+        let (_tmp, store) = fresh_corpus();
+        let err = store
+            .link_artifact(LinkArtifact {
+                project: BAD_PROJECT_SLUG.to_owned(),
+                task: None,
+                kind: "pr".to_owned(),
+                reference: "https://example.com/pr/1".to_owned(),
+                label: "PR #1".to_owned(),
+                actor: "human:test".to_owned(),
             })
             .expect_err("invalid slug");
         assert!(err.to_string().contains("invalid slug"), "got: {err}");
