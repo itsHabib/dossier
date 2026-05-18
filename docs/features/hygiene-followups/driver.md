@@ -93,26 +93,36 @@ batches:
   - id: 4
     label: after batch 3
     depends_on: [3]
-    status: pending
+    status: done
+    completed_at: 2026-05-18T05:48:07Z
     streams:
       - task_id: tsk_01KRSZFVCFPYRN3Q7RCFGQ89HQ
         task_slug: clean-update-project-not-found
         spec_path: docs/features/hygiene-followups/clean-update-project-not-found.md
         branch_name: tower/hygiene-clean-update-project
         touches: [src/store.rs]
-        status: pending
+        status: done
+        pr_number: 33
+        merge_commit: d9fc35c37f3d26fb8f4386ea7d7ef0e796c750dc
+        merged_at: 2026-05-18T05:48:07Z
+        cycles: 1
 
   - id: 5
     label: after batch 4
     depends_on: [4]
-    status: pending
+    status: done
+    completed_at: 2026-05-18T05:48:52Z
     streams:
       - task_id: tsk_01KRSZG2ZYV3BTY6E8HCPHG8S1
         task_slug: frontmatter-field-drift-test
         spec_path: docs/features/hygiene-followups/frontmatter-field-drift-test.md
         branch_name: tower/hygiene-frontmatter-drift
         touches: [src/store.rs]
-        status: pending
+        status: done
+        pr_number: 34
+        merge_commit: 36ed39d57c9c04ea080f288c1da94c4f78c28476
+        merged_at: 2026-05-18T05:48:52Z
+        cycles: 1
 
   - id: 6
     label: after batch 5
