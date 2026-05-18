@@ -47,6 +47,13 @@ impl FsStore {
         &self.root
     }
 
+    fn project_dir(&self, slug: &str) -> Result<PathBuf> {
+        if !is_valid_slug(slug) {
+            bail!("invalid slug: {slug}");
+        }
+        Ok(self.root.join("projects").join(slug))
+    }
+
     /// List projects subject to a predicate filter.
     ///
     /// An empty filter (`ProjectListFilter::default()`) returns every
@@ -317,7 +324,7 @@ impl FsStore {
     /// Phases of a single project, unfiltered. Internal helper for both
     /// the single-project and cross-project list paths.
     fn load_phases_for(&self, project_slug: &str) -> Result<Vec<Phase>> {
-        let dir = self.root.join("projects").join(project_slug).join("phases");
+        let dir = self.project_dir(project_slug)?.join("phases");
         if !dir.exists() {
             return Ok(Vec::new());
         }
@@ -341,7 +348,7 @@ impl FsStore {
     /// Tasks of a single project, unfiltered. Internal helper for both
     /// the single-project and cross-project list paths.
     fn load_tasks_for(&self, project_slug: &str) -> Result<Vec<Task>> {
-        let dir = self.root.join("projects").join(project_slug).join("tasks");
+        let dir = self.project_dir(project_slug)?.join("tasks");
         if !dir.exists() {
             return Ok(Vec::new());
         }
@@ -364,11 +371,7 @@ impl FsStore {
     /// Artifacts linked to a project. JSONL on disk; the file may be
     /// missing or empty (both yield an empty vec).
     pub fn list_artifacts(&self, project_slug: &str) -> Result<Vec<Artifact>> {
-        let path = self
-            .root
-            .join("projects")
-            .join(project_slug)
-            .join("artifacts.jsonl");
+        let path = self.project_dir(project_slug)?.join("artifacts.jsonl");
         if !path.exists() {
             return Ok(Vec::new());
         }
@@ -388,7 +391,7 @@ impl FsStore {
     }
 
     fn load_project(&self, slug: &str, with_body: bool) -> Result<Project> {
-        let path = self.root.join("projects").join(slug).join("project.md");
+        let path = self.project_dir(slug)?.join("project.md");
         let (front, body) = read_frontmatter(&path)?;
         let mut p: Project = serde_yml::from_str(&front)
             .with_context(|| format!("parse project frontmatter {}", path.display()))?;
@@ -626,13 +629,7 @@ impl FsStore {
         if args.slug.is_empty() {
             bail!("slug is required");
         }
-        if !is_valid_slug(&args.slug) {
-            bail!(
-                "slug must be lowercase ascii (a-z, 0-9, -, _): {}",
-                args.slug
-            );
-        }
-        let dir = self.root.join("projects").join(&args.slug);
+        let dir = self.project_dir(&args.slug)?;
         if dir.exists() {
             bail!("project slug already exists: {}", args.slug);
         }
@@ -663,6 +660,7 @@ impl FsStore {
         if args.slug.is_empty() {
             bail!("slug is required");
         }
+        self.project_dir(&args.slug)?;
         let mut project = self.load_project(&args.slug, true)?;
         if let Some(title) = args.title {
             project.title = title;
@@ -675,11 +673,7 @@ impl FsStore {
         }
         project.updated_at = now_utc();
 
-        let path = self
-            .root
-            .join("projects")
-            .join(&project.slug)
-            .join("project.md");
+        let path = self.project_dir(&project.slug)?.join("project.md");
         let content = serialize_project_file(&project)?;
         write_atomic(&path, content.as_bytes())?;
         Ok(project)
@@ -701,7 +695,7 @@ impl FsStore {
                 args.slug
             );
         }
-        let project_dir = self.root.join("projects").join(&args.project);
+        let project_dir = self.project_dir(&args.project)?;
         if !project_dir.exists() {
             bail!("project not found: {}", args.project);
         }
@@ -723,11 +717,7 @@ impl FsStore {
             None => existing.iter().map(|p| p.order).max().unwrap_or(0) + 1,
         };
 
-        let phases_dir = self
-            .root
-            .join("projects")
-            .join(&args.project)
-            .join("phases");
+        let phases_dir = project_dir.join("phases");
         fs::create_dir_all(&phases_dir)
             .with_context(|| format!("create {}", phases_dir.display()))?;
 
@@ -794,7 +784,7 @@ impl FsStore {
     }
 
     fn find_phase_path(&self, project_slug: &str, phase_slug: &str) -> Result<PathBuf> {
-        let phases_dir = self.root.join("projects").join(project_slug).join("phases");
+        let phases_dir = self.project_dir(project_slug)?.join("phases");
         if !phases_dir.exists() {
             bail!("phase not found: {project_slug}/{phase_slug}");
         }
@@ -836,12 +826,6 @@ impl FsStore {
         if args.slug.is_empty() {
             bail!("slug is required");
         }
-        if !is_valid_slug(&args.project) {
-            bail!(
-                "project slug must be lowercase ascii (a-z, 0-9, -, _): {}",
-                args.project
-            );
-        }
         if let Some(phase) = &args.phase {
             if phase.is_empty() {
                 bail!("phase is required (omit the field entirely for a project-wide task)");
@@ -856,7 +840,7 @@ impl FsStore {
                 args.slug
             );
         }
-        let project_dir = self.root.join("projects").join(&args.project);
+        let project_dir = self.project_dir(&args.project)?;
         if !project_dir.exists() {
             bail!("project not found: {}", args.project);
         }
@@ -1096,12 +1080,6 @@ impl FsStore {
         if args.project.is_empty() {
             bail!("project is required");
         }
-        if !is_valid_slug(&args.project) {
-            bail!(
-                "project slug must be lowercase ascii (a-z, 0-9, -, _): {}",
-                args.project
-            );
-        }
         if args.kind.is_empty() {
             bail!("kind is required");
         }
@@ -1122,7 +1100,7 @@ impl FsStore {
             }
         }
 
-        let project_dir = self.root.join("projects").join(&args.project);
+        let project_dir = self.project_dir(&args.project)?;
         if !project_dir.exists() {
             bail!("project not found: {}", args.project);
         }
@@ -1818,6 +1796,10 @@ mod tests {
         }
     }
 
+    /// Path-traversal-shaped caller input; must not reach filesystem join
+    /// without validation.
+    const BAD_PROJECT_SLUG: &str = "../etc/passwd";
+
     #[test]
     fn read_dogfood_corpus() {
         let store = FsStore::open(repo_root()).expect("open corpus");
@@ -2010,7 +1992,108 @@ mod tests {
                 actor: "human:test".to_owned(),
             })
             .expect_err("invalid slug");
-        assert!(err.to_string().contains("lowercase ascii"), "got: {err}");
+        assert!(err.to_string().contains("invalid slug"), "got: {err}");
+    }
+
+    #[test]
+    fn get_project_rejects_invalid_slug() {
+        let (_tmp, store) = fresh_corpus();
+        let err = store
+            .get_project(BAD_PROJECT_SLUG)
+            .expect_err("invalid slug");
+        assert!(err.to_string().contains("invalid slug"), "got: {err}");
+    }
+
+    #[test]
+    fn list_phases_rejects_invalid_project_slug() {
+        let (_tmp, store) = fresh_corpus();
+        let err = store
+            .list_phases(&PhaseListFilter {
+                project: Some(BAD_PROJECT_SLUG.to_owned()),
+                ..Default::default()
+            })
+            .expect_err("invalid slug");
+        assert!(err.to_string().contains("invalid slug"), "got: {err}");
+    }
+
+    #[test]
+    fn list_tasks_rejects_invalid_project_slug() {
+        let (_tmp, store) = fresh_corpus();
+        let err = store
+            .list_tasks(&TaskListFilter {
+                project: Some(BAD_PROJECT_SLUG.to_owned()),
+                ..Default::default()
+            })
+            .expect_err("invalid slug");
+        assert!(err.to_string().contains("invalid slug"), "got: {err}");
+    }
+
+    #[test]
+    fn list_artifacts_rejects_invalid_project_slug() {
+        let (_tmp, store) = fresh_corpus();
+        let err = store
+            .list_artifacts(BAD_PROJECT_SLUG)
+            .expect_err("invalid slug");
+        assert!(err.to_string().contains("invalid slug"), "got: {err}");
+    }
+
+    #[test]
+    fn update_project_rejects_invalid_slug() {
+        let (_tmp, store) = fresh_corpus();
+        let err = store
+            .update_project(UpdateProject {
+                slug: BAD_PROJECT_SLUG.to_owned(),
+                title: Some("x".to_owned()),
+                ..Default::default()
+            })
+            .expect_err("invalid slug");
+        assert!(err.to_string().contains("invalid slug"), "got: {err}");
+    }
+
+    #[test]
+    fn update_phase_rejects_invalid_project_slug() {
+        let (_tmp, store) = fresh_corpus();
+        let err = store
+            .update_phase(UpdatePhase {
+                project: BAD_PROJECT_SLUG.to_owned(),
+                slug: "spec".to_owned(),
+                title: Some("x".to_owned()),
+                ..Default::default()
+            })
+            .expect_err("invalid slug");
+        assert!(err.to_string().contains("invalid slug"), "got: {err}");
+    }
+
+    #[test]
+    fn add_phase_rejects_invalid_project_slug() {
+        let (_tmp, store) = fresh_corpus();
+        let err = store
+            .add_phase(NewPhase {
+                project: BAD_PROJECT_SLUG.to_owned(),
+                slug: "spec".to_owned(),
+                title: "x".to_owned(),
+                body: String::new(),
+                after_phase: None,
+                actor: "human:test".to_owned(),
+            })
+            .expect_err("invalid slug");
+        assert!(err.to_string().contains("invalid slug"), "got: {err}");
+    }
+
+    #[test]
+    fn link_artifact_rejects_invalid_project_slug() {
+        let (_tmp, store) = fresh_corpus();
+        let err = store
+            .link_artifact(LinkArtifact {
+                project: BAD_PROJECT_SLUG.to_owned(),
+                task: None,
+                kind: "pr".to_owned(),
+                reference: "https://example.com/pr/1".to_owned(),
+                label: "PR #1".to_owned(),
+                actor: "human:test".to_owned(),
+            })
+            .expect_err("invalid slug");
+        assert!(err.to_string().contains("invalid slug"), "got: {err}");
     }
 
     #[test]
@@ -2416,10 +2499,7 @@ mod tests {
                 actor: "human:test".to_owned(),
             })
             .expect_err("project slug must be validated");
-        assert!(
-            err.to_string().contains("project slug must be lowercase"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("invalid slug"), "got: {err}");
 
         let err = store
             .create_task(NewTask {
