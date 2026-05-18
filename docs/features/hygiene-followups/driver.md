@@ -76,14 +76,19 @@ batches:
   - id: 3
     label: after batch 2
     depends_on: [2]
-    status: pending
+    status: done
+    completed_at: 2026-05-18T05:25:10Z
     streams:
       - task_id: tsk_01KRSZFZY8DGTE19QSRYV0W3BA
         task_slug: phase-created-by-parity
         spec_path: docs/features/hygiene-followups/phase-created-by-parity.md
         branch_name: tower/hygiene-phase-created-by
         touches: [src/domain.rs, src/store.rs, src/server.rs, LAYOUT.md]
-        status: pending
+        status: done
+        pr_number: 31
+        merge_commit: 1efbd9288192a672a3d39f3760fbfe98a82d74fa
+        merged_at: 2026-05-18T05:25:10Z
+        cycles: 2
 
   - id: 4
     label: after batch 3
