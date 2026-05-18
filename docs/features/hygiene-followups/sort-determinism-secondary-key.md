@@ -1,4 +1,4 @@
-**Status**: draft
+**Status**: accepted (implemented)
 **Owner**: @itsHabib
 **Date**: 2026-05-17
 **Related**: dossier task `sort-determinism-secondary-key` (id: `tsk_01KRV8788KM9JCS9YDWD0H6WJ5`); originally from Claude review on [PR #16](https://github.com/itsHabib/dossier/pull/16#issuecomment-4471190657), round 2.
@@ -25,7 +25,7 @@ Add a secondary `id` key on every sort branch. ULIDs are time-sortable and uniqu
 
 ```rust
 TaskOrderField::CreatedAt => out.sort_by(|a, b| {
-    a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id))
+    a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id))
 }),
 ```
 
