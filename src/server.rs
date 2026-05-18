@@ -326,9 +326,6 @@ pub struct ProjectUpdateArgs {
     /// (`planning` | `active` | `paused` | `done` | `abandoned`)
     #[serde(default)]
     pub status: Option<ProjectStatus>,
-    /// who's making the update (provenance only; not stored on the project itself in v0)
-    #[allow(dead_code)] // surfaced in protocol, not yet persisted as a separate field
-    pub actor: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -365,9 +362,6 @@ pub struct PhaseUpdateArgs {
     /// (`pending` | `active` | `done` | `skipped`)
     #[serde(default)]
     pub status: Option<PhaseStatus>,
-    /// who's making the update
-    #[allow(dead_code)] // provenance, not persisted on the phase row in v0
-    pub actor: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -996,6 +990,73 @@ mod tests {
             Err(err) => panic!("empty args must succeed: {}", err.message),
         };
         assert!(out.projects.is_empty());
+    }
+
+    #[test]
+    fn project_update_args_deserialize_without_actor() {
+        let raw = r#"{"slug": "alpha", "title": "Renamed"}"#;
+        let args: ProjectUpdateArgs = serde_json::from_str(raw).expect("deserialize");
+        assert_eq!(args.slug, "alpha");
+        assert_eq!(args.title.as_deref(), Some("Renamed"));
+        assert!(args.description.is_none());
+        assert!(args.status.is_none());
+    }
+
+    #[test]
+    fn phase_update_args_deserialize_without_actor() {
+        let raw = r#"{"project": "alpha", "slug": "spec", "body": "done"}"#;
+        let args: PhaseUpdateArgs = serde_json::from_str(raw).expect("deserialize");
+        assert_eq!(args.project, "alpha");
+        assert_eq!(args.slug, "spec");
+        assert_eq!(args.body.as_deref(), Some("done"));
+        assert!(args.title.is_none());
+        assert!(args.status.is_none());
+    }
+
+    #[test]
+    fn project_update_and_phase_update_succeed_without_actor() {
+        let (_tmp, svc) = fresh_service();
+
+        svc.project_create(Parameters(ProjectCreateArgs {
+            slug: "alpha".to_owned(),
+            title: "Alpha".to_owned(),
+            description: String::new(),
+            actor: "human:test".to_owned(),
+        }))
+        .expect("project.create");
+
+        svc.phase_add(Parameters(PhaseAddArgs {
+            project: "alpha".to_owned(),
+            slug: "spec".to_owned(),
+            title: "Spec".to_owned(),
+            body: String::new(),
+            after_phase: None,
+            actor: "human:test".to_owned(),
+        }))
+        .expect("phase.add");
+
+        let Json(project) = svc
+            .project_update(Parameters(ProjectUpdateArgs {
+                slug: "alpha".to_owned(),
+                title: Some("Alpha2".to_owned()),
+                description: None,
+                status: Some(ProjectStatus::Active),
+            }))
+            .expect("project.update");
+        assert_eq!(project.title, "Alpha2");
+        assert_eq!(project.status, ProjectStatus::Active);
+
+        let Json(phase) = svc
+            .phase_update(Parameters(PhaseUpdateArgs {
+                project: "alpha".to_owned(),
+                slug: "spec".to_owned(),
+                title: Some("Spec2".to_owned()),
+                body: None,
+                status: Some(PhaseStatus::Done),
+            }))
+            .expect("phase.update");
+        assert_eq!(phase.title, "Spec2");
+        assert_eq!(phase.status, PhaseStatus::Done);
     }
 
     #[test]
