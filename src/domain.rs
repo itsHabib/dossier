@@ -62,6 +62,15 @@ pub struct Phase {
     pub status: PhaseStatus,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[serde(
+        default = "default_phase_created_by",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub created_by: String,
+}
+
+fn default_phase_created_by() -> String {
+    String::from("unknown")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

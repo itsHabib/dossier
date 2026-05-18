@@ -749,8 +749,8 @@ impl FsStore {
             status: PhaseStatus::Pending,
             created_at: now,
             updated_at: now,
+            created_by: args.actor,
         };
-        let _ = args.actor; // recorded in commit history; not persisted on the phase row in v0
         let path = phases_dir.join(phase_filename(new_order, &args.slug));
         let content = serialize_phase_file(&phase)?;
         write_atomic(&path, content.as_bytes())?;
@@ -1407,6 +1407,8 @@ struct PhaseFrontmatter<'a> {
     status: PhaseStatus,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    created_by: &'a str,
 }
 
 impl<'a> From<&'a Phase> for PhaseFrontmatter<'a> {
@@ -1420,6 +1422,7 @@ impl<'a> From<&'a Phase> for PhaseFrontmatter<'a> {
             status: p.status,
             created_at: p.created_at,
             updated_at: p.updated_at,
+            created_by: &p.created_by,
         }
     }
 }
@@ -2162,6 +2165,55 @@ mod tests {
                 actor: "human:test".to_owned(),
             })
             .expect("add phase")
+    }
+
+    #[test]
+    fn add_phase_persists_created_by() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+
+        let created = store
+            .add_phase(NewPhase {
+                project: "alpha".to_owned(),
+                slug: "spec".to_owned(),
+                title: "Spec phase".to_owned(),
+                body: String::new(),
+                after_phase: None,
+                actor: "claude-code:alice".to_owned(),
+            })
+            .expect("add_phase");
+
+        assert_eq!(created.created_by, "claude-code:alice");
+
+        let phases = store.list_phases(&phase_filter_for("alpha")).unwrap();
+        let round_trip = phases
+            .iter()
+            .find(|p| p.slug == "spec")
+            .expect("phase listed");
+        assert_eq!(round_trip.created_by, "claude-code:alice");
+    }
+
+    #[test]
+    fn read_phase_with_missing_created_by_defaults_gracefully() {
+        let (tmp, store) = fresh_corpus();
+        let project = seed_project(&store, "alpha");
+        let phs_id = new_id("phs");
+        let phases_dir = tmp.path().join("projects").join("alpha").join("phases");
+        fs::create_dir_all(&phases_dir).expect("mkdir phases");
+
+        let file_body = format!(
+            "---\nid: {phs_id}\nproject: {}\nslug: legacy\ntitle: Legacy\norder: 1\nstatus: pending\ncreated_at: 2026-05-10T14:30:00Z\nupdated_at: 2026-05-10T14:30:00Z\n---\n",
+            project.id
+        );
+        fs::write(phases_dir.join("01-legacy.md"), file_body).expect("write legacy phase");
+
+        let phases = store.list_phases(&phase_filter_for("alpha")).unwrap();
+        let p = phases
+            .iter()
+            .find(|ph| ph.slug == "legacy")
+            .expect("legacy phase readable");
+        assert_eq!(p.created_by, "unknown");
+        assert_eq!(&p.id, &phs_id);
     }
 
     #[test]
@@ -3594,6 +3646,7 @@ mod tests {
             status: PhaseStatus::Pending,
             created_at,
             updated_at: created_at,
+            created_by: String::new(),
         }
     }
 

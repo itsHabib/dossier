@@ -122,6 +122,7 @@ proptest! {
         prop_assert_eq!(fetched.order, created.order);
         prop_assert_eq!(&fetched.id, &created.id);
         prop_assert_eq!(fetched.status, created.status);
+        prop_assert_eq!(&fetched.created_by, "human:michael");
     }
 
     /// Task create → list-and-find round-trip. Task body must not
