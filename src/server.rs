@@ -7,6 +7,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use anyhow::Error as AnyhowError;
 use chrono::{DateTime, Utc};
 use rmcp::{
     handler::server::wrapper::{Json, Parameters},
@@ -316,6 +317,11 @@ pub struct ProjectCreateArgs {
 pub struct ProjectUpdateArgs {
     /// project slug (addressing key — slug is immutable in v0)
     pub slug: String,
+    /// optional actor for clients that send it; omit on update.
+    /// An explicit empty string is rejected — v0 does not record actors on
+    /// updates, but `""` is never meaningful for auditing.
+    #[serde(default)]
+    pub actor: Option<String>,
     /// new title; omit to leave unchanged
     #[serde(default)]
     pub title: Option<String>,
@@ -451,7 +457,7 @@ impl MeshService {
         let projects = self
             .store
             .list_projects(&ProjectListFilter::from(args))
-            .map_err(internal)?;
+            .map_err(internal_or_invalid)?;
         Ok(Json(ProjectListResult { projects }))
     }
 
@@ -475,7 +481,7 @@ impl MeshService {
                 description: args.description,
                 actor: args.actor,
             })
-            .map_err(internal)?;
+            .map_err(internal_or_invalid)?;
         Ok(Json(project))
     }
 
@@ -491,6 +497,9 @@ impl MeshService {
             .write_lock
             .lock()
             .map_err(|e| internal(format!("write lock poisoned: {e}")))?;
+        if matches!(args.actor.as_deref(), Some("")) {
+            return Err(ErrorData::invalid_params("actor must not be empty", None));
+        }
         let project = self
             .store
             .update_project(UpdateProject {
@@ -499,7 +508,7 @@ impl MeshService {
                 description: args.description,
                 status: args.status,
             })
-            .map_err(internal)?;
+            .map_err(internal_or_invalid)?;
         Ok(Json(project))
     }
 
@@ -511,7 +520,10 @@ impl MeshService {
         &self,
         Parameters(args): Parameters<ProjectGetArgs>,
     ) -> Result<Json<ProjectView>, ErrorData> {
-        let project = self.store.get_project(&args.slug).map_err(internal)?;
+        let project = self
+            .store
+            .get_project(&args.slug)
+            .map_err(internal_or_invalid)?;
         let phase_filter = PhaseListFilter {
             project: Some(args.slug.clone()),
             ..Default::default()
@@ -520,9 +532,18 @@ impl MeshService {
             project: Some(args.slug.clone()),
             ..Default::default()
         };
-        let phases = self.store.list_phases(&phase_filter).map_err(internal)?;
-        let tasks = self.store.list_tasks(&task_filter).map_err(internal)?;
-        let artifacts = self.store.list_artifacts(&args.slug).map_err(internal)?;
+        let phases = self
+            .store
+            .list_phases(&phase_filter)
+            .map_err(internal_or_invalid)?;
+        let tasks = self
+            .store
+            .list_tasks(&task_filter)
+            .map_err(internal_or_invalid)?;
+        let artifacts = self
+            .store
+            .list_artifacts(&args.slug)
+            .map_err(internal_or_invalid)?;
         Ok(Json(ProjectView {
             project,
             phases,
@@ -553,7 +574,7 @@ impl MeshService {
                 after_phase: args.after_phase,
                 actor: args.actor,
             })
-            .map_err(internal)?;
+            .map_err(internal_or_invalid)?;
         Ok(Json(phase))
     }
 
@@ -578,7 +599,7 @@ impl MeshService {
                 body: args.body,
                 status: args.status,
             })
-            .map_err(internal)?;
+            .map_err(internal_or_invalid)?;
         Ok(Json(phase))
     }
 
@@ -604,7 +625,7 @@ impl MeshService {
                 body: args.body,
                 actor: args.actor,
             })
-            .map_err(internal)?;
+            .map_err(internal_or_invalid)?;
         Ok(Json(task))
     }
 
@@ -626,7 +647,7 @@ impl MeshService {
                 id: args.id,
                 actor: args.actor,
             })
-            .map_err(internal)?;
+            .map_err(internal_or_invalid)?;
         Ok(Json(task))
     }
 
@@ -651,7 +672,7 @@ impl MeshService {
                 note: args.note,
                 actor: args.actor,
             })
-            .map_err(internal)?;
+            .map_err(internal_or_invalid)?;
         Ok(Json(task))
     }
 
@@ -674,7 +695,7 @@ impl MeshService {
                 note: args.note,
                 actor: args.actor,
             })
-            .map_err(internal)?;
+            .map_err(internal_or_invalid)?;
         Ok(Json(task))
     }
 
@@ -700,7 +721,7 @@ impl MeshService {
                 label: args.label,
                 actor: args.actor,
             })
-            .map_err(internal)?;
+            .map_err(internal_or_invalid)?;
         Ok(Json(artifact))
     }
 
@@ -713,7 +734,10 @@ impl MeshService {
         Parameters(args): Parameters<PhaseListArgs>,
     ) -> Result<Json<PhaseListResult>, ErrorData> {
         let filter = PhaseListFilter::from(args);
-        let phases = self.store.list_phases(&filter).map_err(internal)?;
+        let phases = self
+            .store
+            .list_phases(&filter)
+            .map_err(internal_or_invalid)?;
         Ok(Json(PhaseListResult { phases }))
     }
 
@@ -732,7 +756,10 @@ impl MeshService {
             ));
         }
         let filter = TaskListFilter::from(args);
-        let tasks = self.store.list_tasks(&filter).map_err(internal)?;
+        let tasks = self
+            .store
+            .list_tasks(&filter)
+            .map_err(internal_or_invalid)?;
         Ok(Json(TaskListResult { tasks }))
     }
 
@@ -744,7 +771,10 @@ impl MeshService {
         &self,
         Parameters(args): Parameters<ArtifactListArgs>,
     ) -> Result<Json<ArtifactListResult>, ErrorData> {
-        let all = self.store.list_artifacts(&args.project).map_err(internal)?;
+        let all = self
+            .store
+            .list_artifacts(&args.project)
+            .map_err(internal_or_invalid)?;
         let artifacts = all
             .into_iter()
             .filter(|a| args.task.is_empty() || a.task == args.task)
@@ -767,10 +797,50 @@ impl MeshService {
                 None,
             ));
         }
-        let hits = self.store.search(&args).map_err(internal)?;
+        let hits = self.store.search(&args).map_err(internal_or_invalid)?;
         Ok(Json(SearchResult { hits }))
     }
 }
+
+/// Substrings matching `bail!` / validation messages in `store.rs`, lowercased
+/// for [`is_user_domain_error`].
+const USER_ERROR_MARKERS: &[&str] = &[
+    "not found",
+    "slug is required",
+    "slug must be lowercase ascii",
+    "project slug must be lowercase ascii",
+    "phase slug must be lowercase ascii",
+    "project slug already exists",
+    "project is required",
+    "phase slug already exists in project",
+    "project and slug are required",
+    "actor is required",
+    "phase is required (omit the field entirely for a project-wide task)",
+    "task slug already exists in project",
+    "cannot claim task in terminal state",
+    "task in todo has assignee",
+    "task in state",
+    "corrupt state",
+    "task already claimed by",
+    "task must be in_progress to complete",
+    "duplicate task id",
+    "kind is required",
+    "ref is required",
+    "label is required",
+    "must be single-line (no newline or carriage return)",
+    "task is empty (omit the field entirely for a project-wide artifact)",
+    "use task.claim to transition into claimed",
+    "use task.complete to transition into done",
+    "task is in a terminal state",
+    "invalid task transition",
+    "task body must not contain",
+    "note must be single-line",
+    "actor must not contain `: `",
+    "note body must not be empty",
+    "not a dossier corpus",
+    "search query must be non-empty",
+    "search: project filter must be non-empty",
+];
 
 /// Map an internal error to an MCP `ErrorData`. Generic over `ToString`
 /// so callers can pass `.map_err(internal)` without an extra closure;
@@ -779,6 +849,35 @@ impl MeshService {
 #[allow(clippy::needless_pass_by_value)]
 fn internal<E: ToString>(e: E) -> ErrorData {
     ErrorData::internal_error(e.to_string(), None)
+}
+
+/// Classify `anyhow` errors from [`FsStore`] into MCP request validation vs
+/// server faults by matching substrings from the error chain against the
+/// `bail!` messages in `store.rs`.
+///
+/// `map_err` hands the error to its callback by value — same rationale as
+/// [`internal`].
+#[allow(clippy::needless_pass_by_value)]
+fn internal_or_invalid(err: AnyhowError) -> ErrorData {
+    let msg = err.to_string();
+    let chain = error_chain_text(&err);
+    if is_user_domain_error(&chain) {
+        ErrorData::invalid_params(msg, None)
+    } else {
+        ErrorData::internal_error(msg, None)
+    }
+}
+
+fn error_chain_text(err: &AnyhowError) -> String {
+    err.chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn is_user_domain_error(chain: &str) -> bool {
+    let lower = chain.to_lowercase();
+    USER_ERROR_MARKERS.iter().any(|m| lower.contains(m))
 }
 
 #[cfg(test)]
@@ -792,6 +891,7 @@ mod tests {
 
     use super::*;
     use crate::domain::SearchArgs;
+    use rmcp::model::ErrorCode;
 
     fn fresh_service() -> (tempfile::TempDir, MeshService) {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -799,6 +899,127 @@ mod tests {
         let store = FsStore::open(tmp.path()).expect("open fresh corpus");
         let service = MeshService::new(store);
         (tmp, service)
+    }
+
+    #[test]
+    fn task_update_unknown_id_returns_invalid_params() {
+        let (_tmp, svc) = fresh_service();
+        match svc.task_update(Parameters(TaskUpdateArgs {
+            id: "tsk_01KRSZG60JG3S0JF294AA3459V".to_owned(),
+            body: None,
+            status: None,
+            note: None,
+            actor: "human:test".to_owned(),
+        })) {
+            Err(err) => {
+                assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+                assert!(
+                    err.message.contains("not found"),
+                    "unexpected message: {}",
+                    err.message
+                );
+            }
+            Ok(_) => panic!("unknown task id must be rejected"),
+        }
+    }
+
+    #[test]
+    fn task_complete_on_todo_returns_invalid_params() {
+        let (_tmp, svc) = fresh_service();
+        svc.project_create(Parameters(ProjectCreateArgs {
+            slug: "alpha".to_owned(),
+            title: "Alpha".to_owned(),
+            description: String::new(),
+            actor: "human:test".to_owned(),
+        }))
+        .expect("project.create");
+        let Json(task) = svc
+            .task_create(Parameters(TaskCreateArgs {
+                project: "alpha".to_owned(),
+                phase: None,
+                slug: "t1".to_owned(),
+                title: "T".to_owned(),
+                body: String::new(),
+                actor: "human:test".to_owned(),
+            }))
+            .expect("task.create");
+        match svc.task_complete(Parameters(TaskCompleteArgs {
+            id: task.id,
+            note: None,
+            actor: "human:test".to_owned(),
+        })) {
+            Err(err) => {
+                assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+                assert!(
+                    err.message.contains("in_progress"),
+                    "unexpected message: {}",
+                    err.message
+                );
+            }
+            Ok(_) => panic!("todo cannot complete"),
+        }
+    }
+
+    #[test]
+    fn project_update_explicit_empty_actor_returns_invalid_params() {
+        let (_tmp, svc) = fresh_service();
+        svc.project_create(Parameters(ProjectCreateArgs {
+            slug: "alpha".to_owned(),
+            title: "Alpha".to_owned(),
+            description: String::new(),
+            actor: "human:test".to_owned(),
+        }))
+        .expect("project.create");
+        match svc.project_update(Parameters(ProjectUpdateArgs {
+            slug: "alpha".to_owned(),
+            actor: Some(String::new()),
+            title: None,
+            description: None,
+            status: None,
+        })) {
+            Err(err) => assert_eq!(err.code, ErrorCode::INVALID_PARAMS),
+            Ok(_) => panic!("empty actor must be rejected"),
+        }
+    }
+
+    #[test]
+    fn task_update_reject_done_via_update_returns_invalid_params() {
+        let (_tmp, svc) = fresh_service();
+        svc.project_create(Parameters(ProjectCreateArgs {
+            slug: "alpha".to_owned(),
+            title: "Alpha".to_owned(),
+            description: String::new(),
+            actor: "human:test".to_owned(),
+        }))
+        .expect("project.create");
+        let Json(task) = svc
+            .task_create(Parameters(TaskCreateArgs {
+                project: "alpha".to_owned(),
+                phase: None,
+                slug: "t1".to_owned(),
+                title: "T".to_owned(),
+                body: String::new(),
+                actor: "human:test".to_owned(),
+            }))
+            .expect("task.create");
+        match svc.task_update(Parameters(TaskUpdateArgs {
+            id: task.id,
+            body: None,
+            status: Some(TaskStatus::Done),
+            note: None,
+            actor: "human:test".to_owned(),
+        })) {
+            Err(err) => assert_eq!(err.code, ErrorCode::INVALID_PARAMS),
+            Ok(_) => panic!("done via update must be rejected"),
+        }
+    }
+
+    #[test]
+    fn internal_or_invalid_unknown_message_is_internal_error() {
+        let err = internal_or_invalid(anyhow::anyhow!(
+            "simulated failure without user-facing store markers"
+        ));
+        assert_eq!(err.code, ErrorCode::INTERNAL_ERROR);
     }
 
     #[test]
@@ -1059,6 +1280,7 @@ mod tests {
         let Json(project) = svc
             .project_update(Parameters(ProjectUpdateArgs {
                 slug: "alpha".to_owned(),
+                actor: None,
                 title: Some("Alpha2".to_owned()),
                 description: None,
                 status: Some(ProjectStatus::Active),
