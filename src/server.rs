@@ -1,7 +1,7 @@
 //! `MCP` server wrapping the `FsStore` as dossier verbs.
 //!
 //! Read side: `project.list` / `project.get` / `phase.list` / `task.list`
-//! / `artifact.list`. Write side: project / phase / task verbs all
+//! / `task.get` / `artifact.list`. Write side: project / phase / task verbs all
 //! routed through the shared `write_lock`. Artifact writes and conflict
 //! detection are not yet wired.
 
@@ -16,11 +16,12 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use ulid::Ulid;
 
 use crate::domain::{
     Artifact, Phase, PhaseListFilter, PhaseOrderField, PhaseStatus, Project, ProjectListFilter,
-    ProjectOrderField, ProjectStatus, SearchArgs, SearchHit, Task, TaskListFilter, TaskOrderField,
-    TaskStatus,
+    ProjectOrderField, ProjectStatus, SearchArgs, SearchHit, Task, TaskGetArgs, TaskListFilter,
+    TaskOrderField, TaskStatus,
 };
 use crate::store::{
     ClaimTask, CompleteTask, FsStore, LinkArtifact, NewPhase, NewProject, NewTask, UpdatePhase,
@@ -700,6 +701,23 @@ impl MeshService {
     }
 
     #[tool(
+        name = "task.get",
+        description = "Fetch a single task by id (tsk_ + ULID). Walks the whole corpus — no project slug required. Rejects malformed ids before scanning; returns not-found when the id is well-formed but absent."
+    )]
+    fn task_get(&self, Parameters(args): Parameters<TaskGetArgs>) -> Result<Json<Task>, ErrorData> {
+        if !is_well_formed_task_id(&args.id) {
+            return Err(ErrorData::invalid_params("invalid id format", None));
+        }
+        let id = &args.id;
+        let task = self
+            .store
+            .get_task(id)
+            .map_err(internal_or_invalid)?
+            .ok_or_else(|| ErrorData::invalid_params(format!("task not found: {id}"), None))?;
+        Ok(Json(task))
+    }
+
+    #[tool(
         name = "artifact.link",
         description = "Link an artifact (commit, PR, file, URL, run, doc, …) to a project, optionally anchored to a specific task. Append-only — entries are never rewritten. `ref` is the pointer (SHA, URL, path, run id); `label` is a short human-readable hint."
     )]
@@ -880,6 +898,14 @@ fn is_user_domain_error(chain: &str) -> bool {
     USER_ERROR_MARKERS.iter().any(|m| lower.contains(m))
 }
 
+/// `tsk_` plus a 26-character Crockford ULID payload (same rule as new ids).
+fn is_well_formed_task_id(id: &str) -> bool {
+    let Some(ulid_part) = id.strip_prefix("tsk_") else {
+        return false;
+    };
+    ulid_part.len() == 26 && Ulid::from_string(ulid_part).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -890,7 +916,7 @@ mod tests {
     )]
 
     use super::*;
-    use crate::domain::SearchArgs;
+    use crate::domain::{SearchArgs, TaskGetArgs};
     use rmcp::model::ErrorCode;
 
     fn fresh_service() -> (tempfile::TempDir, MeshService) {
@@ -920,6 +946,39 @@ mod tests {
                 );
             }
             Ok(_) => panic!("unknown task id must be rejected"),
+        }
+    }
+
+    #[test]
+    fn get_task_errors_on_malformed_id() {
+        let (_tmp, svc) = fresh_service();
+        match svc.task_get(Parameters(TaskGetArgs {
+            id: "tsk_nope".to_owned(),
+        })) {
+            Err(err) => {
+                assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+                assert_eq!(err.message, "invalid id format");
+            }
+            Ok(_) => panic!("malformed task id must be rejected"),
+        }
+    }
+
+    #[test]
+    fn get_task_not_found_returns_invalid_params() {
+        let (_tmp, svc) = fresh_service();
+        let absent = "tsk_01KRSZG60JG3S0JF294AA3459V";
+        match svc.task_get(Parameters(TaskGetArgs {
+            id: absent.to_owned(),
+        })) {
+            Err(err) => {
+                assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+                assert!(
+                    err.message.contains("task not found"),
+                    "unexpected error: {}",
+                    err.message
+                );
+            }
+            Ok(_) => panic!("absent task id must return not-found"),
         }
     }
 

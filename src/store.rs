@@ -1016,13 +1016,33 @@ impl FsStore {
         Ok(task)
     }
 
+    /// Load a task by id without naming its owning project. Returns
+    /// `Ok(None)` when no file matches; propagates I/O / parse failures
+    /// and duplicate-id corpus state.
+    pub fn get_task(&self, id: &str) -> Result<Option<Task>> {
+        let Some((_project_slug, path)) = self.try_find_task_path(id)? else {
+            return Ok(None);
+        };
+        let (task, _notes) = load_task_with_notes(&path)?;
+        Ok(Some(task))
+    }
+
     /// Locate a task file by id by walking each project's `tasks/` dir.
     /// O(projects × tasks) — cheap at v0 corpus sizes; an index lands
     /// when it actually matters.
     fn find_task_path(&self, task_id: &str) -> Result<(String, PathBuf)> {
+        match self.try_find_task_path(task_id)? {
+            Some(pair) => Ok(pair),
+            None => bail!("task not found: {task_id}"),
+        }
+    }
+
+    /// Like [`Self::find_task_path`], but returns `Ok(None)` when the id
+    /// is absent. Duplicate ids under different projects still `bail!`.
+    fn try_find_task_path(&self, task_id: &str) -> Result<Option<(String, PathBuf)>> {
         let projects_dir = self.root.join("projects");
         if !projects_dir.exists() {
-            bail!("task not found: {task_id}");
+            return Ok(None);
         }
         let entries = fs::read_dir(&projects_dir)
             .with_context(|| format!("read {}", projects_dir.display()))?;
@@ -1059,10 +1079,7 @@ impl FsStore {
                 }
             }
         }
-        match found {
-            Some(pair) => Ok(pair),
-            None => bail!("task not found: {task_id}"),
-        }
+        Ok(found)
     }
 }
 
@@ -2503,6 +2520,32 @@ mod tests {
             .find_task_path(&task.id)
             .expect_err("duplicate task id must be rejected");
         assert!(err.to_string().contains("duplicate task id"), "got: {err}");
+    }
+
+    #[test]
+    fn get_task_hits_across_projects() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        seed_project(&store, "beta");
+        let task = seed_task(&store, "alpha", "cross-lookup");
+        let got = store
+            .get_task(&task.id)
+            .expect("get_task")
+            .expect("task in alpha must resolve without naming project");
+        assert_eq!(got.id, task.id);
+        assert_eq!(got.slug, task.slug);
+        assert_eq!(got.title, task.title);
+    }
+
+    #[test]
+    fn get_task_errors_on_unknown_id() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let unknown = "tsk_01KRSZG60JG3S0JF294AA3459V";
+        assert!(
+            store.get_task(unknown).expect("get_task").is_none(),
+            "well-formed id with no file must be None"
+        );
     }
 
     #[test]
