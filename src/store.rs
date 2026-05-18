@@ -1644,8 +1644,14 @@ fn project_matches(p: &Project, f: &ProjectListFilter) -> bool {
 fn sort_projects(out: &mut [Project], f: &ProjectListFilter) {
     let order = f.order_by.unwrap_or(ProjectOrderField::CreatedAt);
     out.sort_by(|a, b| match order {
-        ProjectOrderField::CreatedAt => a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)),
-        ProjectOrderField::UpdatedAt => a.updated_at.cmp(&b.updated_at).then(a.id.cmp(&b.id)),
+        ProjectOrderField::CreatedAt => a
+            .created_at
+            .cmp(&b.created_at)
+            .then_with(|| a.id.cmp(&b.id)),
+        ProjectOrderField::UpdatedAt => a
+            .updated_at
+            .cmp(&b.updated_at)
+            .then_with(|| a.id.cmp(&b.id)),
     });
     if f.desc.unwrap_or(false) {
         out.reverse();
@@ -1670,15 +1676,21 @@ fn phase_matches(p: &Phase, f: &PhaseListFilter) -> bool {
 fn sort_phases(out: &mut [Phase], f: &PhaseListFilter) {
     let order = f.order_by.unwrap_or(PhaseOrderField::Order);
     out.sort_by(|a, b| match order {
-        PhaseOrderField::CreatedAt => a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)),
-        PhaseOrderField::UpdatedAt => a.updated_at.cmp(&b.updated_at).then(a.id.cmp(&b.id)),
+        PhaseOrderField::CreatedAt => a
+            .created_at
+            .cmp(&b.created_at)
+            .then_with(|| a.id.cmp(&b.id)),
+        PhaseOrderField::UpdatedAt => a
+            .updated_at
+            .cmp(&b.updated_at)
+            .then_with(|| a.id.cmp(&b.id)),
         // Cross-project listings group by project so the linear `order`
         // sort stays meaningful — phase order is per-project, not global.
         PhaseOrderField::Order => a
             .project
             .cmp(&b.project)
-            .then(a.order.cmp(&b.order))
-            .then(a.id.cmp(&b.id)),
+            .then_with(|| a.order.cmp(&b.order))
+            .then_with(|| a.id.cmp(&b.id)),
     });
     if f.desc.unwrap_or(false) {
         out.reverse();
@@ -1739,18 +1751,34 @@ fn sort_tasks(out: &mut Vec<Task>, f: &TaskListFilter) {
     // documented behavior in the spec.
     match order {
         TaskOrderField::CreatedAt => {
-            out.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+            out.sort_by(|a, b| {
+                a.created_at
+                    .cmp(&b.created_at)
+                    .then_with(|| a.id.cmp(&b.id))
+            });
         }
         TaskOrderField::UpdatedAt => {
-            out.sort_by(|a, b| a.updated_at.cmp(&b.updated_at).then(a.id.cmp(&b.id)));
+            out.sort_by(|a, b| {
+                a.updated_at
+                    .cmp(&b.updated_at)
+                    .then_with(|| a.id.cmp(&b.id))
+            });
         }
         TaskOrderField::CompletedAt => {
             out.retain(|t| t.completed_at.is_some());
-            out.sort_by(|a, b| a.completed_at.cmp(&b.completed_at).then(a.id.cmp(&b.id)));
+            out.sort_by(|a, b| {
+                a.completed_at
+                    .cmp(&b.completed_at)
+                    .then_with(|| a.id.cmp(&b.id))
+            });
         }
         TaskOrderField::ClaimedAt => {
             out.retain(|t| t.claimed_at.is_some());
-            out.sort_by(|a, b| a.claimed_at.cmp(&b.claimed_at).then(a.id.cmp(&b.id)));
+            out.sort_by(|a, b| {
+                a.claimed_at
+                    .cmp(&b.claimed_at)
+                    .then_with(|| a.id.cmp(&b.id))
+            });
         }
     }
     if f.desc.unwrap_or(false) {
@@ -3517,6 +3545,25 @@ mod tests {
         );
         assert_eq!(rows[0].id.as_str(), "tsk_AAAAAAAAAAAAAAAAAAAAAAAA");
         assert_eq!(rows[1].id.as_str(), "tsk_ZZZZZZZZZZZZZZZZZZZZZZZZ");
+    }
+
+    #[test]
+    fn sort_tasks_ties_break_on_id_desc() {
+        let ts = t("2026-06-06T06:06:06Z");
+        let higher_id = stub_task("tsk_ZZZZZZZZZZZZZZZZZZZZZZZZ", ts);
+        let lower_id = stub_task("tsk_AAAAAAAAAAAAAAAAAAAAAAAA", ts);
+        let mut rows = vec![higher_id, lower_id];
+        sort_tasks(
+            &mut rows,
+            &TaskListFilter {
+                order_by: Some(TaskOrderField::CreatedAt),
+                desc: Some(true),
+                ..TaskListFilter::default()
+            },
+        );
+        // DESC reverses the ASC ordering, so the lower id lands last.
+        assert_eq!(rows[0].id.as_str(), "tsk_ZZZZZZZZZZZZZZZZZZZZZZZZ");
+        assert_eq!(rows[1].id.as_str(), "tsk_AAAAAAAAAAAAAAAAAAAAAAAA");
     }
 
     #[test]
