@@ -803,7 +803,12 @@ impl MeshService {
 }
 
 /// Substrings matching `bail!` / validation messages in `store.rs`, lowercased
-/// for [`is_user_domain_error`].
+/// for [`is_user_domain_error`]. Tightly coupled to the wording of those
+/// `bail!` bodies — when a new store verb is added or an existing message is
+/// reworded, mirror the change here or the new user error silently surfaces
+/// as `internal_error`. Markers that describe corpus corruption or server
+/// misconfiguration are deliberately absent so they fall through to
+/// `internal_error`.
 const USER_ERROR_MARKERS: &[&str] = &[
     "not found",
     "slug is required",
@@ -818,9 +823,6 @@ const USER_ERROR_MARKERS: &[&str] = &[
     "phase is required (omit the field entirely for a project-wide task)",
     "task slug already exists in project",
     "cannot claim task in terminal state",
-    "task in todo has assignee",
-    "task in state",
-    "corrupt state",
     "task already claimed by",
     "task must be in_progress to complete",
     "duplicate task id",
@@ -837,7 +839,6 @@ const USER_ERROR_MARKERS: &[&str] = &[
     "note must be single-line",
     "actor must not contain `: `",
     "note body must not be empty",
-    "not a dossier corpus",
     "search query must be non-empty",
     "search: project filter must be non-empty",
 ];
@@ -1018,6 +1019,29 @@ mod tests {
     fn internal_or_invalid_unknown_message_is_internal_error() {
         let err = internal_or_invalid(anyhow::anyhow!(
             "simulated failure without user-facing store markers"
+        ));
+        assert_eq!(err.code, ErrorCode::INTERNAL_ERROR);
+    }
+
+    #[test]
+    fn internal_or_invalid_corrupt_state_stays_internal_error() {
+        for msg in [
+            "task in todo has assignee, corrupt state",
+            "task in state in_progress has no assignee, corrupt state",
+        ] {
+            let err = internal_or_invalid(anyhow::anyhow!(msg.to_owned()));
+            assert_eq!(
+                err.code,
+                ErrorCode::INTERNAL_ERROR,
+                "corpus-corruption error must not surface as invalid_params: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn internal_or_invalid_missing_corpus_marker_is_internal_error() {
+        let err = internal_or_invalid(anyhow::anyhow!(
+            "not a dossier corpus: .dossier marker missing"
         ));
         assert_eq!(err.code, ErrorCode::INTERNAL_ERROR);
     }
