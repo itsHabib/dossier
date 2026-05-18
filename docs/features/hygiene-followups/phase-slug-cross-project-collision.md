@@ -1,4 +1,4 @@
-**Status**: draft
+**Status**: accepted (implemented)
 **Owner**: @itsHabib
 **Date**: 2026-05-17
 **Related**: dossier task `phase-slug-cross-project-collision` (id: `tsk_01KRW29YMNAG063612PHZY4EH6`), [docs/follow-ups.md](../../follow-ups.md)
