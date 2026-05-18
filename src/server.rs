@@ -708,13 +708,12 @@ impl MeshService {
         if !is_well_formed_task_id(&args.id) {
             return Err(ErrorData::invalid_params("invalid id format", None));
         }
+        let id = &args.id;
         let task = self
             .store
-            .get_task(&args.id)
+            .get_task(id)
             .map_err(internal_or_invalid)?
-            .ok_or_else(|| {
-                ErrorData::invalid_params(format!("task not found: {}", args.id), None)
-            })?;
+            .ok_or_else(|| ErrorData::invalid_params(format!("task not found: {id}"), None))?;
         Ok(Json(task))
     }
 
@@ -961,6 +960,25 @@ mod tests {
                 assert_eq!(err.message, "invalid id format");
             }
             Ok(_) => panic!("malformed task id must be rejected"),
+        }
+    }
+
+    #[test]
+    fn get_task_not_found_returns_invalid_params() {
+        let (_tmp, svc) = fresh_service();
+        let absent = "tsk_01KRSZG60JG3S0JF294AA3459V";
+        match svc.task_get(Parameters(TaskGetArgs {
+            id: absent.to_owned(),
+        })) {
+            Err(err) => {
+                assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+                assert!(
+                    err.message.contains("task not found"),
+                    "unexpected error: {}",
+                    err.message
+                );
+            }
+            Ok(_) => panic!("absent task id must return not-found"),
         }
     }
 
