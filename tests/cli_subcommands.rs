@@ -239,6 +239,57 @@ fn cli_artifact_link_appends_different_tuple() {
 }
 
 #[test]
+fn cli_artifact_link_rejects_explicit_empty_task() {
+    // Regression for codex PR #38 P2: ensure --task "" is rejected before the
+    // existing-artifact dedupe short-circuit (which would otherwise return Ok
+    // when a project-wide artifact already exists).
+    let (tmp, store) = common::fresh_corpus();
+    seed_project(&store, "alpha");
+
+    // Pre-seed a project-wide artifact so the dedupe path is reachable.
+    let (code, _, stderr) = run_cli(
+        tmp.path(),
+        &[
+            "artifact_link",
+            "--project",
+            "alpha",
+            "--kind",
+            "pr",
+            "--ref",
+            "https://example/pr/1",
+            "--label",
+            "PR #1",
+            "--actor",
+            "cli:test",
+        ],
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+
+    // Now call with --task "" + the same tuple. Without the guard this would
+    // hit the dedupe short-circuit and return success.
+    let (code, _, stderr) = run_cli(
+        tmp.path(),
+        &[
+            "artifact_link",
+            "--project",
+            "alpha",
+            "--task",
+            "",
+            "--kind",
+            "pr",
+            "--ref",
+            "https://example/pr/1",
+            "--label",
+            "PR #1",
+            "--actor",
+            "cli:test",
+        ],
+    );
+    assert_ne!(code, 0, "expected non-zero exit for empty --task");
+    assert!(stderr.contains("task is empty"), "stderr: {stderr}");
+}
+
+#[test]
 fn cli_task_list_filters_match_store() {
     let (tmp, store) = common::fresh_corpus();
     seed_project(&store, "alpha");

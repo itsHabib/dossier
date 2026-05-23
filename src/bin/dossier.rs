@@ -254,6 +254,9 @@ fn run_task_update(corpus: &Path, id: String, note: String, actor: Option<String
 }
 
 fn run_artifact_link(corpus: &Path, req: ArtifactLinkRequest) -> Result<()> {
+    if matches!(req.task.as_deref(), Some("")) {
+        bail!("task is empty");
+    }
     let store = FsStore::open(corpus)?;
     let task_key = req.task.clone().unwrap_or_default();
     let label = req.label.unwrap_or_else(|| req.reference.clone());
