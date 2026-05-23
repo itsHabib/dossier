@@ -1176,6 +1176,14 @@ impl FsStore {
             None => String::new(),
         };
 
+        let existing = self.list_artifacts(&args.project)?;
+        if let Some(artifact) = existing
+            .into_iter()
+            .find(|a| a.task == task_id && a.kind == args.kind && a.reference == args.reference)
+        {
+            return Ok(artifact);
+        }
+
         let now = now_utc();
         let artifact = Artifact {
             id: new_id("art"),
@@ -3431,6 +3439,38 @@ mod tests {
         let listed = store.list_artifacts("alpha").unwrap();
         let ids: Vec<&str> = listed.iter().map(|x| x.id.as_str()).collect();
         assert_eq!(ids, vec![a.id.as_str(), b.id.as_str(), c.id.as_str()]);
+    }
+
+    #[test]
+    fn link_artifact_same_tuple_is_idempotent() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+
+        let first = link_simple(&store, "alpha", None, "pr", "https://example/pr/1", "PR #1");
+        let second = link_simple(
+            &store,
+            "alpha",
+            None,
+            "pr",
+            "https://example/pr/1",
+            "different label",
+        );
+
+        assert_eq!(first.id, second.id);
+        let listed = store.list_artifacts("alpha").unwrap();
+        assert_eq!(listed.len(), 1);
+    }
+
+    #[test]
+    fn link_artifact_different_ref_appends() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+
+        link_simple(&store, "alpha", None, "pr", "https://example/pr/1", "PR #1");
+        link_simple(&store, "alpha", None, "pr", "https://example/pr/2", "PR #2");
+
+        let listed = store.list_artifacts("alpha").unwrap();
+        assert_eq!(listed.len(), 2);
     }
 
     #[test]
