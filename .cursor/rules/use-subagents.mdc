@@ -1,0 +1,43 @@
+---
+description: Steers the parent agent to dispatch to the repo's registered subagents at natural points during ship.ship implementation runs.
+globs:
+  - "packages/**/*.ts"
+  - "packages/**/*.tsx"
+  - "e2e/**/*.ts"
+  - "docs/**/*.md"
+  - ".cursor/agents/**/*.md"
+---
+
+# Use the registered subagents during implementation
+
+This repo ships a curated set of subagents under `.cursor/agents/`:
+
+| Subagent | What it returns | When to invoke |
+|---|---|---|
+| `code-reviewer` | P0-P3 findings on the diff (bugs, security, conventions) | After writing code, before the final summary |
+| `scope-tracker` | In-scope / adjacent / out-of-scope verdict per touched file | Before the final summary |
+| `test-author` | Drafted vitest tests for new production code | After writing new exports without matching tests |
+| `validator` | Green / red verdict from `make check` + e2e + diagnosis | Before the final summary |
+
+## When you are implementing a task from a `ship.ship` run, dispatch at the natural points
+
+1. **After writing new production code** → invoke `test-author` via your built-in `Agent` tool. Incorporate its drafted tests before continuing.
+2. **Before producing the final structured summary** → invoke `code-reviewer`. Address P0/P1 findings inline; surface P2/P3 in the summary's risks section.
+3. **Before producing the final structured summary** → invoke `scope-tracker`. If it flags out-of-scope edits, revert or justify inline.
+4. **Before producing the final structured summary** → invoke `validator`. The run isn't done until the verdict is green (or the failures are documented as known/intentional).
+
+## How to invoke
+
+Each subagent has a `name:` in its frontmatter (e.g. `code-reviewer`). Use your built-in `Agent` tool with that name and a brief instruction such as:
+
+- *"Review the current diff for P0/P1 findings against CLAUDE.md conventions."*
+- *"Check whether the diff stays inside the Scope section of the task doc."*
+- *"Run `make check` and the e2e suite; report green / red."*
+
+## If a subagent isn't registered
+
+If your `Agent` tool doesn't list one of these subagents (e.g. the repo predates PR #41 or the SDK didn't load `.cursor/agents/`), skip that step and note the gap in the structured summary's risks section. Do NOT fabricate the subagent's output.
+
+## Background
+
+These subagents were added in PR #41 to push inner-loop concerns (review, scope, tests, validation) INTO the implement phase instead of relying on the outer-loop bot reviewers (codex / claude bot / Copilot) to catch them in cycle 1. The hypothesis is that catching issues during impl reduces driver thrash across cycle-1 fixes. See `docs/features/ship-v2/phases/03-subagent-passthrough.md` for the full rationale.
