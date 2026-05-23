@@ -69,11 +69,12 @@ An ordered subdivision of a project. Phases are linear, not a graph.
 
 A discrete piece of work an implementer can claim and complete.
 
-| field         | type                                                              | notes                         |
-|---------------|-------------------------------------------------------------------|-------------------------------|
-| `id`          | string                                                            |                               |
-| `project_id`  | string                                                            |                               |
-| `phase_id`    | string \| null                                                    | nullable for project-wide tasks |
+| field          | type                                                              | notes                         |
+|----------------|-------------------------------------------------------------------|-------------------------------|
+| `id`           | string                                                            |                               |
+| `project_id`   | string                                                            |                               |
+| `project_slug` | string                                                            | slug of the owning project; derived from corpus path, not stored in frontmatter |
+| `phase_id`     | string \| null                                                    | nullable for project-wide tasks |
 | `title`       | string                                                            |                               |
 | `body`        | string (markdown)                                                 | spec / acceptance criteria    |
 | `status`      | `todo` \| `claimed` \| `in_progress` \| `blocked` \| `done` \| `cancelled` |                       |
