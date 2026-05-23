@@ -1,9 +1,8 @@
 ---
 description: Steers the parent agent to dispatch to the repo's registered subagents at natural points during ship.ship implementation runs.
 globs:
-  - "packages/**/*.ts"
-  - "packages/**/*.tsx"
-  - "e2e/**/*.ts"
+  - "src/**/*.rs"
+  - "tests/**/*.rs"
   - "docs/**/*.md"
   - ".cursor/agents/**/*.md"
 ---
