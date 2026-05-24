@@ -97,6 +97,7 @@ proptest! {
                 body: String::new(),
                 after_phase: None,
                 actor: "human:michael".into(),
+                            owner: "human:test".to_owned(),
             })
             .expect("add_phase on valid slug");
         prop_assert_eq!(phase.slug, phase_slug);
@@ -109,6 +110,7 @@ proptest! {
                 title: "Task".into(),
                 body: String::new(),
                 actor: "human:michael".into(),
+                            depends_on: Vec::new(),
             })
             .expect("create_task on valid slug");
         prop_assert_eq!(task.slug, task_slug);
@@ -154,6 +156,7 @@ proptest! {
             body: String::new(),
             after_phase: None,
             actor: "human:michael".into(),
+                        owner: "human:test".to_owned(),
         });
         prop_assert!(result.is_err());
     }
@@ -178,6 +181,7 @@ proptest! {
             title: "Task".into(),
             body: String::new(),
             actor: "human:michael".into(),
+                        depends_on: Vec::new(),
         });
         prop_assert!(result.is_err());
     }

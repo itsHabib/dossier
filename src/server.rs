@@ -351,6 +351,8 @@ pub struct PhaseAddArgs {
     pub after_phase: Option<String>,
     /// who's adding the phase
     pub actor: String,
+    /// current responsible party (e.g. `human:mh`, `team:frontend`)
+    pub owner: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -369,6 +371,9 @@ pub struct PhaseUpdateArgs {
     /// (`pending` | `active` | `done` | `skipped`)
     #[serde(default)]
     pub status: Option<PhaseStatus>,
+    /// new owner; omit to leave unchanged
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -387,6 +392,9 @@ pub struct TaskCreateArgs {
     pub body: String,
     /// who's creating the task
     pub actor: String,
+    /// task IDs or slugs this task depends on; omit for none
+    #[serde(default)]
+    pub depends_on: Vec<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -412,6 +420,9 @@ pub struct TaskUpdateArgs {
     /// optional note line appended to the task's `## Notes` log
     #[serde(default)]
     pub note: Option<String>,
+    /// replace dependency list; omit to leave unchanged; pass `[]` to clear
+    #[serde(default)]
+    pub depends_on: Option<Vec<String>>,
     /// who's making the update
     pub actor: String,
 }
@@ -555,7 +566,7 @@ impl MeshService {
 
     #[tool(
         name = "phase.add",
-        description = "Add a new phase to a project. Phase slug must be unique within the project. `after_phase` (a phase slug) inserts in order; default appends to the end."
+        description = "Add a new phase to a project. Phase slug must be unique within the project. `owner` is required (current responsible party, actor-string shape — `human:<name>` / `team:<slug>` / `agent:<name>`; distinct from `created_by`, which records the origin actor immutably). `after_phase` (a phase slug) inserts in order; default appends to the end."
     )]
     fn phase_add(
         &self,
@@ -574,6 +585,7 @@ impl MeshService {
                 body: args.body,
                 after_phase: args.after_phase,
                 actor: args.actor,
+                owner: args.owner,
             })
             .map_err(internal_or_invalid)?;
         Ok(Json(phase))
@@ -581,7 +593,7 @@ impl MeshService {
 
     #[tool(
         name = "phase.update",
-        description = "Update mutable fields of a phase (title, body, status). (project, slug) is the addressing key. Preserves id, order, and created_at; bumps updated_at."
+        description = "Update mutable fields of a phase (title, body, status, owner). (project, slug) is the addressing key. `owner` replaces the current value when `Some` (rejects an empty string); omit to leave unchanged. Preserves id, order, and created_at; bumps updated_at."
     )]
     fn phase_update(
         &self,
@@ -599,6 +611,7 @@ impl MeshService {
                 title: args.title,
                 body: args.body,
                 status: args.status,
+                owner: args.owner,
             })
             .map_err(internal_or_invalid)?;
         Ok(Json(phase))
@@ -625,6 +638,7 @@ impl MeshService {
                 title: args.title,
                 body: args.body,
                 actor: args.actor,
+                depends_on: args.depends_on,
             })
             .map_err(internal_or_invalid)?;
         Ok(Json(task))
@@ -672,6 +686,7 @@ impl MeshService {
                 status: args.status,
                 note: args.note,
                 actor: args.actor,
+                depends_on: args.depends_on,
             })
             .map_err(internal_or_invalid)?;
         Ok(Json(task))
@@ -838,6 +853,8 @@ const USER_ERROR_MARKERS: &[&str] = &[
     "phase slug already exists in project",
     "project and slug are required",
     "actor is required",
+    "owner is required",
+    "owner must not be empty",
     "phase is required (omit the field entirely for a project-wide task)",
     "task slug already exists in project",
     "cannot claim task in terminal state",
@@ -936,6 +953,7 @@ mod tests {
             status: None,
             note: None,
             actor: "human:test".to_owned(),
+            depends_on: None,
         })) {
             Err(err) => {
                 assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
@@ -1000,6 +1018,7 @@ mod tests {
                 title: "T".to_owned(),
                 body: String::new(),
                 actor: "human:test".to_owned(),
+                depends_on: Vec::new(),
             }))
             .expect("task.create");
         match svc.task_complete(Parameters(TaskCompleteArgs {
@@ -1059,6 +1078,7 @@ mod tests {
                 title: "T".to_owned(),
                 body: String::new(),
                 actor: "human:test".to_owned(),
+                depends_on: Vec::new(),
             }))
             .expect("task.create");
         match svc.task_update(Parameters(TaskUpdateArgs {
@@ -1067,6 +1087,7 @@ mod tests {
             status: Some(TaskStatus::Done),
             note: None,
             actor: "human:test".to_owned(),
+            depends_on: None,
         })) {
             Err(err) => assert_eq!(err.code, ErrorCode::INVALID_PARAMS),
             Ok(_) => panic!("done via update must be rejected"),
@@ -1356,6 +1377,7 @@ mod tests {
             body: String::new(),
             after_phase: None,
             actor: "human:test".to_owned(),
+            owner: "human:test".to_owned(),
         }))
         .expect("phase.add");
 
@@ -1378,6 +1400,7 @@ mod tests {
                 title: Some("Spec2".to_owned()),
                 body: None,
                 status: Some(PhaseStatus::Done),
+                owner: None,
             }))
             .expect("phase.update");
         assert_eq!(phase.title, "Spec2");
@@ -1411,6 +1434,7 @@ mod tests {
             body: String::new(),
             after_phase: None,
             actor: "human:test".to_owned(),
+            owner: "human:test".to_owned(),
         }))
         .expect("alpha phase");
 
@@ -1421,6 +1445,7 @@ mod tests {
             body: String::new(),
             after_phase: None,
             actor: "human:test".to_owned(),
+            owner: "human:test".to_owned(),
         }))
         .expect("beta phase");
 
@@ -1431,6 +1456,7 @@ mod tests {
             title: "Alpha task".to_owned(),
             body: String::new(),
             actor: "human:test".to_owned(),
+            depends_on: Vec::new(),
         }))
         .expect("alpha task");
 
@@ -1441,6 +1467,7 @@ mod tests {
             title: "Beta task".to_owned(),
             body: String::new(),
             actor: "human:test".to_owned(),
+            depends_on: Vec::new(),
         }))
         .expect("beta task");
 
@@ -1478,6 +1505,7 @@ mod tests {
                 title: "T1".to_owned(),
                 body: String::new(),
                 actor: "human:test".to_owned(),
+                depends_on: Vec::new(),
             }))
             .expect("t1");
 
@@ -1489,6 +1517,7 @@ mod tests {
                 title: "T2".to_owned(),
                 body: String::new(),
                 actor: "human:test".to_owned(),
+                depends_on: Vec::new(),
             }))
             .expect("t2");
 

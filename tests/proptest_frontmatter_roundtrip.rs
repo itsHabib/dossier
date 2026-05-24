@@ -25,6 +25,10 @@ fn slug() -> impl Strategy<Value = String> {
     proptest::string::string_regex("[a-z0-9_-]{1,16}").expect("slug regex")
 }
 
+fn dep_id() -> impl Strategy<Value = String> {
+    proptest::string::string_regex("tsk_[A-Z0-9]{26}").expect("dep id regex")
+}
+
 /// Title generator: punctuation + whitespace chars that exercise YAML
 /// quoting (`:`, `#`, `-`, `!`, `?`, `,`) but no control chars or
 /// leading/trailing whitespace.
@@ -96,6 +100,7 @@ proptest! {
                 actor: "human:michael".into(),
             })
             .expect("create_project");
+        let owner = "team:frontend".to_owned();
         let created = store
             .add_phase(NewPhase {
                 project: proj_slug.clone(),
@@ -104,6 +109,7 @@ proptest! {
                 body: body.clone(),
                 after_phase: None,
                 actor: "human:michael".into(),
+                owner: owner.clone(),
             })
             .expect("add_phase");
         let phases = store
@@ -123,6 +129,7 @@ proptest! {
         prop_assert_eq!(&fetched.id, &created.id);
         prop_assert_eq!(fetched.status, created.status);
         prop_assert_eq!(&fetched.created_by, "human:michael");
+        prop_assert_eq!(&fetched.owner, &owner);
     }
 
     /// Task create → list-and-find round-trip. Task body must not
@@ -134,6 +141,8 @@ proptest! {
         task_slug in slug(),
         title in title(),
         body in body(),
+        use_deps in any::<bool>(),
+        dep_id in dep_id(),
     ) {
         prop_assume!(proj_slug != task_slug);
         let (_tmp, store) = fresh_corpus();
@@ -145,6 +154,11 @@ proptest! {
                 actor: "human:michael".into(),
             })
             .expect("create_project");
+        let depends_on = if use_deps {
+            vec![dep_id]
+        } else {
+            vec![]
+        };
         let created = store
             .create_task(NewTask {
                 project: proj_slug.clone(),
@@ -153,6 +167,7 @@ proptest! {
                 title: title.clone(),
                 body: body.clone(),
                 actor: "human:michael".into(),
+                depends_on: depends_on.clone(),
             })
             .expect("create_task");
         let tasks = store
@@ -170,6 +185,7 @@ proptest! {
         prop_assert_eq!(&fetched.body, &body);
         prop_assert_eq!(&fetched.id, &created.id);
         prop_assert_eq!(fetched.status, created.status);
+        prop_assert_eq!(&fetched.depends_on, &depends_on);
     }
 }
 

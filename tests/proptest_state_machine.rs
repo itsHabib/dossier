@@ -100,6 +100,7 @@ fn apply(store: &FsStore, op: Op, task_id: &str) {
             status: Some(to),
             note: None,
             actor,
+            depends_on: None,
         }),
         Op::Complete { actor } => store.complete_task(CompleteTask {
             id: task_id.to_owned(),
@@ -112,6 +113,7 @@ fn apply(store: &FsStore, op: Op, task_id: &str) {
             status: None,
             note: None,
             actor,
+            depends_on: None,
         }),
     };
 }
@@ -180,6 +182,7 @@ proptest! {
             title: "subject".into(),
             body: String::new(),
             actor: "human:michael".into(),
+                        depends_on: Vec::new(),
         }).expect("create_task");
         let task_id = task.id.clone();
 
@@ -206,6 +209,7 @@ proptest! {
                         status: Some(to),
                         note: None,
                         actor,
+                        depends_on: None,
                     });
                     prop_assert!(
                         result.is_err(),
@@ -298,6 +302,7 @@ proptest! {
             title: "subject".into(),
             body: String::new(),
             actor: "human:michael".into(),
+                        depends_on: Vec::new(),
         }).expect("create_task");
 
         let first = store.claim_task(ClaimTask {

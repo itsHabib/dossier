@@ -249,6 +249,7 @@ fn run_task_update(corpus: &Path, id: String, note: String, actor: Option<String
         status: None,
         note: Some(note),
         actor: default_actor(actor),
+        depends_on: None,
     })?;
     emit_json(&task)
 }
