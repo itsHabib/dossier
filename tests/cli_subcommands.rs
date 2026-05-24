@@ -413,8 +413,13 @@ fn cli_task_list_rejects_phase_without_project() {
 #[test]
 fn cli_serve_requires_explicit_corpus() {
     let (tmp, _store) = common::fresh_corpus();
+    // Scrub DOSSIER_CORPUS from the child env. Clap's `--corpus` arg uses
+    // `env = "DOSSIER_CORPUS"`, so an operator with the var exported in
+    // their shell would otherwise see clap auto-fill it and skip the
+    // "--corpus is required" branch this test asserts on.
     let output = Command::new(dossier_bin())
         .current_dir(tmp.path())
+        .env_remove("DOSSIER_CORPUS")
         .arg("serve")
         .output()
         .expect("spawn serve");
