@@ -1458,6 +1458,7 @@ struct PhaseFrontmatter<'a> {
     updated_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "str::is_empty")]
     created_by: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
     owner: &'a str,
 }
 
@@ -1506,8 +1507,8 @@ struct TaskFrontmatter<'a> {
     completed_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    depends_on: &'a Vec<String>,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    depends_on: &'a [String],
 }
 
 impl<'a> From<&'a Task> for TaskFrontmatter<'a> {

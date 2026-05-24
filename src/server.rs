@@ -566,7 +566,7 @@ impl MeshService {
 
     #[tool(
         name = "phase.add",
-        description = "Add a new phase to a project. Phase slug must be unique within the project. `after_phase` (a phase slug) inserts in order; default appends to the end."
+        description = "Add a new phase to a project. Phase slug must be unique within the project. `owner` is required (current responsible party, actor-string shape — `human:<name>` / `team:<slug>` / `agent:<name>`; distinct from `created_by`, which records the origin actor immutably). `after_phase` (a phase slug) inserts in order; default appends to the end."
     )]
     fn phase_add(
         &self,
@@ -593,7 +593,7 @@ impl MeshService {
 
     #[tool(
         name = "phase.update",
-        description = "Update mutable fields of a phase (title, body, status). (project, slug) is the addressing key. Preserves id, order, and created_at; bumps updated_at."
+        description = "Update mutable fields of a phase (title, body, status, owner). (project, slug) is the addressing key. `owner` replaces the current value when `Some` (rejects an empty string); omit to leave unchanged. Preserves id, order, and created_at; bumps updated_at."
     )]
     fn phase_update(
         &self,
@@ -853,6 +853,8 @@ const USER_ERROR_MARKERS: &[&str] = &[
     "phase slug already exists in project",
     "project and slug are required",
     "actor is required",
+    "owner is required",
+    "owner must not be empty",
     "phase is required (omit the field entirely for a project-wide task)",
     "task slug already exists in project",
     "cannot claim task in terminal state",
