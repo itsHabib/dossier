@@ -80,6 +80,7 @@ status: done          # pending | active | done | skipped
 created_at: 2026-05-10T14:30:00Z
 updated_at: 2026-05-10T15:10:00Z
 created_by: human:mh
+owner: human:mh
 ---
 
 Acceptance: PROTOCOL.md exists and covers primitives, verbs, state
@@ -105,6 +106,7 @@ claimed_at: 2026-05-10T14:35:00Z
 completed_at: 2026-05-10T15:05:00Z
 created_at: 2026-05-10T14:30:00Z
 updated_at: 2026-05-10T15:05:00Z
+depends_on: [tsk_01KSDVQST4YP73CYV9K7G7GZ8G]   # optional; empty / absent means no deps
 ---
 
 ## Spec

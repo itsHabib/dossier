@@ -67,6 +67,8 @@ pub struct Phase {
         skip_serializing_if = "String::is_empty"
     )]
     pub created_by: String,
+    #[serde(default)]
+    pub owner: String,
 }
 
 fn default_phase_created_by() -> String {
@@ -92,6 +94,8 @@ pub struct Task {
     pub updated_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<Note>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

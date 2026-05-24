@@ -59,6 +59,7 @@ fn seed_task(store: &FsStore, project: &str, slug: &str) -> Task {
             title: format!("Task {slug}"),
             body: "spec body".to_owned(),
             actor: "human:test".to_owned(),
+            depends_on: Vec::new(),
         })
         .expect("create task")
 }

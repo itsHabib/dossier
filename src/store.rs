@@ -546,6 +546,7 @@ pub struct NewPhase {
     pub body: String,
     pub after_phase: Option<String>,
     pub actor: String,
+    pub owner: String,
 }
 
 /// Arguments for `FsStore::update_phase`. (project, slug) is the
@@ -558,6 +559,7 @@ pub struct UpdatePhase {
     pub title: Option<String>,
     pub body: Option<String>,
     pub status: Option<PhaseStatus>,
+    pub owner: Option<String>,
 }
 
 /// Arguments for `FsStore::create_task`. Slug must be unique within the
@@ -571,6 +573,7 @@ pub struct NewTask {
     pub title: String,
     pub body: String,
     pub actor: String,
+    pub depends_on: Vec<String>,
 }
 
 /// Arguments for `FsStore::claim_task`. Same-actor re-claim on a
@@ -593,6 +596,7 @@ pub struct UpdateTask {
     pub status: Option<TaskStatus>,
     pub note: Option<String>,
     pub actor: String,
+    pub depends_on: Option<Vec<String>>,
 }
 
 /// Arguments for `FsStore::complete_task`. Errors unless the task is in
@@ -695,6 +699,9 @@ impl FsStore {
         if args.actor.is_empty() {
             bail!("actor is required to add a phase");
         }
+        if args.owner.is_empty() {
+            bail!("owner is required to add a phase");
+        }
         if !is_valid_slug(&args.slug) {
             bail!(
                 "slug must be lowercase ascii (a-z, 0-9, -, _): {}",
@@ -756,6 +763,7 @@ impl FsStore {
             created_at: now,
             updated_at: now,
             created_by: args.actor,
+            owner: args.owner,
         };
         let path = phases_dir.join(phase_filename(new_order, &args.slug));
         let content = serialize_phase_file(&phase)?;
@@ -782,6 +790,12 @@ impl FsStore {
         }
         if let Some(status) = args.status {
             phase.status = status;
+        }
+        if let Some(owner) = args.owner {
+            if owner.is_empty() {
+                bail!("owner must not be empty");
+            }
+            phase.owner = owner;
         }
         phase.updated_at = now_utc();
         let content = serialize_phase_file(&phase)?;
@@ -890,6 +904,7 @@ impl FsStore {
             created_at: now,
             updated_at: now,
             notes: Vec::new(),
+            depends_on: args.depends_on,
         };
         let _ = args.actor; // creator recorded in commit history; no created_by on task in v0
         let path = tasks_dir.join(task_filename(&id, &args.slug));
@@ -973,6 +988,9 @@ impl FsStore {
         if let Some(body) = args.body {
             validate_task_body(&body)?;
             task.body = body;
+        }
+        if let Some(depends_on) = args.depends_on {
+            task.depends_on = depends_on;
         }
         let now = now_utc();
         if let Some(note) = args.note {
@@ -1440,6 +1458,7 @@ struct PhaseFrontmatter<'a> {
     updated_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "str::is_empty")]
     created_by: &'a str,
+    owner: &'a str,
 }
 
 impl<'a> From<&'a Phase> for PhaseFrontmatter<'a> {
@@ -1454,6 +1473,7 @@ impl<'a> From<&'a Phase> for PhaseFrontmatter<'a> {
             created_at: p.created_at,
             updated_at: p.updated_at,
             created_by: &p.created_by,
+            owner: &p.owner,
         }
     }
 }
@@ -1486,6 +1506,8 @@ struct TaskFrontmatter<'a> {
     completed_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    depends_on: &'a Vec<String>,
 }
 
 impl<'a> From<&'a Task> for TaskFrontmatter<'a> {
@@ -1502,6 +1524,7 @@ impl<'a> From<&'a Task> for TaskFrontmatter<'a> {
             completed_at: t.completed_at,
             created_at: t.created_at,
             updated_at: t.updated_at,
+            depends_on: &t.depends_on,
         }
     }
 }
@@ -2125,6 +2148,7 @@ mod tests {
                 body: String::new(),
                 after_phase: None,
                 actor: "human:test".to_owned(),
+                owner: "human:test".to_owned(),
             })
             .expect_err("invalid slug");
         assert!(err.to_string().contains("invalid slug"), "got: {err}");
@@ -2210,6 +2234,7 @@ mod tests {
                 body: String::new(),
                 after_phase: None,
                 actor: "human:test".to_owned(),
+                owner: "human:test".to_owned(),
             })
             .expect("add phase")
     }
@@ -2227,6 +2252,7 @@ mod tests {
                 body: String::new(),
                 after_phase: None,
                 actor: "claude-code:alice".to_owned(),
+                owner: "human:test".to_owned(),
             })
             .expect("add_phase");
 
@@ -2253,9 +2279,155 @@ mod tests {
                 body: String::new(),
                 after_phase: None,
                 actor: String::new(),
+                owner: "human:test".to_owned(),
             })
             .expect_err("empty actor");
         assert!(err.to_string().contains("actor is required"), "got: {err}");
+    }
+
+    #[test]
+    fn add_phase_persists_owner() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+
+        let created = store
+            .add_phase(NewPhase {
+                project: "alpha".to_owned(),
+                slug: "owned".to_owned(),
+                title: "Owned phase".to_owned(),
+                body: String::new(),
+                after_phase: None,
+                actor: "claude-code:alice".to_owned(),
+                owner: "team:frontend".to_owned(),
+            })
+            .expect("add_phase");
+
+        assert_eq!(created.owner, "team:frontend");
+
+        let phases = store.list_phases(&phase_filter_for("alpha")).unwrap();
+        let round_trip = phases
+            .iter()
+            .find(|p| p.slug == "owned")
+            .expect("phase listed");
+        assert_eq!(round_trip.owner, "team:frontend");
+    }
+
+    #[test]
+    fn add_phase_rejects_empty_owner() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+
+        let err = store
+            .add_phase(NewPhase {
+                project: "alpha".to_owned(),
+                slug: "spec".to_owned(),
+                title: "Spec phase".to_owned(),
+                body: String::new(),
+                after_phase: None,
+                actor: "human:test".to_owned(),
+                owner: String::new(),
+            })
+            .expect_err("empty owner");
+        assert!(err.to_string().contains("owner is required"), "got: {err}");
+    }
+
+    #[test]
+    fn update_phase_replaces_owner() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        add_phase_simple(&store, "alpha", "spec");
+
+        let updated = store
+            .update_phase(UpdatePhase {
+                project: "alpha".to_owned(),
+                slug: "spec".to_owned(),
+                owner: Some("team:platform".to_owned()),
+                ..Default::default()
+            })
+            .expect("update_phase");
+        assert_eq!(updated.owner, "team:platform");
+    }
+
+    #[test]
+    fn update_phase_rejects_empty_owner() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        add_phase_simple(&store, "alpha", "spec");
+
+        let err = store
+            .update_phase(UpdatePhase {
+                project: "alpha".to_owned(),
+                slug: "spec".to_owned(),
+                owner: Some(String::new()),
+                ..Default::default()
+            })
+            .expect_err("empty owner update");
+        assert!(
+            err.to_string().contains("owner must not be empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn update_phase_leaves_owner_when_none() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        store
+            .add_phase(NewPhase {
+                project: "alpha".to_owned(),
+                slug: "spec".to_owned(),
+                title: "Spec".to_owned(),
+                body: String::new(),
+                after_phase: None,
+                actor: "human:test".to_owned(),
+                owner: "team:frontend".to_owned(),
+            })
+            .expect("add_phase");
+
+        let updated = store
+            .update_phase(UpdatePhase {
+                project: "alpha".to_owned(),
+                slug: "spec".to_owned(),
+                title: Some("Renamed".to_owned()),
+                owner: None,
+                ..Default::default()
+            })
+            .expect("update_phase");
+        assert_eq!(updated.title, "Renamed");
+        assert_eq!(updated.owner, "team:frontend");
+    }
+
+    #[test]
+    fn read_phase_with_missing_owner_defaults_empty() {
+        let (tmp, store) = fresh_corpus();
+        let project = seed_project(&store, "alpha");
+        let phs_id = new_id("phs");
+        let phases_dir = tmp.path().join("projects").join("alpha").join("phases");
+        fs::create_dir_all(&phases_dir).expect("mkdir phases");
+
+        let file_body = format!(
+            "---
+id: {phs_id}
+project: {}
+slug: legacy-owner
+title: Legacy
+order: 1
+status: pending
+created_at: 2026-05-10T14:30:00Z
+updated_at: 2026-05-10T14:30:00Z
+created_by: human:test
+---
+",
+            project.id
+        );
+        fs::write(phases_dir.join("01-legacy-owner.md"), file_body).expect("write legacy phase");
+
+        let phases = store.list_phases(&phase_filter_for("alpha")).unwrap();
+        let p = phases
+            .iter()
+            .find(|ph| ph.slug == "legacy-owner")
+            .expect("legacy phase readable");
+        assert_eq!(p.owner, "");
     }
 
     #[test]
@@ -2316,6 +2488,7 @@ mod tests {
                 body: String::new(),
                 after_phase: Some("spec".to_owned()),
                 actor: "human:test".to_owned(),
+                owner: "human:test".to_owned(),
             })
             .unwrap();
         assert_eq!(inserted.order, 2);
@@ -2359,6 +2532,7 @@ mod tests {
                 body: String::new(),
                 after_phase: None,
                 actor: "human:test".to_owned(),
+                owner: "human:test".to_owned(),
             })
             .expect_err("duplicate slug");
         assert!(
@@ -2381,6 +2555,7 @@ mod tests {
                 body: String::new(),
                 after_phase: Some("nonexistent".to_owned()),
                 actor: "human:test".to_owned(),
+                owner: "human:test".to_owned(),
             })
             .expect_err("unknown after_phase");
         assert!(
@@ -2400,6 +2575,7 @@ mod tests {
                 body: String::new(),
                 after_phase: None,
                 actor: "human:test".to_owned(),
+                owner: "human:test".to_owned(),
             })
             .expect_err("unknown project");
         assert!(err.to_string().contains("project not found"), "got: {err}");
@@ -2420,6 +2596,7 @@ mod tests {
                 title: Some("Spec v2".to_owned()),
                 body: Some("acceptance criteria here".to_owned()),
                 status: Some(PhaseStatus::Active),
+                owner: None,
             })
             .unwrap();
 
@@ -2469,6 +2646,7 @@ mod tests {
                 title: format!("Task {slug}"),
                 body: "spec body".to_owned(),
                 actor: "human:test".to_owned(),
+                depends_on: Vec::new(),
             })
             .expect("create task")
     }
@@ -2492,6 +2670,162 @@ mod tests {
                 ..Default::default()
             })
             .expect("advance to in_progress")
+    }
+
+    #[test]
+    fn task_create_persists_depends_on() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+
+        let dep = "tsk_01KSDVQST4YP73CYV9K7G7GZ8G".to_owned();
+        let created = store
+            .create_task(NewTask {
+                project: "alpha".to_owned(),
+                phase: None,
+                slug: "blocked-work".to_owned(),
+                title: "Blocked work".to_owned(),
+                body: String::new(),
+                actor: "human:test".to_owned(),
+                depends_on: vec![dep.clone()],
+            })
+            .expect("create_task");
+        assert_eq!(created.depends_on, vec![dep.clone()]);
+
+        let listed = store.list_tasks(&task_filter_for("alpha")).unwrap();
+        let round_trip = listed
+            .iter()
+            .find(|t| t.slug == "blocked-work")
+            .expect("task listed");
+        assert_eq!(round_trip.depends_on, vec![dep]);
+    }
+
+    #[test]
+    fn task_create_defaults_depends_on_empty() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let task = seed_task(&store, "alpha", "no-deps");
+        assert!(task.depends_on.is_empty());
+    }
+
+    #[test]
+    fn task_update_replaces_depends_on() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let task = seed_task(&store, "alpha", "dep-target");
+
+        let updated = store
+            .update_task(UpdateTask {
+                id: task.id,
+                depends_on: Some(vec!["tsk_FOO".to_owned()]),
+                actor: "human:test".to_owned(),
+                ..Default::default()
+            })
+            .expect("update_task");
+        assert_eq!(updated.depends_on, vec!["tsk_FOO".to_owned()]);
+    }
+
+    #[test]
+    fn task_update_clears_depends_on_with_empty_list() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let task = store
+            .create_task(NewTask {
+                project: "alpha".to_owned(),
+                phase: None,
+                slug: "had-deps".to_owned(),
+                title: "Had deps".to_owned(),
+                body: String::new(),
+                actor: "human:test".to_owned(),
+                depends_on: vec!["tsk_BAR".to_owned()],
+            })
+            .expect("create_task");
+
+        let updated = store
+            .update_task(UpdateTask {
+                id: task.id,
+                depends_on: Some(vec![]),
+                actor: "human:test".to_owned(),
+                ..Default::default()
+            })
+            .expect("update_task");
+        assert!(updated.depends_on.is_empty());
+    }
+
+    #[test]
+    fn task_update_leaves_depends_on_when_none() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let task = store
+            .create_task(NewTask {
+                project: "alpha".to_owned(),
+                phase: None,
+                slug: "keep-deps".to_owned(),
+                title: "Keep deps".to_owned(),
+                body: String::new(),
+                actor: "human:test".to_owned(),
+                depends_on: vec!["tsk_KEEP".to_owned()],
+            })
+            .expect("create_task");
+
+        let updated = store
+            .update_task(UpdateTask {
+                id: task.id,
+                body: Some("new body".to_owned()),
+                depends_on: None,
+                actor: "human:test".to_owned(),
+                ..Default::default()
+            })
+            .expect("update_task");
+        assert_eq!(updated.body, "new body");
+        assert_eq!(updated.depends_on, vec!["tsk_KEEP".to_owned()]);
+    }
+
+    #[test]
+    fn read_task_with_missing_depends_on_defaults_empty() {
+        let (tmp, store) = fresh_corpus();
+        let project = seed_project(&store, "alpha");
+        let tsk_id = new_id("tsk");
+        let tasks_dir = tmp.path().join("projects").join("alpha").join("tasks");
+        fs::create_dir_all(&tasks_dir).expect("mkdir tasks");
+
+        let file_body = format!(
+            "---
+id: {tsk_id}
+project: {}
+slug: legacy-deps
+title: Legacy
+status: todo
+created_at: 2026-05-10T14:30:00Z
+updated_at: 2026-05-10T14:30:00Z
+---
+",
+            project.id
+        );
+        fs::write(
+            tasks_dir.join(task_filename(&tsk_id, "legacy-deps")),
+            file_body,
+        )
+        .expect("write legacy task");
+
+        let tasks = store.list_tasks(&task_filter_for("alpha")).unwrap();
+        let t = tasks
+            .iter()
+            .find(|tk| tk.slug == "legacy-deps")
+            .expect("legacy task readable");
+        assert!(t.depends_on.is_empty());
+    }
+
+    #[test]
+    fn task_with_empty_depends_on_omits_field_on_write() {
+        let (_tmp, store) = fresh_corpus();
+        seed_project(&store, "alpha");
+        let task = seed_task(&store, "alpha", "no-dep-field");
+        let (_proj, path) = store.find_task_path(&task.id).unwrap();
+        let raw = fs::read_to_string(&path).expect("read task file");
+        assert!(
+            !raw.contains("depends_on:"),
+            "empty depends_on must be omitted from frontmatter"
+        );
     }
 
     #[test]
@@ -2570,6 +2904,7 @@ mod tests {
                 title: "Draft".to_owned(),
                 body: String::new(),
                 actor: "human:test".to_owned(),
+                depends_on: Vec::new(),
             })
             .unwrap();
         assert_eq!(task.phase, phase.id, "phase slug should resolve to id");
@@ -2589,6 +2924,7 @@ mod tests {
                 title: "dup".to_owned(),
                 body: String::new(),
                 actor: "human:test".to_owned(),
+                depends_on: Vec::new(),
             })
             .expect_err("duplicate slug");
         assert!(
@@ -2609,6 +2945,7 @@ mod tests {
                 title: "x".to_owned(),
                 body: String::new(),
                 actor: "human:test".to_owned(),
+                depends_on: Vec::new(),
             })
             .expect_err("unknown project");
         assert!(err.to_string().contains("project not found"), "got: {err}");
@@ -2622,6 +2959,7 @@ mod tests {
                 title: "x".to_owned(),
                 body: String::new(),
                 actor: "human:test".to_owned(),
+                depends_on: Vec::new(),
             })
             .expect_err("unknown phase");
         assert!(err.to_string().contains("phase not found"), "got: {err}");
@@ -2640,6 +2978,7 @@ mod tests {
                 title: "x".to_owned(),
                 body: String::new(),
                 actor: "human:test".to_owned(),
+                depends_on: Vec::new(),
             })
             .expect_err("project slug must be validated");
         assert!(err.to_string().contains("invalid slug"), "got: {err}");
@@ -2652,6 +2991,7 @@ mod tests {
                 title: "x".to_owned(),
                 body: String::new(),
                 actor: "human:test".to_owned(),
+                depends_on: Vec::new(),
             })
             .expect_err("phase slug must be validated");
         assert!(
@@ -3263,6 +3603,7 @@ mod tests {
                 title: "x".to_owned(),
                 body: String::new(),
                 actor: String::new(),
+                depends_on: Vec::new(),
             })
             .expect_err("empty actor must be rejected");
         assert!(err.to_string().contains("actor is required"), "got: {err}");
@@ -3282,6 +3623,7 @@ mod tests {
                 title: "x".to_owned(),
                 body: bad_body.to_owned(),
                 actor: "ship".to_owned(),
+                depends_on: Vec::new(),
             })
             .expect_err("body with ## Notes must be rejected");
         assert!(err.to_string().contains("## Notes"), "got: {err}");
@@ -3755,6 +4097,7 @@ mod tests {
             created_at,
             updated_at: created_at,
             notes: Vec::new(),
+            depends_on: Vec::new(),
         }
     }
 
@@ -3770,6 +4113,7 @@ mod tests {
             created_at,
             updated_at: created_at,
             created_by: "unknown".to_owned(),
+            owner: String::new(),
         }
     }
 
@@ -4523,6 +4867,7 @@ mod tests {
                 title: "Draft spec".to_owned(),
                 body: String::new(),
                 actor: "human:test".to_owned(),
+                depends_on: Vec::new(),
             })
             .unwrap();
         let _in_build = store
@@ -4533,6 +4878,7 @@ mod tests {
                 title: "Wire up".to_owned(),
                 body: String::new(),
                 actor: "human:test".to_owned(),
+                depends_on: Vec::new(),
             })
             .unwrap();
 
@@ -4565,6 +4911,7 @@ mod tests {
                 title: "Draft spec".to_owned(),
                 body: String::new(),
                 actor: "human:test".to_owned(),
+                depends_on: Vec::new(),
             })
             .unwrap();
 
@@ -4895,6 +5242,7 @@ mod tests {
                 body: String::new(),
                 after_phase: None,
                 actor: "t".to_owned(),
+                owner: "human:test".to_owned(),
             })
             .unwrap();
         store
@@ -4905,6 +5253,7 @@ mod tests {
                 title: "task has needle".to_owned(),
                 body: String::new(),
                 actor: "t".to_owned(),
+                depends_on: Vec::new(),
             })
             .unwrap();
         store
@@ -4915,6 +5264,7 @@ mod tests {
                 title: "task has needle".to_owned(),
                 body: String::new(),
                 actor: "t".to_owned(),
+                depends_on: Vec::new(),
             })
             .unwrap();
 
@@ -4985,6 +5335,7 @@ mod tests {
                 body: "body has BODYKEY-gamma token".to_owned(),
                 after_phase: None,
                 actor: "t".to_owned(),
+                owner: "human:test".to_owned(),
             })
             .unwrap();
         store
@@ -4995,6 +5346,7 @@ mod tests {
                 title: "TITLEKEY-delta task".to_owned(),
                 body: "BODYKEY-epsilon in spec".to_owned(),
                 actor: "t".to_owned(),
+                depends_on: Vec::new(),
             })
             .unwrap();
 
@@ -5139,6 +5491,7 @@ mod tests {
                 status: None,
                 note: Some("note about zzzuniquezzz term".to_owned()),
                 actor: "t".to_owned(),
+                depends_on: None,
             })
             .unwrap();
         let hits = store
@@ -5233,6 +5586,10 @@ mod tests {
             want.created_by, got.created_by,
             "field `created_by` not persisted (phase frontmatter round-trip)"
         );
+        assert_eq!(
+            want.owner, got.owner,
+            "field `owner` not persisted (phase frontmatter round-trip)"
+        );
     }
 
     fn assert_task_all_fields_persisted(want: &Task, got: &Task) {
@@ -5288,6 +5645,10 @@ mod tests {
             want.notes.len(),
             got.notes.len(),
             "field `notes` count not persisted (`## Notes` section round-trip)"
+        );
+        assert_eq!(
+            want.depends_on, got.depends_on,
+            "field `depends_on` not persisted (task frontmatter round-trip)"
         );
         for (i, (wn, gn)) in want.notes.iter().zip(got.notes.iter()).enumerate() {
             assert_eq!(
@@ -5368,6 +5729,7 @@ mod tests {
             created_at: ts_create,
             updated_at: ts_upd,
             created_by: "agent:test-roundtrip".to_owned(),
+            owner: "team:platform".to_owned(),
         };
 
         let path = phases_dir.join(phase_filename(want.order, phase_slug));
@@ -5437,6 +5799,7 @@ mod tests {
             created_at: ts_create,
             updated_at: ts_upd,
             notes: vec![note],
+            depends_on: Vec::new(),
         };
 
         let path = tasks_dir.join(task_filename(&tsk_id, task_slug));
