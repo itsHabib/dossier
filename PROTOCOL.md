@@ -75,13 +75,13 @@ A discrete piece of work an implementer can claim and complete.
 | `project`      | string                                                            | owning project's id (`prj_…`) |
 | `project_slug` | string                                                            | slug of the owning project; derived from corpus path, not stored in frontmatter |
 | `phase`        | string \| null                                                    | nullable for project-wide tasks |
-| `title`       | string                                                            |                               |
-| `body`        | string (markdown)                                                 | spec / acceptance criteria    |
-| `status`      | `todo` \| `claimed` \| `in_progress` \| `blocked` \| `done` \| `cancelled` |                       |
-| `assignee`    | string \| null                                                    | actor that holds the claim    |
-| `claimed_at`  | timestamp \| null                                                 |                               |
-| `completed_at`| timestamp \| null                                                 |                               |
-| `notes`       | array of `{ actor, body, posted_at }`                             | append-only progress log      |
+| `title`        | string                                                            |                               |
+| `body`         | string (markdown)                                                 | spec / acceptance criteria    |
+| `status`       | `todo` \| `claimed` \| `in_progress` \| `blocked` \| `done` \| `cancelled` |                      |
+| `assignee`     | string \| null                                                    | actor that holds the claim    |
+| `claimed_at`   | timestamp \| null                                                 |                               |
+| `completed_at` | timestamp \| null                                                 |                               |
+| `notes`        | array of `{ actor, body, posted_at }`                             | append-only progress log      |
 
 ### Artifact
 
