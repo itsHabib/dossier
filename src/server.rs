@@ -311,7 +311,7 @@ pub struct ArtifactListResult {
     pub artifacts: Vec<Artifact>,
 }
 
-/// Arguments for `project.create`.
+/// Arguments for `project.create`. Slug must be unique in the corpus and pass slug rules.
 #[derive(Deserialize, JsonSchema)]
 pub struct ProjectCreateArgs {
     /// project slug — lowercase ASCII (a-z, 0-9, `-`, `_`); must be unique
@@ -347,7 +347,8 @@ pub struct ProjectUpdateArgs {
     pub status: Option<ProjectStatus>,
 }
 
-/// Arguments for `phase.add`.
+/// Arguments for `phase.add`. Phase slug must be unique within the project;
+/// `after_phase` inserts in order, omit to append.
 #[derive(Deserialize, JsonSchema)]
 pub struct PhaseAddArgs {
     /// project slug
@@ -390,7 +391,8 @@ pub struct PhaseUpdateArgs {
     pub owner: Option<String>,
 }
 
-/// Arguments for `task.create`.
+/// Arguments for `task.create`. Task slug must be unique within the project;
+/// optional `phase` slug anchors the task to that phase.
 #[derive(Deserialize, JsonSchema)]
 pub struct TaskCreateArgs {
     /// project slug
@@ -412,7 +414,7 @@ pub struct TaskCreateArgs {
     pub depends_on: Vec<String>,
 }
 
-/// Arguments for `task.claim`.
+/// Arguments for `task.claim`. Same-actor re-claim on a non-terminal task is a no-op.
 #[derive(Deserialize, JsonSchema)]
 pub struct TaskClaimArgs {
     /// task id (ULID with `tsk_` prefix)
