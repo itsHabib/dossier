@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// Lifecycle status of a project (`planning` | `active` | `paused` | `done` | `abandoned`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectStatus {
@@ -16,6 +17,7 @@ pub enum ProjectStatus {
     Abandoned,
 }
 
+/// Lifecycle status of a phase (`pending` | `active` | `done` | `skipped`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PhaseStatus {
@@ -25,6 +27,8 @@ pub enum PhaseStatus {
     Skipped,
 }
 
+/// Task state-machine status (`todo` | `claimed` | `in_progress` | `blocked` | `done` | `cancelled`).
+/// `claimed` and `done` are set only via `task.claim` / `task.complete`, not `task.update`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
@@ -36,6 +40,7 @@ pub enum TaskStatus {
     Cancelled,
 }
 
+/// Top-level project row — metadata in frontmatter, description body on disk.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Project {
     pub id: String,
@@ -50,6 +55,7 @@ pub struct Project {
     pub created_by: String,
 }
 
+/// Design-doc phase within a project; `order` is linear position on disk.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Phase {
     pub id: String,
@@ -75,6 +81,7 @@ fn default_phase_created_by() -> String {
     String::from("unknown")
 }
 
+/// Unit of work within a project, optionally anchored to a phase by id.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Task {
     pub id: String,
@@ -101,6 +108,7 @@ pub struct Task {
     pub depends_on: Vec<String>,
 }
 
+/// One append-only entry in a task's `## Notes` section.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Note {
     pub actor: String,
