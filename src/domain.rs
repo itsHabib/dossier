@@ -79,6 +79,9 @@ fn default_phase_created_by() -> String {
 pub struct Task {
     pub id: String,
     pub project: String,
+    /// Slug of the owning project; stamped by the store from the on-disk path on load and create. Empty if deserialized without going through the store.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub project_slug: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub phase: String,
     pub slug: String,

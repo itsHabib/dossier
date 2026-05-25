@@ -362,7 +362,8 @@ impl FsStore {
             if path.extension().and_then(|s| s.to_str()) != Some("md") {
                 continue;
             }
-            let task = load_task(&path).with_context(|| format!("load task {}", path.display()))?;
+            let task = load_task(&path, project_slug)
+                .with_context(|| format!("load task {}", path.display()))?;
             out.push(task);
         }
         Ok(out)
@@ -410,8 +411,8 @@ fn load_phase(path: &Path) -> Result<Phase> {
     Ok(p)
 }
 
-fn load_task(path: &Path) -> Result<Task> {
-    let (t, _notes) = load_task_with_notes(path)?;
+fn load_task(path: &Path, project_slug: &str) -> Result<Task> {
+    let (t, _notes) = load_task_with_notes(path, project_slug)?;
     Ok(t)
 }
 
@@ -423,12 +424,17 @@ fn load_task(path: &Path) -> Result<Task> {
 /// lines inside the notes section are trimmed during the split, so the
 /// round trip preserves entries and order but not surrounding blank
 /// padding.
-fn load_task_with_notes(path: &Path) -> Result<(Task, Vec<String>)> {
+///
+/// `project_slug` is stamped onto the returned task so callers (and the
+/// JSON output) get the owning-project slug without having to thread it
+/// alongside every Task value. It is not read from frontmatter.
+fn load_task_with_notes(path: &Path, project_slug: &str) -> Result<(Task, Vec<String>)> {
     let (front, body) = read_frontmatter(path)?;
     let mut t: Task = serde_yml::from_str(&front)
         .with_context(|| format!("parse task frontmatter {}", path.display()))?;
     let (spec, notes_lines) = split_task_body(&body);
     t.body = spec;
+    project_slug.clone_into(&mut t.project_slug);
     t.notes = notes_lines
         .iter()
         .filter_map(|l| parse_note_line(l))
@@ -893,6 +899,7 @@ impl FsStore {
         let task = Task {
             id: id.clone(),
             project: project.id,
+            project_slug: args.project.clone(),
             phase: phase_id,
             slug: args.slug.clone(),
             title: args.title,
@@ -923,8 +930,8 @@ impl FsStore {
         if args.actor.is_empty() {
             bail!("actor is required to claim a task");
         }
-        let (_project_slug, path) = self.find_task_path(&args.id)?;
-        let (task, notes_lines) = load_task_with_notes(&path)?;
+        let (project_slug, path) = self.find_task_path(&args.id)?;
+        let (task, notes_lines) = load_task_with_notes(&path, &project_slug)?;
 
         if matches!(task.status, TaskStatus::Done | TaskStatus::Cancelled) {
             bail!(
@@ -978,8 +985,8 @@ impl FsStore {
         if args.actor.is_empty() {
             bail!("actor is required to update a task");
         }
-        let (_project_slug, path) = self.find_task_path(&args.id)?;
-        let (mut task, mut notes_lines) = load_task_with_notes(&path)?;
+        let (project_slug, path) = self.find_task_path(&args.id)?;
+        let (mut task, mut notes_lines) = load_task_with_notes(&path, &project_slug)?;
 
         if let Some(target) = args.status {
             validate_task_update_transition(task.status, target)?;
@@ -1011,8 +1018,8 @@ impl FsStore {
         if args.actor.is_empty() {
             bail!("actor is required to complete a task");
         }
-        let (_project_slug, path) = self.find_task_path(&args.id)?;
-        let (mut task, mut notes_lines) = load_task_with_notes(&path)?;
+        let (project_slug, path) = self.find_task_path(&args.id)?;
+        let (mut task, mut notes_lines) = load_task_with_notes(&path, &project_slug)?;
 
         if !matches!(task.status, TaskStatus::InProgress) {
             bail!(
@@ -1038,10 +1045,10 @@ impl FsStore {
     /// `Ok(None)` when no file matches; propagates I/O / parse failures
     /// and duplicate-id corpus state.
     pub fn get_task(&self, id: &str) -> Result<Option<Task>> {
-        let Some((_project_slug, path)) = self.try_find_task_path(id)? else {
+        let Some((project_slug, path)) = self.try_find_task_path(id)? else {
             return Ok(None);
         };
-        let (task, _notes) = load_task_with_notes(&path)?;
+        let (task, _notes) = load_task_with_notes(&path, &project_slug)?;
         Ok(Some(task))
     }
 
@@ -4087,6 +4094,7 @@ updated_at: 2026-05-10T14:30:00Z
         Task {
             id: id.to_owned(),
             project: "alpha".to_owned(),
+            project_slug: "alpha".to_owned(),
             phase: String::new(),
             slug: "stub".to_owned(),
             title: "stub".to_owned(),
@@ -5603,6 +5611,10 @@ updated_at: 2026-05-10T14:30:00Z
             "field `project` not persisted (task frontmatter round-trip)"
         );
         assert_eq!(
+            want.project_slug, got.project_slug,
+            "field `project_slug` not stamped (store should derive it from the corpus path on load)"
+        );
+        assert_eq!(
             want.phase, got.phase,
             "field `phase` not persisted (task frontmatter round-trip)"
         );
@@ -5789,6 +5801,7 @@ updated_at: 2026-05-10T14:30:00Z
         let want = Task {
             id: tsk_id.clone(),
             project: prj_id,
+            project_slug: proj_slug.to_owned(),
             phase: phs_id,
             slug: task_slug.to_owned(),
             title: "Task title persisted".to_owned(),
