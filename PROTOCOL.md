@@ -13,7 +13,7 @@ If you're curious about the on-disk format, that lives in [LAYOUT.md](LAYOUT.md)
 
 v0 — minimal core. The smallest surface that lets a single implementer
 agent (Claude / Cursor / ship) drive a project end-to-end while the
-operator queries it. Search, semantic queries, multi-tenant auth,
+operator queries it. Semantic / vector / RAG search, multi-tenant auth,
 cross-project relationships, conflict detection, and decision tracking
 are explicitly out of scope; see the vision doc.
 
@@ -130,7 +130,12 @@ writes are idempotent on `(actor, request_id)` if `request_id` is supplied.
 - `task.claim` — `{ id, actor }` → Task (status=`claimed`, assignee=actor). Fails if already claimed by another actor.
 - `task.update` — `{ id, body?, status?, note? }` → Task. `note` appends to log.
 - `task.complete` — `{ id, note? }` → Task (status=`done`, completed_at=now)
+- `task.get` — `{ id }` → Task. Walks every project; no project slug required. Malformed id → `invalid_params("invalid id format")`; well-formed but absent → `invalid_params("task not found: <id>")`.
 - `task.list` — `{ project?, phase?, status?, assignee?, body_contains?, created_after?, created_before?, updated_after?, updated_before?, completed_after?, completed_before?, claimed_after?, claimed_before?, order_by?, desc?, limit? }` → list of Task. `project` is optional (omit / `null` = cross-corpus); `phase` is a slug and requires `project`. `status` is a list (OR-of-statuses). `body_contains` is a case-insensitive literal substring. Date params are RFC 3339; `_after` is inclusive, `_before` is exclusive. `order_by` on a nullable field (`completed_at`, `claimed_at`) drops rows where that field is null.
+
+### Search
+
+- `search` — `{ query, kinds?, project?, limit? }` → ranked list of hits across project / phase / task titles + bodies. `query` is a non-empty case-insensitive literal substring. `kinds` is a subset of `project` | `phase` | `task` (default: all). `project` restricts to one project slug (omit for corpus-wide). `limit` defaults to 50, applied after sort by `score` descending then `updated_at` descending. Each hit: `kind`, `id`, `project`, `slug`, `title`, `snippet` (~80 chars centered on first match), `score` (overlapping literal match count in title+body). Task hits may include `phase` (slug). Empty `query` is rejected; no matches returns an empty list.
 
 ### Artifact
 
@@ -172,9 +177,9 @@ needs version stability, this section grows; today it doesn't.
 Deliberately not built. See [docs/vision.md](docs/vision.md) for the
 "samurai sword, not swiss army" framing.
 
-- **Search / semantic query / RAG inside dossier** — LLMs already do
-  retrieval over MCP tool outputs; the query engine lives in the
-  consumer, not the store.
+- **Semantic query / vector / RAG inside dossier** — literal substring
+  `search` ships; embedding indexes and semantic retrieval stay in the
+  LLM consumer, not the store.
 - **Conflict detection** (multi-claim, slug similarity, stale claims) —
   enterprise problem; solo dev doesn't have it.
 - **Decisions** as a first-class primitive — use a task or an
