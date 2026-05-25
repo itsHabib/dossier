@@ -71,6 +71,7 @@ jobs:
             } >> "${summary_file}"
             echo "survived=0" >> "${GITHUB_OUTPUT}"
             echo "report_issue=true" >> "${GITHUB_OUTPUT}"
+            echo "summary_file=${summary_file}" >> "${GITHUB_OUTPUT}"
             cat "${summary_file}" >> "${GITHUB_STEP_SUMMARY}"
             exit 0
           fi
@@ -138,6 +139,7 @@ jobs:
           issue_num="$(gh issue list \
             --label mutation-drift \
             --state open \
+            --limit 1 \
             --json number \
             --jq '.[0].number // empty')"
 
