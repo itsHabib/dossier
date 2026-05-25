@@ -56,8 +56,9 @@ Shipped on `main`:
 - **Read side** — `project.list / project.get / phase.list / task.list
   / task.get / artifact.list`.
 - **`search`** — case-insensitive literal substring across project,
-  phase, and task titles + bodies in one ranked call (no vectors, no
-  semantic index). Returns snippets so the LLM picks the next verb
+  phase, and task titles + spec bodies in one ranked call (no vectors,
+  no semantic index; the appended `## Notes` section on tasks is excluded
+  from the index). Returns snippets so the LLM picks the next verb
   (`project.get`, `task.list`, …) without three round-trips.
 - **Write side** — `project.create/update`, `phase.add/update`,
   `task.create/claim/update/complete` with a runtime-enforced state

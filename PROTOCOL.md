@@ -130,12 +130,12 @@ writes are idempotent on `(actor, request_id)` if `request_id` is supplied.
 - `task.claim` — `{ id, actor }` → Task (status=`claimed`, assignee=actor). Fails if already claimed by another actor.
 - `task.update` — `{ id, body?, status?, note? }` → Task. `note` appends to log.
 - `task.complete` — `{ id, note? }` → Task (status=`done`, completed_at=now)
-- `task.get` — `{ id }` → Task. Walks every project; no project slug required. Malformed id → `invalid_params("invalid id format")`; well-formed but absent → `invalid_params("task not found: <id>")`.
+- `task.get` — `{ id }` → Task. Walks every project; no project slug required. Malformed id → `invalid_params("invalid id format")`; well-formed but absent → `invalid_params("task not found: ")` followed by the queried ULID.
 - `task.list` — `{ project?, phase?, status?, assignee?, body_contains?, created_after?, created_before?, updated_after?, updated_before?, completed_after?, completed_before?, claimed_after?, claimed_before?, order_by?, desc?, limit? }` → list of Task. `project` is optional (omit / `null` = cross-corpus); `phase` is a slug and requires `project`. `status` is a list (OR-of-statuses). `body_contains` is a case-insensitive literal substring. Date params are RFC 3339; `_after` is inclusive, `_before` is exclusive. `order_by` on a nullable field (`completed_at`, `claimed_at`) drops rows where that field is null.
 
 ### Search
 
-- `search` — `{ query, kinds?, project?, limit? }` → ranked list of hits across project / phase / task titles + bodies. `query` is a non-empty case-insensitive literal substring. `kinds` is a subset of `project` | `phase` | `task` (default: all). `project` restricts to one project slug (omit for corpus-wide). `limit` defaults to 50, applied after sort by `score` descending then `updated_at` descending. Each hit: `kind`, `id`, `project`, `slug`, `title`, `snippet` (~80 chars centered on first match), `score` (overlapping literal match count in title+body). Task hits may include `phase` (slug). Empty `query` is rejected; no matches returns an empty list.
+- `search` — `{ query, kinds?, project?, limit? }` → ranked list of hits across project / phase / task titles + spec bodies. `query` is a non-empty case-insensitive literal substring. `kinds` is a subset of `project` | `phase` | `task` (default: all). `project` restricts to one project slug (omit for corpus-wide). `limit` defaults to 50, applied after sort by `score` descending then `updated_at` descending. Each hit: `kind`, `id`, `project`, `slug`, `title`, `snippet` (~80 chars centered on first match), `score` (overlapping literal match count in title+body). Task hits may include `phase` (slug). The appended `## Notes` section on tasks is excluded from the index — only the spec body is searched. Empty `query` is rejected; no matches returns an empty list.
 
 ### Artifact
 
