@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2021"
 description = "Agent Project Protocol reference mesh — MCP server over a markdown-on-disk corpus"
 license = "MIT"
-authors = ["Michael Habib <michael.habib@hadrian.co>"]
 repository = "https://github.com/itsHabib/dossier"
 keywords = ["mcp", "agent", "project-management", "protocol"]
 categories = ["development-tools", "command-line-utilities"]
