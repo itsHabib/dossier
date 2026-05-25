@@ -14,7 +14,8 @@ batches:
   - id: 1
     label: ready now (all 7 parallel-safe — no file overlap across the polish surface)
     depends_on: []
-    status: pending
+    status: done
+    completed_at: 2026-05-25T02:09:05Z
     streams:
       - task_id: tsk_01KSE9A1N8P81HJF4W13KBTPY1
         task_slug: mutants-workflow-dispatch-job
@@ -22,49 +23,70 @@ batches:
         branch_name: tower/v0-polish-mutants
         runtime: cloud
         touches: [.github/workflows/mutants.yml]
-        status: pending
+        status: done
+        pr_number: 49
+        merge_commit: 0b011ad
+        merged_at: 2026-05-25T02:09:01Z
       - task_id: tsk_01KSE9ASHQS3WQG1AN0A93AMH7
         task_slug: windows-matrix-test-job
         spec_path: docs/features/v0-polish/windows-matrix-test-job.md
         branch_name: tower/v0-polish-windows
         runtime: cloud
         touches: [.github/workflows/ci.yml]
-        status: pending
+        status: done
+        pr_number: 45
+        merge_commit: b10d44b
+        merged_at: 2026-05-25T01:53:55Z
       - task_id: tsk_01KSE9BMBCGDPCEK738TF5QCCK
         task_slug: coverage-workflow-dispatch-job
         spec_path: docs/features/v0-polish/coverage-workflow-dispatch-job.md
         branch_name: tower/v0-polish-coverage
         runtime: cloud
         touches: [.github/workflows/coverage.yml]
-        status: pending
+        status: done
+        pr_number: 51
+        merge_commit: cc2afb5
+        merged_at: 2026-05-25T02:09:05Z
       - task_id: tsk_01KSE9D4VT116994WKF6JPFS90
         task_slug: prune-shipped-followups
         spec_path: docs/features/v0-polish/prune-shipped-followups.md
         branch_name: tower/v0-polish-followups
         runtime: cloud
         touches: [docs/follow-ups.md]
-        status: pending
+        status: done
+        pr_number: 44
+        merge_commit: 6774e6f
+        merged_at: 2026-05-25T01:53:18Z
       - task_id: tsk_01KSE9EDSQZYMC625NVSMEZDGT
         task_slug: reconcile-search-and-protocol-drift
         spec_path: docs/features/v0-polish/reconcile-search-and-protocol-drift.md
         branch_name: tower/v0-polish-search-protocol
         runtime: cloud
         touches: [docs/vision.md, docs/PROTOCOL.md]
-        status: pending
+        status: done
+        pr_number: 47
+        merge_commit: 51bc385
+        merged_at: 2026-05-25T02:08:54Z
       - task_id: tsk_01KSE9FEYHJY334TRN3DN2M6E5
         task_slug: readme-polish
         spec_path: docs/features/v0-polish/readme-polish.md
         branch_name: tower/v0-polish-readme
         runtime: cloud
         touches: [README.md]
-        status: pending
+        status: done
+        pr_number: 46
+        merge_commit: e232509
+        merged_at: 2026-05-25T02:08:50Z
       - task_id: tsk_01KSE9GD1VPY08WJHRCXV61X9Y
         task_slug: doc-comment-audit-public-surface
         spec_path: docs/features/v0-polish/doc-comment-audit-public-surface.md
         branch_name: tower/v0-polish-doc-audit
         runtime: cloud
         touches: [src/store.rs, src/server.rs, src/domain.rs]
-        status: pending
+        status: done
+        pr_number: 48
+        merge_commit: daadec1
+        merged_at: 2026-05-25T02:08:57Z
 
 conflict_notes:
   - kind: no_file_overlap
