@@ -23,6 +23,23 @@ claude mcp add dossier -- "$(which dossier)" serve --corpus ~/dossier-corpus
 #    matching list / get reads.
 ```
 
+### Claude Desktop
+
+Same binary, different config — add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
+
+```json
+{
+  "mcpServers": {
+    "dossier": {
+      "command": "/absolute/path/to/dossier",
+      "args": ["serve", "--corpus", "/absolute/path/to/dossier-corpus"]
+    }
+  }
+}
+```
+
+Restart Claude Desktop; the dossier tools show up in the tools menu.
+
 Ask Claude to create a project for one of your repos and link a PR:
 
 > Create a project in dossier for "tower" with slug `tower` and title "Tower —
@@ -114,7 +131,7 @@ See [PROTOCOL.md](PROTOCOL.md) for the full spec.
 ## Develop
 
 ```sh
-make check        # fmt-check + clippy --all-targets -- -D warnings + test
+make check        # fmt-check + clippy --all-targets --all-features -- -D warnings + test
 make fmt          # apply rustfmt
 make test         # cargo test
 make build        # debug build

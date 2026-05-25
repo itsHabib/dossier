@@ -72,23 +72,26 @@ Shipped on `main`:
 
 ## The shortlist of what's next
 
-In order:
+`artifact.link` shipped. The next round is more about adoption ergonomics
+than missing functionality — the core write side is real, and an agent
+that's been pointed at dossier scaffolds a corpus by calling the verbs
+without any extra tooling.
 
-1. **`artifact.link`** (PR D, ~80 LOC) — wire `append_jsonl` into a new
-   verb so tasks can point at the PRs / commits / files that shipped
-   them. Directly serves "link to a PR."
+1. **Install dossier as an MCP server in Claude Code / Claude Desktop**
+   — zero new code. Any Claude session can answer "what's open in
+   `<project>`?" / "show me the auth design doc" / "what tasks did I
+   close last week?" by calling the existing verbs. The LLM is the
+   natural-language layer; dossier provides the structured truth. This
+   is the actual public-adoption surface.
 2. **`dossier sync` / `init` CLI** — walk into a random repo, run one
    command, dossier scaffolds `.dossier/` from what it sees (README →
    `project.md`, `docs/features/*/spec.md` → phases, recent merged PRs
-   → artifacts). The adoption unlock.
-3. **Install dossier as an MCP server in Claude Code / Claude Desktop**
-   — zero new code. Once #1 and #2 land, any Claude session can answer
-   "what's open in roxiq?" / "show me the auth design doc" / "what
-   tasks did I close last week?" by calling the existing verbs. The
-   LLM is the natural-language layer; dossier provides the structured
-   truth.
+   → artifacts). Demoted from "the adoption unlock" — empirically an
+   agent + the write verbs scaffolds a corpus in one session without a
+   dedicated CLI. Worth building for ergonomic "two-keystroke onboard"
+   if the friction shows up, not before.
 
-After #3, stop and watch real usage. Anything that looks like noise in
+After #1, stop and watch real usage. Anything that looks like noise in
 the corpus, or a question Claude can't answer well, becomes the next
 target — chosen from evidence, not speculation.
 
