@@ -27,8 +27,8 @@ pub enum PhaseStatus {
     Skipped,
 }
 
-/// Task state-machine status. `claimed` and `done` are set only via
-/// `task.claim` / `task.complete`, not `task.update`.
+/// Task state-machine status (`todo` | `claimed` | `in_progress` | `blocked` | `done` | `cancelled`).
+/// `claimed` and `done` are set only via `task.claim` / `task.complete`, not `task.update`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {

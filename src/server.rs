@@ -297,10 +297,10 @@ impl From<TaskListArgs> for TaskListFilter {
 pub struct ArtifactListArgs {
     /// project slug
     pub project: String,
-    /// if set, only artifacts linked to this task ID
+    /// if non-empty, only artifacts linked to this task ID
     #[serde(default)]
     pub task: String,
-    /// if set, only artifacts of this kind (commit, pr, file, url, run, doc)
+    /// if non-empty, only artifacts of this kind (commit, pr, file, url, run, doc)
     #[serde(default)]
     pub kind: String,
 }
@@ -435,9 +435,9 @@ pub struct TaskUpdateArgs {
     /// new body; omit to leave unchanged
     #[serde(default)]
     pub body: Option<String>,
-    /// new status; omit to leave unchanged.
+    /// new status; omit to leave unchanged. Accepted values:
+    /// (`todo` | `in_progress` | `blocked` | `cancelled`).
     /// `claimed` and `done` are rejected — use task.claim / task.complete.
-    /// (`todo` | `claimed` | `in_progress` | `blocked` | `done` | `cancelled`)
     #[serde(default)]
     pub status: Option<TaskStatus>,
     /// optional note line appended to the task's `## Notes` log
