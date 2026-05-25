@@ -131,7 +131,7 @@ Specs and plans live under `docs/features/<feature>/`. Reference docs go directl
 ## Develop
 
 ```sh
-make check        # fmt-check + clippy --all-targets -- -D warnings + test
+make check        # fmt-check + clippy --all-targets --all-features -- -D warnings + test
 make fmt          # apply rustfmt
 make lint         # clippy strict (no fix)
 make test         # cargo test
