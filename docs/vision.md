@@ -39,8 +39,9 @@ that doesn't directly serve that gets cut or deferred.
 - **Multi-implementer concerns** (`request_id` idempotency, conformance
   language, protocol-version negotiation). Single-actor today.
 - **Audit logs / `last_updated_by`**. Git history covers it.
-- **Search / RAG inside dossier**. LLMs already do retrieval over MCP
-  tool outputs — build the query engine in the LLM, not the store.
+- **RAG / vector / semantic search inside dossier**. Literal substring
+  `search` ships; embedding indexes and semantic retrieval stay in the
+  LLM consumer, not the store.
 - **Web UI**. Markdown + grep + an MCP-aware agent is the UI.
 - **Cross-project relationship graphs / dependency tracking**. YAGNI.
 
@@ -53,7 +54,12 @@ Shipped on `main`:
 - **Corpus layout** (`LAYOUT.md`) — `.dossier/` marker, `projects/<slug>/{project.md,
   phases/, tasks/, artifacts.jsonl}`.
 - **Read side** — `project.list / project.get / phase.list / task.list
-  / artifact.list`.
+  / task.get / artifact.list`.
+- **`search`** — case-insensitive literal substring across project,
+  phase, and task titles + spec bodies in one ranked call (no vectors,
+  no semantic index; the appended `## Notes` section on tasks is excluded
+  from the index). Returns snippets so the LLM picks the next verb
+  (`project.get`, `task.list`, …) without three round-trips.
 - **Write side** — `project.create/update`, `phase.add/update`,
   `task.create/claim/update/complete` with a runtime-enforced state
   machine, slug uniqueness, atomic file writes, and structural guards
