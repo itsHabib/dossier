@@ -21,6 +21,10 @@ use crate::domain::{
     TaskOrderField, TaskStatus,
 };
 
+/// Filesystem-backed access to the on-disk dossier corpus at `root`.
+///
+/// Open via [`Self::open`]. Reads are lock-free; callers must serialize
+/// writes (the mesh uses a process-local `Mutex` for that).
 #[derive(Debug)]
 pub struct FsStore {
     root: PathBuf,
@@ -43,6 +47,7 @@ impl FsStore {
         Ok(Self { root: canonical })
     }
 
+    /// Canonical corpus root directory (the path passed to [`Self::open`]).
     pub fn root(&self) -> &Path {
         &self.root
     }

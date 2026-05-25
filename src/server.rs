@@ -44,6 +44,7 @@ pub struct MeshService {
 }
 
 impl MeshService {
+    /// Wrap an opened [`FsStore`] with a shared handle and process-local write lock.
     pub fn new(store: FsStore) -> Self {
         Self {
             store: Arc::new(store),
@@ -52,17 +53,21 @@ impl MeshService {
     }
 }
 
+/// Response envelope for `project.list`.
 #[derive(Serialize, JsonSchema)]
 pub struct ProjectListResult {
     pub projects: Vec<Project>,
 }
 
+/// Arguments for `project.get`.
 #[derive(Deserialize, JsonSchema)]
 pub struct ProjectGetArgs {
     /// project slug, e.g. "dossier"
     pub slug: String,
 }
 
+/// Aggregated project snapshot returned by `project.get` — project row plus
+/// all phases, tasks, and artifacts for that slug.
 #[derive(Serialize, JsonSchema)]
 pub struct ProjectView {
     pub project: Project,
@@ -147,6 +152,7 @@ pub struct PhaseListArgs {
     pub limit: Option<usize>,
 }
 
+/// Response envelope for `phase.list`.
 #[derive(Serialize, JsonSchema)]
 pub struct PhaseListResult {
     pub phases: Vec<Phase>,
@@ -218,11 +224,13 @@ pub struct TaskListArgs {
     pub limit: Option<usize>,
 }
 
+/// Response envelope for `task.list`.
 #[derive(Serialize, JsonSchema)]
 pub struct TaskListResult {
     pub tasks: Vec<Task>,
 }
 
+/// Response envelope for `search`.
 #[derive(Serialize, JsonSchema)]
 pub struct SearchResult {
     pub hits: Vec<SearchHit>,
@@ -284,6 +292,7 @@ impl From<TaskListArgs> for TaskListFilter {
     }
 }
 
+/// Arguments for `artifact.list`.
 #[derive(Deserialize, JsonSchema)]
 pub struct ArtifactListArgs {
     /// project slug
@@ -296,11 +305,13 @@ pub struct ArtifactListArgs {
     pub kind: String,
 }
 
+/// Response envelope for `artifact.list`.
 #[derive(Serialize, JsonSchema)]
 pub struct ArtifactListResult {
     pub artifacts: Vec<Artifact>,
 }
 
+/// Arguments for `project.create`.
 #[derive(Deserialize, JsonSchema)]
 pub struct ProjectCreateArgs {
     /// project slug — lowercase ASCII (a-z, 0-9, `-`, `_`); must be unique
@@ -314,6 +325,7 @@ pub struct ProjectCreateArgs {
     pub actor: String,
 }
 
+/// Arguments for `project.update`. Slug is immutable; omit fields to leave them unchanged.
 #[derive(Deserialize, JsonSchema)]
 pub struct ProjectUpdateArgs {
     /// project slug (addressing key — slug is immutable in v0)
@@ -335,6 +347,7 @@ pub struct ProjectUpdateArgs {
     pub status: Option<ProjectStatus>,
 }
 
+/// Arguments for `phase.add`.
 #[derive(Deserialize, JsonSchema)]
 pub struct PhaseAddArgs {
     /// project slug
@@ -355,6 +368,7 @@ pub struct PhaseAddArgs {
     pub owner: String,
 }
 
+/// Arguments for `phase.update`. (project, slug) is the addressing key.
 #[derive(Deserialize, JsonSchema)]
 pub struct PhaseUpdateArgs {
     /// project slug
@@ -376,6 +390,7 @@ pub struct PhaseUpdateArgs {
     pub owner: Option<String>,
 }
 
+/// Arguments for `task.create`.
 #[derive(Deserialize, JsonSchema)]
 pub struct TaskCreateArgs {
     /// project slug
@@ -397,6 +412,7 @@ pub struct TaskCreateArgs {
     pub depends_on: Vec<String>,
 }
 
+/// Arguments for `task.claim`.
 #[derive(Deserialize, JsonSchema)]
 pub struct TaskClaimArgs {
     /// task id (ULID with `tsk_` prefix)
@@ -405,6 +421,7 @@ pub struct TaskClaimArgs {
     pub actor: String,
 }
 
+/// Arguments for `task.update`. `status=claimed` and `status=done` are rejected.
 #[derive(Deserialize, JsonSchema)]
 pub struct TaskUpdateArgs {
     /// task id
@@ -427,6 +444,7 @@ pub struct TaskUpdateArgs {
     pub actor: String,
 }
 
+/// Arguments for `task.complete`. Task must be `in_progress`.
 #[derive(Deserialize, JsonSchema)]
 pub struct TaskCompleteArgs {
     /// task id
@@ -438,6 +456,7 @@ pub struct TaskCompleteArgs {
     pub actor: String,
 }
 
+/// Arguments for `artifact.link`. Appends one row to `artifacts.jsonl`.
 #[derive(Deserialize, JsonSchema)]
 pub struct ArtifactLinkArgs {
     /// project slug
