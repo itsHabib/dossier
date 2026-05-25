@@ -47,7 +47,7 @@ impl FsStore {
         Ok(Self { root: canonical })
     }
 
-    /// Canonical corpus root directory (the path passed to [`Self::open`]).
+    /// Absolute canonical corpus root directory (as resolved by [`Self::open`]).
     pub fn root(&self) -> &Path {
         &self.root
     }

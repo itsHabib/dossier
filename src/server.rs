@@ -423,7 +423,9 @@ pub struct TaskClaimArgs {
     pub actor: String,
 }
 
-/// Arguments for `task.update`. `status=claimed` and `status=done` are rejected.
+/// Arguments for `task.update`. `status=claimed` and `status=done` are rejected —
+/// use `task.claim` / `task.complete`. Terminal states reject all status transitions;
+/// remaining targets are state-machine guarded.
 #[derive(Deserialize, JsonSchema)]
 pub struct TaskUpdateArgs {
     /// task id
