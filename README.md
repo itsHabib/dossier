@@ -40,15 +40,19 @@ and linking artifacts when PRs land:
 
 ```
 # Create a project
-mcp__dossier__project_create { slug: "wellness-ai", title: "Wellness AI", actor: "human:michael" }
+mcp__dossier__project_create {"slug": "wellness-ai", "title": "Wellness AI", "actor": "human:michael"}
 
 # Add a phase + task
-mcp__dossier__phase_add { project: "wellness-ai", slug: "hyrox-coach-mvp", title: "HYROX coach MVP", actor: "human:michael", owner: "human:michael" }
-mcp__dossier__task_create { project: "wellness-ai", phase: "hyrox-coach-mvp", slug: "auth-flow", title: "auth flow design", actor: "human:michael" }
+mcp__dossier__phase_add {"project": "wellness-ai", "slug": "hyrox-coach-mvp", "title": "HYROX coach MVP", "actor": "human:michael", "owner": "human:michael"}
+mcp__dossier__task_create {"project": "wellness-ai", "phase": "hyrox-coach-mvp", "slug": "auth-flow", "title": "auth flow design", "actor": "human:michael"}
 
 # Link a PR when it merges
-mcp__dossier__artifact_link { project: "wellness-ai", task: "tsk_...", kind: "pr", ref: "https://github.com/.../pull/42", label: "PR #42 — auth flow", actor: "human:michael" }
+mcp__dossier__artifact_link {"project": "wellness-ai", "task": "tsk_...", "kind": "pr", "ref": "https://github.com/.../pull/42", "label": "PR #42 — auth flow", "actor": "human:michael"}
 ```
+
+The `mcp__dossier__<verb>` names are the Claude-Code-prefixed surface form;
+[PROTOCOL.md](PROTOCOL.md) describes the underlying verbs as `project.create` /
+`phase.add` / `task.create` / `artifact.link`. Tool args are JSON objects.
 
 ## Layout
 
@@ -74,8 +78,9 @@ Each operator keeps their corpus wherever they like — dossier only cares
 about the path you pass to `--corpus`. A common convention is
 `~/pers/dossier-state/` (e.g. `mkdir -p ~/pers/dossier-state/.dossier` then
 `dossier serve --corpus ~/pers/dossier-state`); the write verbs create
-everything else. The in-repo `projects/` directory is a test fixture, not a
-real corpus.
+everything else. The in-repo `.dossier/` marker and `projects/` directory
+form a checked-in fixture corpus used by tests — they're a valid corpus, just
+not the one an operator edits day-to-day.
 
 On disk: [project](LAYOUT.md#projectmd) ·
 [phase](LAYOUT.md#phasesnn-slugmd) ·
