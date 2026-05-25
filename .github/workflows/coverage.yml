@@ -1,0 +1,66 @@
+name: coverage
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Generate LCOV report
+        run: cargo llvm-cov --all-features --lcov --output-path lcov.info
+
+      - name: Upload LCOV artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lcov.info
+          path: lcov.info
+          retention-days: 30
+
+      - name: Post coverage summary
+        run: |
+          set -euo pipefail
+
+          cargo llvm-cov report --json --summary-only --output-path coverage-summary.json
+
+          {
+            echo "## Coverage Report"
+            echo ""
+            echo "### Totals"
+            echo ""
+            echo "| Metric | Covered | Total | % |"
+            echo "| --- | ---: | ---: | ---: |"
+            jq -r '.data[0].totals | "| Lines | \(.lines.covered) | \(.lines.count) | \(.lines.percent | . * 100 | round / 100)% |"' coverage-summary.json
+            jq -r '.data[0].totals | "| Regions | \(.regions.covered) | \(.regions.count) | \(.regions.percent | . * 100 | round / 100)% |"' coverage-summary.json
+            echo ""
+            echo "### Lowest line coverage (bottom 5 files)"
+            echo ""
+            echo "| File | Line % | Lines | Missed |"
+            echo "| --- | ---: | ---: | ---: |"
+            jq -r --arg prefix "$GITHUB_WORKSPACE/" '
+              .data[0].files
+              | sort_by(.summary.lines.percent)
+              | .[0:5][]
+              | .filename |= ltrimstr($prefix)
+              | "| \(.filename) | \(.summary.lines.percent | . * 100 | round / 100)% | \(.summary.lines.count) | \(.summary.lines.count - .summary.lines.covered) |"
+            ' coverage-summary.json
+          } >> "$GITHUB_STEP_SUMMARY"
