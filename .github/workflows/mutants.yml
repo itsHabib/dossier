@@ -54,6 +54,15 @@ jobs:
             echo
           } > "${summary_file}"
 
+          if [[ "${{ steps.run-mutants.outcome }}" == "failure" ]]; then
+            {
+              echo "## Run status"
+              echo
+              echo "\`make mutants\` exited non-zero. Review the mutation test logs for details."
+              echo
+            } >> "${summary_file}"
+          fi
+
           if [[ ! -f "${outcomes}" ]]; then
             {
               echo "## Error"
@@ -61,6 +70,7 @@ jobs:
               echo "No \`mutants.out/outcomes.json\` was produced. Check the mutation test logs."
             } >> "${summary_file}"
             echo "survived=0" >> "${GITHUB_OUTPUT}"
+            echo "report_issue=true" >> "${GITHUB_OUTPUT}"
             cat "${summary_file}" >> "${GITHUB_STEP_SUMMARY}"
             exit 0
           fi
@@ -76,7 +86,7 @@ jobs:
             ""
           ' "${outcomes}" >> "${summary_file}"
 
-          survived="$(jq '[.outcomes[] | select(.summary == "Missed" or .summary == "Timeout")] | length' "${outcomes}")"
+          survived="$(jq '(.missed + .timeout)' "${outcomes}")"
           echo "survived=${survived}" >> "${GITHUB_OUTPUT}"
 
           {
@@ -86,12 +96,14 @@ jobs:
 
           if [[ "${survived}" -eq 0 ]]; then
             echo "No surviving mutations." >> "${summary_file}"
+            echo "report_issue=false" >> "${GITHUB_OUTPUT}"
           else
             jq -r '
               .outcomes[]
-              | select(.summary == "Missed" or .summary == "Timeout")
+              | select(.summary == "MissedMutant" or .summary == "Timeout")
               | "- **\(.scenario.Mutant.file):\(.scenario.Mutant.span.start.line)** — \(.scenario.Mutant.genre) → `\(.scenario.Mutant.replacement)` in `\(.scenario.Mutant.function.function_name)` — add or tighten a test that fails when this mutation is applied"
             ' "${outcomes}" >> "${summary_file}"
+            echo "report_issue=true" >> "${GITHUB_OUTPUT}"
           fi
 
           cat "${summary_file}" >> "${GITHUB_STEP_SUMMARY}"
@@ -110,7 +122,8 @@ jobs:
         if: >-
           always()
           && github.event_name == 'schedule'
-          && steps.summary.outputs.survived != '0'
+          && steps.summary.outcome == 'success'
+          && steps.summary.outputs.report_issue == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
