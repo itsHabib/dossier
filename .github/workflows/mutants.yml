@@ -1,0 +1,153 @@
+name: mutants
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly: Sunday 06:00 UTC
+    - cron: "0 6 * * 0"
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  mutants:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-mutants
+        id: install-mutants
+        continue-on-error: true
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+
+      - name: Install cargo-mutants (fallback)
+        if: steps.install-mutants.outcome == 'failure'
+        run: cargo install cargo-mutants --locked
+
+      - name: Run mutation tests
+        id: run-mutants
+        continue-on-error: true
+        run: make mutants
+
+      - name: Write mutation summary
+        id: summary
+        if: always()
+        run: |
+          set -euo pipefail
+          summary_file="${RUNNER_TEMP}/mutants-summary.md"
+          outcomes="mutants.out/outcomes.json"
+
+          {
+            echo "# Mutation testing summary"
+            echo
+            echo "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo
+          } > "${summary_file}"
+
+          if [[ "${{ steps.run-mutants.outcome }}" == "failure" ]]; then
+            {
+              echo "## Run status"
+              echo
+              echo "\`make mutants\` exited non-zero. Review the mutation test logs for details."
+              echo
+            } >> "${summary_file}"
+          fi
+
+          if [[ ! -f "${outcomes}" ]]; then
+            {
+              echo "## Error"
+              echo
+              echo "No \`mutants.out/outcomes.json\` was produced. Check the mutation test logs."
+            } >> "${summary_file}"
+            echo "survived=0" >> "${GITHUB_OUTPUT}"
+            echo "report_issue=true" >> "${GITHUB_OUTPUT}"
+            echo "summary_file=${summary_file}" >> "${GITHUB_OUTPUT}"
+            cat "${summary_file}" >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+
+          jq -r '
+            "## Totals",
+            "",
+            "- Total mutants: \(.total_mutants)",
+            "- Caught: \(.caught)",
+            "- Missed: \(.missed)",
+            "- Timeout: \(.timeout)",
+            "- Unviable: \(.unviable)",
+            ""
+          ' "${outcomes}" >> "${summary_file}"
+
+          survived="$(jq '(.missed + .timeout)' "${outcomes}")"
+          echo "survived=${survived}" >> "${GITHUB_OUTPUT}"
+
+          {
+            echo "## Surviving mutations (missed + timeout)"
+            echo
+          } >> "${summary_file}"
+
+          if [[ "${survived}" -eq 0 ]]; then
+            echo "No surviving mutations." >> "${summary_file}"
+            echo "report_issue=false" >> "${GITHUB_OUTPUT}"
+          else
+            jq -r '
+              .outcomes[]
+              | select(.summary == "MissedMutant" or .summary == "Timeout")
+              | "- **\(.scenario.Mutant.file):\(.scenario.Mutant.span.start.line)** — \(.scenario.Mutant.genre) → `\(.scenario.Mutant.replacement)` in `\(.scenario.Mutant.function.function_name)` — add or tighten a test that fails when this mutation is applied"
+            ' "${outcomes}" >> "${summary_file}"
+            echo "report_issue=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+          cat "${summary_file}" >> "${GITHUB_STEP_SUMMARY}"
+          echo "summary_file=${summary_file}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload mutants.out artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-out
+          path: mutants.out/
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Open or update mutation-drift issue
+        if: >-
+          always()
+          && github.event_name == 'schedule'
+          && steps.summary.outcome == 'success'
+          && steps.summary.outputs.report_issue == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          summary_file="${{ steps.summary.outputs.summary_file }}"
+
+          gh label create mutation-drift \
+            --color d93f0b \
+            --description "Surviving cargo-mutants drift from weekly cron" \
+            2>/dev/null || true
+
+          issue_num="$(gh issue list \
+            --label mutation-drift \
+            --state open \
+            --limit 1 \
+            --json number \
+            --jq '.[0].number // empty')"
+
+          if [[ -n "${issue_num}" ]]; then
+            gh issue comment "${issue_num}" --body-file "${summary_file}"
+          else
+            gh issue create \
+              --title "Mutation drift: surviving mutants detected" \
+              --label mutation-drift \
+              --body-file "${summary_file}"
+          fi
