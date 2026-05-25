@@ -32,6 +32,24 @@ Ask Claude to create a project for one of your repos and link a PR:
 That's it. No `init` command needed — the write verbs scaffold the
 directory tree as you go.
 
+## Example session
+
+Once dossier is wired into a Claude Code session, an agent typically drives
+project memory without operator prompting — creating structure as work starts
+and linking artifacts when PRs land:
+
+```
+# Create a project
+mcp__dossier__project_create { slug: "wellness-ai", title: "Wellness AI", actor: "human:michael" }
+
+# Add a phase + task
+mcp__dossier__phase_add { project: "wellness-ai", slug: "hyrox-coach-mvp", title: "HYROX coach MVP", actor: "human:michael", owner: "human:michael" }
+mcp__dossier__task_create { project: "wellness-ai", phase: "hyrox-coach-mvp", slug: "auth-flow", title: "auth flow design", actor: "human:michael" }
+
+# Link a PR when it merges
+mcp__dossier__artifact_link { project: "wellness-ai", task: "tsk_...", kind: "pr", ref: "https://github.com/.../pull/42", label: "PR #42 — auth flow", actor: "human:michael" }
+```
+
 ## Layout
 
 A corpus is any directory with a `.dossier/` marker. Inside:
@@ -50,6 +68,19 @@ A corpus is any directory with a `.dossier/` marker. Inside:
       artifacts.jsonl    # append-only
 ```
 
+### Corpus location
+
+Each operator keeps their corpus wherever they like — dossier only cares
+about the path you pass to `--corpus`. A common convention is
+`~/pers/dossier-state/` (e.g. `mkdir -p ~/pers/dossier-state/.dossier` then
+`dossier serve --corpus ~/pers/dossier-state`); the write verbs create
+everything else. The in-repo `projects/` directory is a test fixture, not a
+real corpus.
+
+On disk: [project](LAYOUT.md#projectmd) ·
+[phase](LAYOUT.md#phasesnn-slugmd) ·
+[task](LAYOUT.md#tasksid-slugmd) ·
+[artifact](LAYOUT.md#artifactsjsonl).
 Full format in [LAYOUT.md](LAYOUT.md). The corpus is the source of truth
 — humans grep and edit the markdown directly, and the mesh re-reads it
 on every call.
@@ -68,7 +99,12 @@ on every call.
 | | `task.complete` |
 | | `artifact.link` |
 
-Data model in [PROTOCOL.md](PROTOCOL.md), including the task state machine.
+Data model: [project](PROTOCOL.md#project) ·
+[phase](PROTOCOL.md#phase) ·
+[task](PROTOCOL.md#task) ·
+[artifact](PROTOCOL.md#artifact) ·
+[task state machine](PROTOCOL.md#task-state-machine).
+See [PROTOCOL.md](PROTOCOL.md) for the full spec.
 
 ## Develop
 
