@@ -1,5 +1,8 @@
 # dossier
 
+[![CI](https://github.com/itsHabib/dossier/actions/workflows/ci.yml/badge.svg)](https://github.com/itsHabib/dossier/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 Project memory for the solo developer. One markdown-on-disk corpus tracking
 design docs, TDDs, and task notes across a portfolio, queryable through any
 LLM via MCP. See [docs/vision.md](docs/vision.md) for the longer "what +
