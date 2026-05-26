@@ -4,3 +4,11 @@ mutants.out/
 .idea/
 .vscode/
 *.swp
+
+# Env / secret hygiene
+.env
+.env.*
+*.pem
+*.key
+credentials*
+secrets/
