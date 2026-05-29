@@ -59,7 +59,7 @@ An ordered subdivision of a project. Phases are linear, not a graph.
 | field        | type                                        | notes                  |
 |--------------|---------------------------------------------|------------------------|
 | `id`         | string                                      | server-assigned        |
-| `project_id` | string                                      |                        |
+| `project`    | string                                      |                        |
 | `title`      | string                                      |                        |
 | `body`       | string (markdown)                           | phase doc / acceptance |
 | `order`      | integer                                     | dense, server-managed  |
@@ -90,8 +90,8 @@ A pointer to something concrete the work produced or depends on.
 | field         | type                                                          | notes                               |
 |---------------|---------------------------------------------------------------|-------------------------------------|
 | `id`          | string                                                        |                                     |
-| `project_id`  | string                                                        |                                     |
-| `task_id`     | string \| null                                                |                                     |
+| `project`     | string                                                        |                                     |
+| `task`        | string \| null                                                |                                     |
 | `kind`        | `commit` \| `pr` \| `file` \| `url` \| `run` \| `doc`         | extensible                          |
 | `ref`         | string                                                        | sha / url / path / run id           |
 | `label`       | string                                                        | short human-readable                |
@@ -120,13 +120,13 @@ writes are idempotent on `(actor, request_id)` if `request_id` is supplied.
 
 ### Phase
 
-- `phase.add` — `{ project_id, title, body, after_phase_id? }` → Phase
+- `phase.add` — `{ project, title, body, after_phase? }` → Phase
 - `phase.update` — `{ id, title?, body?, status? }` → Phase
 - `phase.list` — `{ project?, status?, body_contains?, created_after?, created_before?, updated_after?, updated_before?, order_by?, desc?, limit? }` → list of Phase. `project` is optional — omit (or pass `null`) for a cross-corpus listing. Default `order_by` is `order` (linear position within a project).
 
 ### Task
 
-- `task.create` — `{ project_id, phase_id?, title, body }` → Task (status=`todo`)
+- `task.create` — `{ project, phase?, title, body }` → Task (status=`todo`)
 - `task.claim` — `{ id, actor }` → Task (status=`claimed`, assignee=actor). Fails if already claimed by another actor.
 - `task.update` — `{ id, body?, status?, note? }` → Task. `note` appends to log.
 - `task.complete` — `{ id, note? }` → Task (status=`done`, completed_at=now)
@@ -139,8 +139,8 @@ writes are idempotent on `(actor, request_id)` if `request_id` is supplied.
 
 ### Artifact
 
-- `artifact.link` — `{ project_id, task_id?, kind, ref, label }` → Artifact
-- `artifact.list` — `{ project_id?, task_id?, kind? }` → list of Artifact
+- `artifact.link` — `{ project, task?, kind, ref, label }` → Artifact
+- `artifact.list` — `{ project?, task?, kind? }` → list of Artifact
 
 ## Task state machine
 
