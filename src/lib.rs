@@ -3,7 +3,9 @@
 //! format lives in LAYOUT.md.
 
 pub mod domain;
+pub mod s3store;
 pub mod server;
 pub mod store;
 
+pub use s3store::{S3Config, S3Store};
 pub use store::{ArtifactListFilter, FsStore, Store, StoreError, Version, Versioned};
