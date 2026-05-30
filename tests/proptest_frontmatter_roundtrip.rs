@@ -102,7 +102,7 @@ proptest! {
             .expect("create_project");
         let owner = "team:frontend".to_owned();
         let created = store
-            .add_phase(NewPhase {
+            .add_phase(&NewPhase {
                 project: proj_slug.clone(),
                 slug: phase_slug.clone(),
                 title: title.clone(),

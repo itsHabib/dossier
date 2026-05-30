@@ -19,8 +19,7 @@ use ulid::Ulid;
 
 use crate::domain::{
     Artifact, Phase, PhaseListFilter, PhaseOrderField, PhaseStatus, Project, ProjectListFilter,
-    ProjectOrderField, ProjectStatus, SearchArgs, SearchHit, SearchKind, Task, TaskListFilter,
-    TaskOrderField, TaskStatus,
+    ProjectOrderField, ProjectStatus, Task, TaskListFilter, TaskOrderField, TaskStatus,
 };
 
 /// Opaque content version token — for `FsStore`, the SHA-256 hex digest of
@@ -111,6 +110,16 @@ fn file_version(path: &Path) -> Result<Version, StoreError> {
 #[allow(clippy::needless_pass_by_value)] // map_err hands errors by value
 fn store_invalid(err: anyhow::Error) -> StoreError {
     StoreError::Invalid(err.to_string())
+}
+
+fn store_error_to_anyhow(err: StoreError) -> anyhow::Error {
+    match err {
+        StoreError::NotFound => anyhow!("not found"),
+        StoreError::Conflict => anyhow!("conflict"),
+        StoreError::Unavailable => anyhow!("unavailable"),
+        StoreError::Invalid(msg) => anyhow!("{msg}"),
+        StoreError::Io(io) => io.into(),
+    }
 }
 
 fn store_io(err: anyhow::Error) -> StoreError {
@@ -546,138 +555,6 @@ impl FsStore {
         Ok(out)
     }
 
-    /// Case-insensitive literal substring search across project titles +
-    /// descriptions, phase titles + bodies, and task titles + spec bodies
-    /// (excluding `## Notes`). Results are ranked by match count
-    /// (`score`) descending, then `updated_at` descending, then truncated
-    /// to `limit` (default 50).
-    // `too_many_lines`: single corpus walk; splitting adds indirection
-    // without clarity benefit on a structurally linear function.
-    // `cast_precision_loss`: `score` is a match count; f64 precision is
-    // only lost past 2^53 matches, which is unreachable in practice.
-    #[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
-    pub fn search(&self, args: &SearchArgs) -> Result<Vec<SearchHit>> {
-        const SNIPPET_CHARS: usize = 80;
-        let needle = args.query.trim();
-        if needle.is_empty() {
-            bail!("search query must be non-empty");
-        }
-        let limit = args.limit.unwrap_or(50);
-        let kinds = args
-            .kinds
-            .clone()
-            .unwrap_or_else(|| vec![SearchKind::Project, SearchKind::Phase, SearchKind::Task]);
-        let want_project = kinds.contains(&SearchKind::Project);
-        let want_phase = kinds.contains(&SearchKind::Phase);
-        let want_task = kinds.contains(&SearchKind::Task);
-
-        // Empty-string `project` is a caller bug (form default, etc.),
-        // not a "search everywhere" request. Per spec contract,
-        // corpus-wide search is opt-in by omitting / `null`-ing
-        // `project`, not by passing `""`. Reject explicitly so a
-        // misconfigured caller doesn't silently broaden scope.
-        let project_slugs: Vec<String> = match &args.project {
-            Some(s) if s.is_empty() => bail!(
-                "search: project filter must be non-empty (omit `project` field for corpus-wide search)"
-            ),
-            Some(s) => vec![s.clone()],
-            None => self.project_slugs()?,
-        };
-
-        let mut ranked: Vec<(SearchHit, DateTime<Utc>)> = Vec::new();
-
-        for proj_slug in &project_slugs {
-            if want_project {
-                let Ok(p) = self.load_project(proj_slug, true) else {
-                    continue;
-                };
-                let hay = format!("{}\n{}", p.title, p.description);
-                let score = count_ci_overlapping(&hay, needle);
-                if score > 0 {
-                    ranked.push((
-                        SearchHit {
-                            kind: SearchKind::Project,
-                            id: p.id.clone(),
-                            project: p.slug.clone(),
-                            phase: None,
-                            slug: p.slug.clone(),
-                            title: p.title.clone(),
-                            snippet: search_snippet(&hay, needle, SNIPPET_CHARS),
-                            score: score as f64,
-                        },
-                        p.updated_at,
-                    ));
-                }
-            }
-
-            let phase_list = if want_phase || want_task {
-                self.load_phases_for(proj_slug)?
-            } else {
-                Vec::new()
-            };
-            let id_to_phase_slug: std::collections::HashMap<&str, &str> = phase_list
-                .iter()
-                .map(|ph| (ph.id.as_str(), ph.slug.as_str()))
-                .collect();
-
-            if want_phase {
-                for ph in &phase_list {
-                    let hay = format!("{}\n{}", ph.title, ph.body);
-                    let score = count_ci_overlapping(&hay, needle);
-                    if score > 0 {
-                        ranked.push((
-                            SearchHit {
-                                kind: SearchKind::Phase,
-                                id: ph.id.clone(),
-                                project: proj_slug.clone(),
-                                phase: None,
-                                slug: ph.slug.clone(),
-                                title: ph.title.clone(),
-                                snippet: search_snippet(&hay, needle, SNIPPET_CHARS),
-                                score: score as f64,
-                            },
-                            ph.updated_at,
-                        ));
-                    }
-                }
-            }
-
-            if want_task {
-                let tasks = self.load_tasks_for(proj_slug)?;
-                for t in tasks {
-                    let hay = format!("{}\n{}", t.title, t.body);
-                    let score = count_ci_overlapping(&hay, needle);
-                    if score > 0 {
-                        let phase_slug = if t.phase.is_empty() {
-                            None
-                        } else {
-                            id_to_phase_slug
-                                .get(t.phase.as_str())
-                                .map(|s| (*s).to_owned())
-                        };
-                        ranked.push((
-                            SearchHit {
-                                kind: SearchKind::Task,
-                                id: t.id.clone(),
-                                project: proj_slug.clone(),
-                                phase: phase_slug,
-                                slug: t.slug.clone(),
-                                title: t.title.clone(),
-                                snippet: search_snippet(&hay, needle, SNIPPET_CHARS),
-                                score: score as f64,
-                            },
-                            t.updated_at,
-                        ));
-                    }
-                }
-            }
-        }
-
-        ranked.sort_by(|(ha, ta), (hb, tb)| hb.score.total_cmp(&ha.score).then_with(|| tb.cmp(ta)));
-
-        Ok(ranked.into_iter().take(limit).map(|(h, _)| h).collect())
-    }
-
     /// Slugs of every project directory under `projects/`, sorted for
     /// determinism. Used by the cross-project list paths.
     fn project_slugs(&self) -> Result<Vec<String>> {
@@ -918,6 +795,11 @@ pub struct UpdateProject {
     pub status: Option<ProjectStatus>,
 }
 
+/// Bounded retry budget for concurrent `phase.add` writers — enough to drain a
+/// burst of independent writers racing on one project; exhausting it signals
+/// pathological contention rather than normal load.
+const PHASE_ADD_MAX_RETRIES: u32 = 8;
+
 /// Arguments for `FsStore::add_phase`. Slug must be unique within the
 /// project. `after_phase` (also a slug) inserts in order; default appends.
 #[derive(Debug, Clone)]
@@ -1074,7 +956,11 @@ impl FsStore {
     /// immediately after that phase, shifting subsequent phases up by 1.
     /// When omitted, the new phase is appended to the end. The phase
     /// slug must be unique within the project.
-    pub fn add_phase(&self, args: NewPhase) -> Result<Phase> {
+    ///
+    /// Ordering is guarded by a compare-and-swap on `project.md`: two
+    /// concurrent writers racing on the same project version retry with
+    /// a freshly computed `order` rather than silently stomping.
+    pub fn add_phase(&self, args: &NewPhase) -> Result<Phase> {
         if args.project.is_empty() {
             bail!("project is required");
         }
@@ -1094,11 +980,31 @@ impl FsStore {
         if !project_dir.exists() {
             bail!("project not found: {}", args.project);
         }
-        let project = self.load_project(&args.project, false)?;
 
-        let mut existing = self.load_phases_for(&args.project)?;
+        for _ in 0..PHASE_ADD_MAX_RETRIES {
+            match self.try_add_phase_once(args, &project_dir) {
+                Ok(phase) => return Ok(phase),
+                Err(StoreError::Conflict) => (),
+                Err(e) => return Err(store_error_to_anyhow(e)),
+            }
+        }
+        bail!("phase add failed: too many concurrent writers (conflict)");
+    }
+
+    fn try_add_phase_once(&self, args: &NewPhase, project_dir: &Path) -> Result<Phase, StoreError> {
+        // Load WITH body: the CAS gate below re-serializes this project back to
+        // project.md, so an empty description here would wipe it on every phase.add.
+        let Versioned {
+            value: project,
+            version: project_version,
+        } = versioned_project(self, &args.project, true)?;
+
+        let mut existing = self.load_phases_for(&args.project).map_err(store_invalid)?;
         if existing.iter().any(|p| p.slug == args.slug) {
-            bail!("phase slug already exists in project: {}", args.slug);
+            return Err(StoreError::Invalid(format!(
+                "phase slug already exists in project: {}",
+                args.slug
+            )));
         }
 
         let new_order = match &args.after_phase {
@@ -1106,15 +1012,29 @@ impl FsStore {
                 let after = existing
                     .iter()
                     .find(|p| &p.slug == after_slug)
-                    .ok_or_else(|| anyhow!("after_phase not found: {after_slug}"))?;
+                    .ok_or_else(|| {
+                        StoreError::Invalid(format!("after_phase not found: {after_slug}"))
+                    })?;
                 after.order + 1
             }
             None => existing.iter().map(|p| p.order).max().unwrap_or(0) + 1,
         };
 
+        // Touch project.md (bump updated_at -> new version) under CAS: the gate that
+        // makes two concurrent phase.add writers conflict instead of both computing the
+        // same order and silently losing one.
+        let mut project_gate = project.clone();
+        project_gate.updated_at = now_utc();
+        let project_path = project_dir.join("project.md");
+        let project_content = serialize_project_file(&project_gate).map_err(store_invalid)?;
+        cas_write(
+            &project_path,
+            project_content.as_bytes(),
+            Some(project_version),
+        )?;
+
         let phases_dir = project_dir.join("phases");
-        fs::create_dir_all(&phases_dir)
-            .with_context(|| format!("create {}", phases_dir.display()))?;
+        fs::create_dir_all(&phases_dir).map_err(StoreError::Io)?;
 
         // Shift existing phases at or above new_order (descending so renames
         // don't collide).
@@ -1126,11 +1046,11 @@ impl FsStore {
             let old_name = phase_filename(p.order, &p.slug);
             let new_name = phase_filename(p.order + 1, &p.slug);
             fs::rename(phases_dir.join(&old_name), phases_dir.join(&new_name))
-                .with_context(|| format!("rename {old_name} -> {new_name}"))?;
+                .map_err(StoreError::Io)?;
             p.order += 1;
             let path = phases_dir.join(&new_name);
-            let content = serialize_phase_file(p)?;
-            write_atomic(&path, content.as_bytes())?;
+            let content = serialize_phase_file(p).map_err(store_invalid)?;
+            write_atomic(&path, content.as_bytes()).map_err(store_io)?;
         }
 
         let now = now_utc();
@@ -1138,18 +1058,18 @@ impl FsStore {
             id: new_id("phs"),
             project: project.id,
             slug: args.slug.clone(),
-            title: args.title,
-            body: args.body,
+            title: args.title.clone(),
+            body: args.body.clone(),
             order: new_order,
             status: PhaseStatus::Pending,
             created_at: now,
             updated_at: now,
-            created_by: args.actor,
-            owner: args.owner,
+            created_by: args.actor.clone(),
+            owner: args.owner.clone(),
         };
         let path = phases_dir.join(phase_filename(new_order, &args.slug));
-        let content = serialize_phase_file(&phase)?;
-        write_atomic(&path, content.as_bytes())?;
+        let content = serialize_phase_file(&phase).map_err(store_invalid)?;
+        write_atomic(&path, content.as_bytes()).map_err(store_io)?;
         Ok(phase)
     }
 
@@ -1961,79 +1881,6 @@ fn icontains(haystack: &str, needle: &str) -> bool {
     haystack.to_lowercase().contains(&needle.to_lowercase())
 }
 
-fn unicode_ci_eq(a: char, b: char) -> bool {
-    let sa: String = a.to_lowercase().collect();
-    let sb: String = b.to_lowercase().collect();
-    sa == sb
-}
-
-/// First byte offset in `haystack` where `needle` matches case-insensitively.
-///
-/// Uses char-by-char comparison on the original string. This diverges from
-/// `count_ci_overlapping`, which scans on `to_lowercase()`, for the edge
-/// case of multi-char lowercase mappings (e.g. `ß` → `ss`): a hit can be
-/// counted but the snippet comes back empty. Corpus is developer notes in
-/// English; aligning the two strategies would require char-index
-/// translation between the original and lowercased strings in
-/// `search_snippet`. Tracking as a separate follow-up rather than
-/// over-engineering here.
-fn find_ci_start_byte(haystack: &str, needle: &str) -> Option<usize> {
-    if needle.is_empty() {
-        return None;
-    }
-    'outer: for (start, _) in haystack.char_indices() {
-        let tail = &haystack[start..];
-        let mut t = tail;
-        for nc in needle.chars() {
-            let Some(hc) = t.chars().next() else {
-                continue 'outer;
-            };
-            if !unicode_ci_eq(hc, nc) {
-                continue 'outer;
-            }
-            t = &t[hc.len_utf8()..];
-        }
-        return Some(start);
-    }
-    None
-}
-
-/// Overlapping occurrence count of literal `needle` in `haystack` (case-insensitive).
-fn count_ci_overlapping(haystack: &str, needle: &str) -> usize {
-    let h = haystack.to_lowercase();
-    let n = needle.to_lowercase();
-    if n.is_empty() {
-        return 0;
-    }
-    let mut count = 0;
-    let mut s = 0usize;
-    while let Some(i) = h[s..].find(&n) {
-        count += 1;
-        // Advance by one CHAR width, not one byte. `find` returns a
-        // byte offset; for multi-byte UTF-8 chars (accented letters,
-        // CJK, emoji), advancing by `i + 1` can land mid-codepoint and
-        // panic on the next slice. Stepping by `len_utf8()` of the
-        // first char at the match keeps the index on a char boundary
-        // while still allowing overlapping matches.
-        let first_char_len = h[s + i..].chars().next().map_or(1, char::len_utf8);
-        s += i + first_char_len;
-    }
-    count
-}
-
-/// Roughly `width` chars centered on the first case-insensitive match.
-fn search_snippet(haystack: &str, needle: &str, width: usize) -> String {
-    let Some(start_byte) = find_ci_start_byte(haystack, needle) else {
-        return String::new();
-    };
-    let start_char = haystack[..start_byte].chars().count();
-    let chars: Vec<char> = haystack.chars().collect();
-    let half = width / 2;
-    let lo = start_char.saturating_sub(half);
-    let hi = (lo + width).min(chars.len());
-    chars.into_iter().skip(lo).take(hi - lo).collect()
-}
-
 /// `_after` is inclusive (>=), `_before` is strictly less than. Picks
 /// the boundary semantics that match how a caller phrases "since" /
 /// "before" in natural language.
@@ -2227,7 +2074,7 @@ mod tests {
     )]
 
     use super::*;
-    use crate::domain::{Note, SearchArgs, SearchKind};
+    use crate::domain::{Note, TaskListFilter};
 
     fn repo_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -2582,7 +2429,7 @@ mod tests {
     fn add_phase_rejects_invalid_project_slug() {
         let (_tmp, store) = fresh_corpus();
         let err = store
-            .add_phase(NewPhase {
+            .add_phase(&NewPhase {
                 project: BAD_PROJECT_SLUG.to_owned(),
                 slug: "spec".to_owned(),
                 title: "x".to_owned(),
@@ -2668,7 +2515,7 @@ mod tests {
 
     fn add_phase_simple(store: &FsStore, project: &str, slug: &str) -> Phase {
         store
-            .add_phase(NewPhase {
+            .add_phase(&NewPhase {
                 project: project.to_owned(),
                 slug: slug.to_owned(),
                 title: slug.to_owned(),
@@ -2686,7 +2533,7 @@ mod tests {
         seed_project(&store, "alpha");
 
         let created = store
-            .add_phase(NewPhase {
+            .add_phase(&NewPhase {
                 project: "alpha".to_owned(),
                 slug: "spec".to_owned(),
                 title: "Spec phase".to_owned(),
@@ -2708,12 +2555,34 @@ mod tests {
     }
 
     #[test]
+    fn add_phase_preserves_project_description() {
+        let (_tmp, store) = fresh_corpus();
+        store
+            .create_project(NewProject {
+                slug: "alpha".to_owned(),
+                title: "Alpha".to_owned(),
+                description: "important description body".to_owned(),
+                actor: "human:test".to_owned(),
+            })
+            .expect("create project");
+
+        // phase.add re-writes project.md as its CAS gate; it must not drop the body.
+        add_phase_simple(&store, "alpha", "spec");
+
+        let project = store.load_project("alpha", true).expect("load project");
+        assert_eq!(
+            project.description, "important description body",
+            "phase.add must not wipe the project description"
+        );
+    }
+
+    #[test]
     fn add_phase_rejects_empty_actor() {
         let (_tmp, store) = fresh_corpus();
         seed_project(&store, "alpha");
 
         let err = store
-            .add_phase(NewPhase {
+            .add_phase(&NewPhase {
                 project: "alpha".to_owned(),
                 slug: "spec".to_owned(),
                 title: "Spec phase".to_owned(),
@@ -2732,7 +2601,7 @@ mod tests {
         seed_project(&store, "alpha");
 
         let created = store
-            .add_phase(NewPhase {
+            .add_phase(&NewPhase {
                 project: "alpha".to_owned(),
                 slug: "owned".to_owned(),
                 title: "Owned phase".to_owned(),
@@ -2759,7 +2628,7 @@ mod tests {
         seed_project(&store, "alpha");
 
         let err = store
-            .add_phase(NewPhase {
+            .add_phase(&NewPhase {
                 project: "alpha".to_owned(),
                 slug: "spec".to_owned(),
                 title: "Spec phase".to_owned(),
@@ -2814,7 +2683,7 @@ mod tests {
         let (_tmp, store) = fresh_corpus();
         seed_project(&store, "alpha");
         store
-            .add_phase(NewPhase {
+            .add_phase(&NewPhase {
                 project: "alpha".to_owned(),
                 slug: "spec".to_owned(),
                 title: "Spec".to_owned(),
@@ -2922,7 +2791,7 @@ created_by: human:test
 
         // Insert after "spec": new phase becomes order 2; build/ship shift to 3/4.
         let inserted = store
-            .add_phase(NewPhase {
+            .add_phase(&NewPhase {
                 project: "alpha".to_owned(),
                 slug: "design".to_owned(),
                 title: "design".to_owned(),
@@ -2966,7 +2835,7 @@ created_by: human:test
         add_phase_simple(&store, "alpha", "spec");
 
         let err = store
-            .add_phase(NewPhase {
+            .add_phase(&NewPhase {
                 project: "alpha".to_owned(),
                 slug: "spec".to_owned(),
                 title: "Another spec".to_owned(),
@@ -2989,7 +2858,7 @@ created_by: human:test
         add_phase_simple(&store, "alpha", "spec");
 
         let err = store
-            .add_phase(NewPhase {
+            .add_phase(&NewPhase {
                 project: "alpha".to_owned(),
                 slug: "design".to_owned(),
                 title: "design".to_owned(),
@@ -3009,7 +2878,7 @@ created_by: human:test
     fn add_phase_rejects_unknown_project() {
         let (_tmp, store) = fresh_corpus();
         let err = store
-            .add_phase(NewPhase {
+            .add_phase(&NewPhase {
                 project: "ghost".to_owned(),
                 slug: "spec".to_owned(),
                 title: "spec".to_owned(),
@@ -5616,337 +5485,141 @@ updated_at: 2026-05-10T14:30:00Z
         }
     }
 
-    // ----- search (corpus-wide ranked substring) -----
+    // ----- phase.add CAS ordering -----
 
-    #[test]
-    fn dogfood_search_smoke_against_real_corpus() {
-        // Smoke test: exercise the real on-disk shape end-to-end without
-        // pinning specific slugs or content strings. Anything more specific
-        // would couple test pass/fail to corpus-rename PRs that have nothing
-        // to do with the search verb. Spec acceptance for filters, kinds,
-        // empty-query, and nonexistent-query lives in
-        // search_filters_in_temp_corpus, which uses a synthetic fixture
-        // we fully control.
-        let store = FsStore::open(repo_root()).expect("open corpus");
+    #[tokio::test]
+    async fn add_phase_cas_race_two_independent_writers() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(tmp.path().join(".dossier")).expect("mkdir .dossier");
+        let path = tmp.path();
 
-        // "dossier" appears in the own-project name itself, so any future
-        // PM rename of unrelated content won't break this.
-        let hits = store
-            .search(&SearchArgs {
-                query: "dossier".to_owned(),
-                ..Default::default()
+        let store_a = FsStore::open(path).expect("writer a");
+        store_a
+            .create_project(NewProject {
+                slug: "race".to_owned(),
+                title: "Race".to_owned(),
+                description: String::new(),
+                actor: "human:test".to_owned(),
             })
-            .unwrap();
-        assert!(!hits.is_empty(), "expected at least one 'dossier' hit");
+            .expect("create project");
+        let store_b = FsStore::open(path).expect("writer b");
 
-        let none = store
-            .search(&SearchArgs {
-                query: "DEFINITELY-NOT-IN-CORPUS-XYZ-9999".to_owned(),
-                ..Default::default()
-            })
-            .unwrap();
-        assert!(none.is_empty());
+        let va = Store::get_project(&store_a, "race")
+            .await
+            .expect("read v0 from a");
+        let vb = Store::get_project(&store_b, "race")
+            .await
+            .expect("read v0 from b");
+        assert_eq!(va.version, vb.version);
 
-        assert!(store
-            .search(&SearchArgs {
-                query: String::new(),
-                ..Default::default()
-            })
-            .is_err());
+        let args_a = NewPhase {
+            project: "race".to_owned(),
+            slug: "phase-a".to_owned(),
+            title: "Phase A".to_owned(),
+            body: String::new(),
+            after_phase: None,
+            actor: "human:test".to_owned(),
+            owner: "human:test".to_owned(),
+        };
+        let args_b = NewPhase {
+            project: "race".to_owned(),
+            slug: "phase-b".to_owned(),
+            title: "Phase B".to_owned(),
+            body: String::new(),
+            after_phase: None,
+            actor: "human:test".to_owned(),
+            owner: "human:test".to_owned(),
+        };
+
+        let phase_a = store_a.add_phase(&args_a).expect("writer a lands");
+        assert_eq!(phase_a.order, 1);
+
+        let mut stale_gate = vb.value;
+        stale_gate.updated_at = now_utc();
+        let err = store_b
+            .put_project(&stale_gate, Some(vb.version))
+            .await
+            .expect_err("writer b stale project CAS");
+        assert!(matches!(err, StoreError::Conflict));
+
+        let phase_b = store_b.add_phase(&args_b).expect("writer b retry lands");
+        assert_eq!(phase_b.order, 2);
+        assert_ne!(phase_a.order, phase_b.order);
+
+        let mut phases = store_a
+            .list_phases(&phase_filter_for("race"))
+            .expect("list phases");
+        assert_eq!(phases.len(), 2);
+        phases.sort_by_key(|p| p.order);
+        assert_eq!(phases[0].order, 1);
+        assert_eq!(phases[1].order, 2);
     }
 
-    #[test]
-    fn search_filters_in_temp_corpus() {
+    #[tokio::test]
+    async fn add_phase_cas_project_gate_conflict_then_retry() {
         let (_tmp, store) = fresh_corpus();
-        // Two projects, both indexed against the same needle to verify
-        // narrowing by project and by kind.
         store
             .create_project(NewProject {
-                slug: "alpha".to_owned(),
-                title: "alpha needle project".to_owned(),
-                description: "needle".to_owned(),
-                actor: "t".to_owned(),
+                slug: "cas".to_owned(),
+                title: "CAS".to_owned(),
+                description: String::new(),
+                actor: "human:test".to_owned(),
             })
-            .unwrap();
+            .expect("create");
+
+        let Versioned {
+            value: project,
+            version: v0,
+        } = Store::get_project(&store, "cas").await.expect("read v0");
+
+        let mut writer_a = project.clone();
+        writer_a.updated_at = now_utc();
+        let v1 = store
+            .put_project(&writer_a, Some(v0.clone()))
+            .await
+            .expect("writer a wins project CAS");
+
+        let mut writer_b = project;
+        writer_b.updated_at = now_utc();
+        let err = store
+            .put_project(&writer_b, Some(v0))
+            .await
+            .expect_err("writer b stale");
+        assert!(matches!(err, StoreError::Conflict));
+
+        let mut writer_b_retry = writer_a;
+        writer_b_retry.updated_at = now_utc();
         store
-            .create_project(NewProject {
-                slug: "beta".to_owned(),
-                title: "beta needle project".to_owned(),
-                description: "needle".to_owned(),
-                actor: "t".to_owned(),
-            })
-            .unwrap();
-        store
-            .add_phase(NewPhase {
-                project: "alpha".to_owned(),
-                slug: "ph".to_owned(),
-                title: "phase has needle".to_owned(),
+            .put_project(&writer_b_retry, Some(v1))
+            .await
+            .expect("writer b retry on v1");
+
+        let phase_a = store
+            .add_phase(&NewPhase {
+                project: "cas".to_owned(),
+                slug: "a".to_owned(),
+                title: "A".to_owned(),
                 body: String::new(),
                 after_phase: None,
-                actor: "t".to_owned(),
+                actor: "human:test".to_owned(),
                 owner: "human:test".to_owned(),
             })
-            .unwrap();
-        store
-            .create_task(NewTask {
-                project: "alpha".to_owned(),
-                phase: None,
-                slug: "ta".to_owned(),
-                title: "task has needle".to_owned(),
+            .expect("add a");
+        let phase_b = store
+            .add_phase(&NewPhase {
+                project: "cas".to_owned(),
+                slug: "b".to_owned(),
+                title: "B".to_owned(),
                 body: String::new(),
-                actor: "t".to_owned(),
-                depends_on: Vec::new(),
-            })
-            .unwrap();
-        store
-            .create_task(NewTask {
-                project: "beta".to_owned(),
-                phase: None,
-                slug: "tb".to_owned(),
-                title: "task has needle".to_owned(),
-                body: String::new(),
-                actor: "t".to_owned(),
-                depends_on: Vec::new(),
-            })
-            .unwrap();
-
-        // Unscoped: cross-project + cross-kind hits.
-        let all = store
-            .search(&SearchArgs {
-                query: "needle".to_owned(),
-                ..Default::default()
-            })
-            .unwrap();
-        let projects: std::collections::HashSet<_> =
-            all.iter().map(|h| h.project.clone()).collect();
-        assert_eq!(projects.len(), 2);
-
-        // kinds filter narrows to Task only.
-        let tasks = store
-            .search(&SearchArgs {
-                query: "needle".to_owned(),
-                kinds: Some(vec![SearchKind::Task]),
-                ..Default::default()
-            })
-            .unwrap();
-        assert!(!tasks.is_empty());
-        assert!(tasks.iter().all(|h| h.kind == SearchKind::Task));
-
-        // project filter narrows to one project across kinds.
-        let alpha_only = store
-            .search(&SearchArgs {
-                query: "needle".to_owned(),
-                project: Some("alpha".to_owned()),
-                ..Default::default()
-            })
-            .unwrap();
-        assert!(!alpha_only.is_empty());
-        assert!(alpha_only.iter().all(|h| h.project == "alpha"));
-
-        // Filter composition: project + kinds.
-        let alpha_tasks = store
-            .search(&SearchArgs {
-                query: "needle".to_owned(),
-                project: Some("alpha".to_owned()),
-                kinds: Some(vec![SearchKind::Task]),
-                ..Default::default()
-            })
-            .unwrap();
-        assert!(!alpha_tasks.is_empty());
-        assert!(alpha_tasks
-            .iter()
-            .all(|h| h.project == "alpha" && h.kind == SearchKind::Task));
-    }
-
-    #[test]
-    fn search_title_and_body_hits_in_temp_corpus() {
-        let (_tmp, store) = fresh_corpus();
-        store
-            .create_project(NewProject {
-                slug: "p1".to_owned(),
-                title: "TITLEKEY-alpha project".to_owned(),
-                description: "minimal".to_owned(),
-                actor: "t".to_owned(),
-            })
-            .unwrap();
-        store
-            .add_phase(NewPhase {
-                project: "p1".to_owned(),
-                slug: "ph1".to_owned(),
-                title: "TITLEKEY-beta phase".to_owned(),
-                body: "body has BODYKEY-gamma token".to_owned(),
                 after_phase: None,
-                actor: "t".to_owned(),
+                actor: "human:test".to_owned(),
                 owner: "human:test".to_owned(),
             })
-            .unwrap();
-        store
-            .create_task(NewTask {
-                project: "p1".to_owned(),
-                phase: Some("ph1".to_owned()),
-                slug: "tsk".to_owned(),
-                title: "TITLEKEY-delta task".to_owned(),
-                body: "BODYKEY-epsilon in spec".to_owned(),
-                actor: "t".to_owned(),
-                depends_on: Vec::new(),
-            })
-            .unwrap();
+            .expect("add b");
+        assert_ne!(phase_a.order, phase_b.order);
 
-        let t_alpha = store
-            .search(&SearchArgs {
-                query: "titlekey-alpha".to_owned(),
-                ..Default::default()
-            })
-            .unwrap();
-        assert_eq!(t_alpha.len(), 1);
-        assert_eq!(t_alpha[0].kind, SearchKind::Project);
-
-        let t_beta = store
-            .search(&SearchArgs {
-                query: "titlekey-beta".to_owned(),
-                ..Default::default()
-            })
-            .unwrap();
-        assert_eq!(t_beta.len(), 1);
-        assert_eq!(t_beta[0].kind, SearchKind::Phase);
-
-        let t_gamma = store
-            .search(&SearchArgs {
-                query: "bodykey-gamma".to_owned(),
-                ..Default::default()
-            })
-            .unwrap();
-        assert_eq!(t_gamma.len(), 1);
-        assert_eq!(t_gamma[0].kind, SearchKind::Phase);
-
-        let t_delta = store
-            .search(&SearchArgs {
-                query: "titlekey-delta".to_owned(),
-                ..Default::default()
-            })
-            .unwrap();
-        assert_eq!(t_delta.len(), 1);
-        assert_eq!(t_delta[0].kind, SearchKind::Task);
-
-        let t_eps = store
-            .search(&SearchArgs {
-                query: "bodykey-epsilon".to_owned(),
-                ..Default::default()
-            })
-            .unwrap();
-        assert_eq!(t_eps.len(), 1);
-        assert_eq!(t_eps[0].kind, SearchKind::Task);
-
-        let uni = store
-            .search(&SearchArgs {
-                query: "KEY-".to_owned(),
-                ..Default::default()
-            })
-            .unwrap();
-        let kinds: std::collections::HashSet<_> = uni.iter().map(|h| h.kind).collect();
-        assert_eq!(kinds.len(), 3);
-    }
-
-    #[test]
-    fn search_ranks_higher_score_before_lower() {
-        let (_tmp, store) = fresh_corpus();
-        seed_project(&store, "alpha");
-        let a = seed_task(&store, "alpha", "one-match");
-        let b = seed_task(&store, "alpha", "triple");
-        set_task_body(&store, &a.id, "needleonce");
-        set_task_body(&store, &b.id, "needleneedleneedle");
-        let hits = store
-            .search(&SearchArgs {
-                query: "needle".to_owned(),
-                project: Some("alpha".to_owned()),
-                kinds: Some(vec![SearchKind::Task]),
-                ..Default::default()
-            })
-            .unwrap();
-        assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].slug, "triple");
-        assert_eq!(hits[0].score as i64, 3);
-        assert_eq!(hits[1].score as i64, 1);
-    }
-
-    #[test]
-    fn search_tiebreaks_by_updated_at_desc() {
-        let (_tmp, store) = fresh_corpus();
-        seed_project(&store, "alpha");
-        let a = seed_task(&store, "alpha", "oldhit");
-        let b = seed_task(&store, "alpha", "newhit");
-        set_task_body(&store, &a.id, "sameneedle");
-        set_task_body(&store, &b.id, "sameneedle");
-        set_task_field(&store, &a.id, "updated_at", "2026-01-01T00:00:00Z");
-        set_task_field(&store, &b.id, "updated_at", "2026-06-01T00:00:00Z");
-        let hits = store
-            .search(&SearchArgs {
-                query: "sameneedle".to_owned(),
-                project: Some("alpha".to_owned()),
-                kinds: Some(vec![SearchKind::Task]),
-                ..Default::default()
-            })
-            .unwrap();
-        assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].slug, "newhit");
-        assert_eq!(hits[1].slug, "oldhit");
-    }
-
-    #[test]
-    fn search_limit_after_sort() {
-        let (_tmp, store) = fresh_corpus();
-        seed_project(&store, "alpha");
-        for i in 0..5 {
-            let slug = format!("t{i}");
-            let task = seed_task(&store, "alpha", &slug);
-            set_task_body(&store, &task.id, &format!("{} needle", "x".repeat(i + 1)));
-            set_task_field(
-                &store,
-                &task.id,
-                "updated_at",
-                &format!("2026-05-{:02}T00:00:00Z", 10 + i),
-            );
-        }
-        let hits = store
-            .search(&SearchArgs {
-                query: "needle".to_owned(),
-                project: Some("alpha".to_owned()),
-                kinds: Some(vec![SearchKind::Task]),
-                limit: Some(2),
-            })
-            .unwrap();
-        assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].slug, "t4");
-        assert_eq!(hits[1].slug, "t3");
-    }
-
-    #[test]
-    fn search_notes_section_not_indexed() {
-        let (_tmp, store) = fresh_corpus();
-        seed_project(&store, "alpha");
-        let task = seed_task(&store, "alpha", "n");
-        set_task_body(&store, &task.id, "spec has no secret");
-        store
-            .update_task(UpdateTask {
-                id: task.id,
-                body: None,
-                status: None,
-                note: Some("note about zzzuniquezzz term".to_owned()),
-                actor: "t".to_owned(),
-                depends_on: None,
-            })
-            .unwrap();
-        let hits = store
-            .search(&SearchArgs {
-                query: "zzzuniquezzz".to_owned(),
-                project: Some("alpha".to_owned()),
-                ..Default::default()
-            })
-            .unwrap();
-        assert!(
-            hits.is_empty(),
-            "notes must not be searchable, got {hits:?}"
-        );
+        let phases = store.list_phases(&phase_filter_for("cas")).expect("list");
+        assert_eq!(phases.len(), 2);
     }
 
     /// Exhaustive field comparison after project.md write + read. If a new
