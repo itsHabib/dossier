@@ -24,30 +24,36 @@ use crate::domain::{
     TaskOrderField, TaskStatus,
 };
 use crate::store::{
-    ClaimTask, CompleteTask, FsStore, LinkArtifact, NewPhase, NewProject, NewTask, UpdatePhase,
-    UpdateProject, UpdateTask,
+    ArtifactListFilter, ClaimTask, CompleteTask, FsStore, LinkArtifact, NewPhase, NewProject,
+    NewTask, Store, StoreError, UpdatePhase, UpdateProject, UpdateTask,
 };
 
 /// Implementation version of the dossier mesh. Distinct from the
 /// protocol version (which lives in PROTOCOL.md, currently v0).
 pub const VERSION: &str = "0.1.0";
 
-/// Service holding a shared `FsStore` and a process-local write lock.
+/// Service holding a shared [`Store`] backend and a process-local write lock.
 ///
-/// The `Arc<FsStore>` lets `rmcp` clone the service cheaply across
-/// handler invocations; the `Mutex<()>` serializes writes inside this
-/// process so concurrent tool calls don't race each other.
+/// The `Arc<dyn Store>` lets `rmcp` clone the service cheaply across
+/// handler invocations; the paired `Arc<FsStore>` reaches inherent-only
+/// verbs (`search`, create/update helpers) until the service layer owns
+/// them. The `Mutex<()>` serializes writes inside this process so
+/// concurrent tool calls don't race each other.
 #[derive(Clone)]
 pub struct MeshService {
-    store: Arc<FsStore>,
+    store: Arc<dyn Store>,
+    fs: Arc<FsStore>,
     write_lock: Arc<Mutex<()>>,
 }
 
 impl MeshService {
-    /// Wrap an opened [`FsStore`] with a shared handle and process-local write lock.
+    /// Wrap an opened [`FsStore`] with shared handles and a process-local write lock.
     pub fn new(store: FsStore) -> Self {
+        let fs = Arc::new(store);
+        let store: Arc<dyn Store> = fs.clone();
         Self {
-            store: Arc::new(store),
+            store,
+            fs,
             write_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -487,14 +493,18 @@ impl MeshService {
         name = "project.list",
         description = "List projects subject to a predicate filter. Every argument is optional; an empty arg set returns every project in the corpus, sorted by `created_at` ASC. Filters AND-together.\n\nFilters: `status` is a list of statuses (`planning` | `active` | `paused` | `done` | `abandoned`) — OR-of-statuses. `body_contains` is a case-insensitive literal substring against the project's description body. `created_after` / `created_before` and `updated_after` / `updated_before` are RFC 3339 timestamps; `_after` is inclusive (>=), `_before` is exclusive (<). Malformed timestamps are rejected.\n\nOrdering: `order_by` is `created_at` | `updated_at` (default `created_at`); `desc: true` reverses (default ascending). `limit` caps the rows.\n\nReturns metadata only — call `project.get` for the full description body."
     )]
-    fn project_list(
+    async fn project_list(
         &self,
         Parameters(args): Parameters<ProjectListArgs>,
     ) -> Result<Json<ProjectListResult>, ErrorData> {
         let projects = self
             .store
-            .list_projects(&ProjectListFilter::from(args))
-            .map_err(internal_or_invalid)?;
+            .list_projects(ProjectListFilter::from(args))
+            .await
+            .map_err(store_err)?
+            .into_iter()
+            .map(|v| v.value)
+            .collect();
         Ok(Json(ProjectListResult { projects }))
     }
 
@@ -511,7 +521,7 @@ impl MeshService {
             .lock()
             .map_err(|e| internal(format!("write lock poisoned: {e}")))?;
         let project = self
-            .store
+            .fs
             .create_project(NewProject {
                 slug: args.slug,
                 title: args.title,
@@ -538,7 +548,7 @@ impl MeshService {
             return Err(ErrorData::invalid_params("actor must not be empty", None));
         }
         let project = self
-            .store
+            .fs
             .update_project(UpdateProject {
                 slug: args.slug,
                 title: args.title,
@@ -553,14 +563,20 @@ impl MeshService {
         name = "project.get",
         description = "Get one project by slug, including phases, tasks, artifacts, and full description body."
     )]
-    fn project_get(
+    async fn project_get(
         &self,
         Parameters(args): Parameters<ProjectGetArgs>,
     ) -> Result<Json<ProjectView>, ErrorData> {
-        let project = self
-            .store
-            .get_project(&args.slug)
-            .map_err(internal_or_invalid)?;
+        let project = match self.store.get_project(&args.slug).await {
+            Err(StoreError::NotFound) => {
+                return Err(ErrorData::invalid_params(
+                    format!("project not found: {}", args.slug),
+                    None,
+                ));
+            }
+            Err(err) => return Err(store_err(err)),
+            Ok(versioned) => versioned.value,
+        };
         let phase_filter = PhaseListFilter {
             project: Some(args.slug.clone()),
             ..Default::default()
@@ -571,16 +587,27 @@ impl MeshService {
         };
         let phases = self
             .store
-            .list_phases(&phase_filter)
-            .map_err(internal_or_invalid)?;
+            .list_phases(phase_filter)
+            .await
+            .map_err(store_err)?
+            .into_iter()
+            .map(|v| v.value)
+            .collect();
         let tasks = self
             .store
-            .list_tasks(&task_filter)
-            .map_err(internal_or_invalid)?;
+            .list_tasks(task_filter)
+            .await
+            .map_err(store_err)?
+            .into_iter()
+            .map(|v| v.value)
+            .collect();
         let artifacts = self
             .store
-            .list_artifacts(&args.slug)
-            .map_err(internal_or_invalid)?;
+            .list_artifacts(ArtifactListFilter {
+                project: args.slug.clone(),
+            })
+            .await
+            .map_err(store_err)?;
         Ok(Json(ProjectView {
             project,
             phases,
@@ -602,7 +629,7 @@ impl MeshService {
             .lock()
             .map_err(|e| internal(format!("write lock poisoned: {e}")))?;
         let phase = self
-            .store
+            .fs
             .add_phase(NewPhase {
                 project: args.project,
                 slug: args.slug,
@@ -629,7 +656,7 @@ impl MeshService {
             .lock()
             .map_err(|e| internal(format!("write lock poisoned: {e}")))?;
         let phase = self
-            .store
+            .fs
             .update_phase(UpdatePhase {
                 project: args.project,
                 slug: args.slug,
@@ -655,7 +682,7 @@ impl MeshService {
             .lock()
             .map_err(|e| internal(format!("write lock poisoned: {e}")))?;
         let task = self
-            .store
+            .fs
             .create_task(NewTask {
                 project: args.project,
                 phase: args.phase,
@@ -682,7 +709,7 @@ impl MeshService {
             .lock()
             .map_err(|e| internal(format!("write lock poisoned: {e}")))?;
         let task = self
-            .store
+            .fs
             .claim_task(ClaimTask {
                 id: args.id,
                 actor: args.actor,
@@ -704,7 +731,7 @@ impl MeshService {
             .lock()
             .map_err(|e| internal(format!("write lock poisoned: {e}")))?;
         let task = self
-            .store
+            .fs
             .update_task(UpdateTask {
                 id: args.id,
                 body: args.body,
@@ -730,7 +757,7 @@ impl MeshService {
             .lock()
             .map_err(|e| internal(format!("write lock poisoned: {e}")))?;
         let task = self
-            .store
+            .fs
             .complete_task(CompleteTask {
                 id: args.id,
                 note: args.note,
@@ -744,16 +771,24 @@ impl MeshService {
         name = "task.get",
         description = "Fetch a single task by id (tsk_ + ULID). Walks the whole corpus — no project slug required. Rejects malformed ids before scanning; returns not-found when the id is well-formed but absent."
     )]
-    fn task_get(&self, Parameters(args): Parameters<TaskGetArgs>) -> Result<Json<Task>, ErrorData> {
+    async fn task_get(
+        &self,
+        Parameters(args): Parameters<TaskGetArgs>,
+    ) -> Result<Json<Task>, ErrorData> {
         if !is_well_formed_task_id(&args.id) {
             return Err(ErrorData::invalid_params("invalid id format", None));
         }
         let id = &args.id;
-        let task = self
-            .store
-            .get_task(id)
-            .map_err(internal_or_invalid)?
-            .ok_or_else(|| ErrorData::invalid_params(format!("task not found: {id}"), None))?;
+        let task = match self.store.get_task(id).await {
+            Ok(versioned) => versioned.value,
+            Err(StoreError::NotFound) => {
+                return Err(ErrorData::invalid_params(
+                    format!("task not found: {id}"),
+                    None,
+                ));
+            }
+            Err(err) => return Err(store_err(err)),
+        };
         Ok(Json(task))
     }
 
@@ -770,7 +805,7 @@ impl MeshService {
             .lock()
             .map_err(|e| internal(format!("write lock poisoned: {e}")))?;
         let artifact = self
-            .store
+            .fs
             .link_artifact(LinkArtifact {
                 project: args.project,
                 task: args.task,
@@ -787,15 +822,19 @@ impl MeshService {
         name = "phase.list",
         description = "List phases subject to a predicate filter. Phase bodies are included.\n\nCross-project: `project` is optional — omit it (or pass `null`) to scan every project in the corpus. A cross-project listing groups by project, then by `order` within each project, so the linear-position ordering stays meaningful.\n\nFilters: `status` is a list (`pending` | `active` | `done` | `skipped`) — OR-of-statuses. `body_contains` is a case-insensitive literal substring against the phase body. `created_after` / `created_before` and `updated_after` / `updated_before` are RFC 3339 timestamps; `_after` is inclusive (>=), `_before` is exclusive (<). Malformed timestamps are rejected.\n\nOrdering: `order_by` is `created_at` | `updated_at` | `order` (default `order` — the linear-position frontmatter field). `desc: true` reverses (default ascending). `limit` caps the rows. Filters AND-together."
     )]
-    fn phase_list(
+    async fn phase_list(
         &self,
         Parameters(args): Parameters<PhaseListArgs>,
     ) -> Result<Json<PhaseListResult>, ErrorData> {
         let filter = PhaseListFilter::from(args);
         let phases = self
             .store
-            .list_phases(&filter)
-            .map_err(internal_or_invalid)?;
+            .list_phases(filter)
+            .await
+            .map_err(store_err)?
+            .into_iter()
+            .map(|v| v.value)
+            .collect();
         Ok(Json(PhaseListResult { phases }))
     }
 
@@ -803,7 +842,7 @@ impl MeshService {
         name = "task.list",
         description = "List tasks subject to a predicate filter. Every argument is optional; an empty arg set returns every task in the corpus, sorted by `created_at` ASC. Filters AND-together.\n\nCross-project: `project` is optional — omit it (or pass `null`) to scan every project in the corpus. `phase` is a phase slug and REQUIRES `project` (validation error otherwise — phase slugs are unique per project, not globally).\n\nFilters: `status` is a list (`todo` | `claimed` | `in_progress` | `blocked` | `done` | `cancelled`) — OR-of-statuses. `assignee` is an exact match against the task's `assignee` frontmatter (e.g. `human:michael`, `ship`). `body_contains` is a case-insensitive literal substring against the task body. The four date-range pairs — `created`, `updated`, `completed`, `claimed` — each take `_after` (inclusive, >=) and `_before` (exclusive, <) RFC 3339 timestamps. Filtering on `completed_*` or `claimed_*` drops rows where that timestamp is null. Malformed timestamps are rejected.\n\nOrdering: `order_by` is `created_at` | `updated_at` | `completed_at` | `claimed_at` (default `created_at`); sorting by a nullable field (`completed_at`, `claimed_at`) drops rows where that field is null. `desc: true` reverses (default ascending). `limit` caps the rows."
     )]
-    fn task_list(
+    async fn task_list(
         &self,
         Parameters(args): Parameters<TaskListArgs>,
     ) -> Result<Json<TaskListResult>, ErrorData> {
@@ -816,8 +855,12 @@ impl MeshService {
         let filter = TaskListFilter::from(args);
         let tasks = self
             .store
-            .list_tasks(&filter)
-            .map_err(internal_or_invalid)?;
+            .list_tasks(filter)
+            .await
+            .map_err(store_err)?
+            .into_iter()
+            .map(|v| v.value)
+            .collect();
         Ok(Json(TaskListResult { tasks }))
     }
 
@@ -825,14 +868,17 @@ impl MeshService {
         name = "artifact.list",
         description = "List the artifacts linked to a project (commits, PRs, files, URLs, runs, docs)."
     )]
-    fn artifact_list(
+    async fn artifact_list(
         &self,
         Parameters(args): Parameters<ArtifactListArgs>,
     ) -> Result<Json<ArtifactListResult>, ErrorData> {
         let all = self
             .store
-            .list_artifacts(&args.project)
-            .map_err(internal_or_invalid)?;
+            .list_artifacts(ArtifactListFilter {
+                project: args.project.clone(),
+            })
+            .await
+            .map_err(store_err)?;
         let artifacts = all
             .into_iter()
             .filter(|a| args.task.is_empty() || a.task == args.task)
@@ -855,7 +901,7 @@ impl MeshService {
                 None,
             ));
         }
-        let hits = self.store.search(&args).map_err(internal_or_invalid)?;
+        let hits = self.fs.search(&args).map_err(internal_or_invalid)?;
         Ok(Json(SearchResult { hits }))
     }
 }
@@ -909,6 +955,25 @@ const USER_ERROR_MARKERS: &[&str] = &[
 #[allow(clippy::needless_pass_by_value)]
 fn internal<E: ToString>(e: E) -> ErrorData {
     ErrorData::internal_error(e.to_string(), None)
+}
+
+/// Map a [`StoreError`] onto MCP `ErrorData`. `NotFound` and validation-style
+/// `Invalid` values become request errors; `Conflict` is the CAS mismatch path.
+fn store_err(err: StoreError) -> ErrorData {
+    match err {
+        StoreError::NotFound => ErrorData::invalid_params("not found", None),
+        StoreError::Conflict => ErrorData::invalid_request("conflict", None),
+        StoreError::Unavailable => ErrorData::internal_error("unavailable", None),
+        StoreError::Invalid(msg) => {
+            let lower = msg.to_lowercase();
+            if is_user_domain_error(&lower) {
+                ErrorData::invalid_params(msg, None)
+            } else {
+                ErrorData::internal_error(msg, None)
+            }
+        }
+        StoreError::Io(e) => internal(e),
+    }
 }
 
 /// Classify `anyhow` errors from [`FsStore`] into MCP request validation vs
@@ -969,6 +1034,14 @@ mod tests {
         (tmp, service)
     }
 
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+            .block_on(future)
+    }
+
     #[test]
     fn task_update_unknown_id_returns_invalid_params() {
         let (_tmp, svc) = fresh_service();
@@ -995,9 +1068,9 @@ mod tests {
     #[test]
     fn get_task_errors_on_malformed_id() {
         let (_tmp, svc) = fresh_service();
-        match svc.task_get(Parameters(TaskGetArgs {
+        match block_on(svc.task_get(Parameters(TaskGetArgs {
             id: "tsk_nope".to_owned(),
-        })) {
+        }))) {
             Err(err) => {
                 assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
                 assert_eq!(err.message, "invalid id format");
@@ -1010,9 +1083,9 @@ mod tests {
     fn get_task_not_found_returns_invalid_params() {
         let (_tmp, svc) = fresh_service();
         let absent = "tsk_01KRSZG60JG3S0JF294AA3459V";
-        match svc.task_get(Parameters(TaskGetArgs {
+        match block_on(svc.task_get(Parameters(TaskGetArgs {
             id: absent.to_owned(),
-        })) {
+        }))) {
             Err(err) => {
                 assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
                 assert!(
@@ -1157,7 +1230,7 @@ mod tests {
             phase: Some("spec".to_owned()),
             ..Default::default()
         };
-        match svc.task_list(Parameters(args)) {
+        match block_on(svc.task_list(Parameters(args))) {
             Err(err) => assert!(
                 err.message.contains("phase requires project"),
                 "unexpected error message: {}",
@@ -1180,7 +1253,7 @@ mod tests {
             phase: Some("spec".to_owned()),
             ..Default::default()
         };
-        match svc.task_list(Parameters(args)) {
+        match block_on(svc.task_list(Parameters(args))) {
             Err(err) => {
                 assert!(
                     !err.message.contains("phase requires project"),
@@ -1334,7 +1407,7 @@ mod tests {
     fn project_list_accepts_empty_args() {
         // Smoke: a completely empty arg set is a valid call (list everything).
         let (_tmp, svc) = fresh_service();
-        let out = match svc.project_list(Parameters(ProjectListArgs::default())) {
+        let out = match block_on(svc.project_list(Parameters(ProjectListArgs::default()))) {
             Ok(Json(out)) => out,
             Err(err) => panic!("empty args must succeed: {}", err.message),
         };
@@ -1496,11 +1569,10 @@ mod tests {
         }))
         .expect("beta task");
 
-        let Json(view) = svc
-            .project_get(Parameters(ProjectGetArgs {
-                slug: "alpha".to_owned(),
-            }))
-            .expect("project.get alpha");
+        let Json(view) = block_on(svc.project_get(Parameters(ProjectGetArgs {
+            slug: "alpha".to_owned(),
+        })))
+        .expect("project.get alpha");
 
         assert_eq!(view.phases.len(), 1, "scoped to alpha project");
         assert_eq!(view.phases[0].slug, "alpha-phase");
@@ -1584,7 +1656,8 @@ mod tests {
 
         macro_rules! ids {
             ($args:expr) => {{
-                let Json(out) = svc.artifact_list(Parameters($args)).expect("artifact_list");
+                let Json(out) =
+                    block_on(svc.artifact_list(Parameters($args))).expect("artifact_list");
                 out.artifacts.into_iter().map(|a| a.id).collect::<Vec<_>>()
             }};
         }

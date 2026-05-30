@@ -11,8 +11,10 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
 use crate::domain::{
@@ -20,6 +22,348 @@ use crate::domain::{
     ProjectOrderField, ProjectStatus, SearchArgs, SearchHit, SearchKind, Task, TaskListFilter,
     TaskOrderField, TaskStatus,
 };
+
+/// Opaque content version token — for `FsStore`, the SHA-256 hex digest of
+/// the object's raw on-disk bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Version(String);
+
+impl Version {
+    /// Borrow the underlying digest string.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A domain value paired with its current storage version for CAS writes.
+#[derive(Debug, Clone)]
+pub struct Versioned<T> {
+    pub value: T,
+    pub version: Version,
+}
+
+/// Typed storage-layer errors surfaced by [`Store`] implementations.
+#[derive(Debug)]
+pub enum StoreError {
+    NotFound,
+    Conflict,
+    Unavailable,
+    Invalid(String),
+    Io(std::io::Error),
+}
+
+/// Filter for [`Store::list_artifacts`].
+#[derive(Debug, Clone, Default)]
+pub struct ArtifactListFilter {
+    pub project: String,
+}
+
+/// Backend seam — async, object-safe, versioned reads and CAS writes.
+#[async_trait]
+pub trait Store: Send + Sync {
+    async fn get_project(&self, slug: &str) -> Result<Versioned<Project>, StoreError>;
+    async fn list_projects(
+        &self,
+        filter: ProjectListFilter,
+    ) -> Result<Vec<Versioned<Project>>, StoreError>;
+    async fn get_phase(&self, project: &str, slug: &str) -> Result<Versioned<Phase>, StoreError>;
+    async fn list_phases(
+        &self,
+        filter: PhaseListFilter,
+    ) -> Result<Vec<Versioned<Phase>>, StoreError>;
+    async fn get_task(&self, id: &str) -> Result<Versioned<Task>, StoreError>;
+    async fn list_tasks(&self, filter: TaskListFilter) -> Result<Vec<Versioned<Task>>, StoreError>;
+    async fn list_artifacts(&self, filter: ArtifactListFilter)
+        -> Result<Vec<Artifact>, StoreError>;
+
+    async fn put_project(
+        &self,
+        project: &Project,
+        expected: Option<Version>,
+    ) -> Result<Version, StoreError>;
+    async fn put_phase(
+        &self,
+        phase: &Phase,
+        expected: Option<Version>,
+    ) -> Result<Version, StoreError>;
+    async fn put_task(&self, task: &Task, expected: Option<Version>)
+        -> Result<Version, StoreError>;
+    async fn put_artifact(&self, artifact: &Artifact) -> Result<(), StoreError>;
+}
+
+fn hash_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+fn file_version(path: &Path) -> Result<Version, StoreError> {
+    let bytes = fs::read(path).map_err(StoreError::Io)?;
+    Ok(Version(hash_bytes(&bytes)))
+}
+
+#[allow(clippy::needless_pass_by_value)] // map_err hands errors by value
+fn store_invalid(err: anyhow::Error) -> StoreError {
+    StoreError::Invalid(err.to_string())
+}
+
+fn store_io(err: anyhow::Error) -> StoreError {
+    match err.downcast::<std::io::Error>() {
+        Ok(io) => StoreError::Io(io),
+        Err(err) => StoreError::Invalid(err.to_string()),
+    }
+}
+
+fn versioned_project(
+    store: &FsStore,
+    slug: &str,
+    with_body: bool,
+) -> Result<Versioned<Project>, StoreError> {
+    let path = store
+        .project_dir(slug)
+        .map_err(store_invalid)?
+        .join("project.md");
+    if !path.exists() {
+        return Err(StoreError::NotFound);
+    }
+    let project = store.load_project(slug, with_body).map_err(store_invalid)?;
+    let version = file_version(&path)?;
+    Ok(Versioned {
+        value: project,
+        version,
+    })
+}
+
+fn versioned_phase(path: &Path) -> Result<Versioned<Phase>, StoreError> {
+    let phase = load_phase(path).map_err(store_invalid)?;
+    let version = file_version(path)?;
+    Ok(Versioned {
+        value: phase,
+        version,
+    })
+}
+
+fn versioned_task(path: &Path, project_slug: &str) -> Result<Versioned<Task>, StoreError> {
+    let (task, _notes) = load_task_with_notes(path, project_slug).map_err(store_invalid)?;
+    let version = file_version(path)?;
+    Ok(Versioned {
+        value: task,
+        version,
+    })
+}
+
+fn notes_lines_for_task(task: &Task) -> Vec<String> {
+    task.notes
+        .iter()
+        .map(|n| format_note_line(n.posted_at, &n.actor, &n.body))
+        .collect()
+}
+
+fn cas_write(
+    path: &Path,
+    content: &[u8],
+    expected: Option<Version>,
+) -> Result<Version, StoreError> {
+    match expected {
+        None => {
+            if path.exists() {
+                return Err(StoreError::Conflict);
+            }
+        }
+        Some(expected_v) => {
+            if !path.exists() {
+                return Err(StoreError::NotFound);
+            }
+            let current = file_version(path)?;
+            if current != expected_v {
+                return Err(StoreError::Conflict);
+            }
+        }
+    }
+    write_atomic(path, content).map_err(store_io)?;
+    file_version(path)
+}
+
+fn project_slug_for_id(store: &FsStore, project_id: &str) -> Result<String, StoreError> {
+    for slug in store.project_slugs().map_err(store_invalid)? {
+        let project = store.load_project(&slug, false).map_err(store_invalid)?;
+        if project.id == project_id {
+            return Ok(slug);
+        }
+    }
+    Err(StoreError::NotFound)
+}
+
+#[async_trait]
+impl Store for FsStore {
+    async fn get_project(&self, slug: &str) -> Result<Versioned<Project>, StoreError> {
+        versioned_project(self, slug, true)
+    }
+
+    async fn list_projects(
+        &self,
+        filter: ProjectListFilter,
+    ) -> Result<Vec<Versioned<Project>>, StoreError> {
+        let projects = Self::list_projects(self, &filter).map_err(store_invalid)?;
+        projects
+            .into_iter()
+            .map(|p| {
+                let path = self
+                    .project_dir(&p.slug)
+                    .map_err(store_invalid)?
+                    .join("project.md");
+                let version = file_version(&path)?;
+                Ok(Versioned { value: p, version })
+            })
+            .collect()
+    }
+
+    async fn get_phase(&self, project: &str, slug: &str) -> Result<Versioned<Phase>, StoreError> {
+        let path = self.find_phase_path(project, slug).map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("not found") {
+                StoreError::NotFound
+            } else {
+                StoreError::Invalid(msg)
+            }
+        })?;
+        versioned_phase(&path)
+    }
+
+    async fn list_phases(
+        &self,
+        filter: PhaseListFilter,
+    ) -> Result<Vec<Versioned<Phase>>, StoreError> {
+        let phases = Self::list_phases(self, &filter).map_err(store_invalid)?;
+        let project = filter.project.as_deref();
+        phases
+            .into_iter()
+            .map(|p| {
+                let project_slug = project
+                    .map(str::to_owned)
+                    .or_else(|| self.project_slug_for_phase_id(&p.id).ok())
+                    .ok_or(StoreError::NotFound)?;
+                let path = self
+                    .find_phase_path(&project_slug, &p.slug)
+                    .map_err(|e| StoreError::Invalid(e.to_string()))?;
+                versioned_phase(&path)
+            })
+            .collect()
+    }
+
+    async fn get_task(&self, id: &str) -> Result<Versioned<Task>, StoreError> {
+        let (project_slug, path) = self.find_task_path(id).map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("not found") {
+                StoreError::NotFound
+            } else {
+                StoreError::Invalid(msg)
+            }
+        })?;
+        versioned_task(&path, &project_slug)
+    }
+
+    async fn list_tasks(&self, filter: TaskListFilter) -> Result<Vec<Versioned<Task>>, StoreError> {
+        let tasks = Self::list_tasks(self, &filter).map_err(store_invalid)?;
+        tasks
+            .into_iter()
+            .map(|t| {
+                let path = self
+                    .project_dir(&t.project_slug)
+                    .map_err(store_invalid)?
+                    .join("tasks")
+                    .join(task_filename(&t.id, &t.slug));
+                versioned_task(&path, &t.project_slug)
+            })
+            .collect()
+    }
+
+    async fn list_artifacts(
+        &self,
+        filter: ArtifactListFilter,
+    ) -> Result<Vec<Artifact>, StoreError> {
+        Self::list_artifacts(self, &filter.project).map_err(store_invalid)
+    }
+
+    async fn put_project(
+        &self,
+        project: &Project,
+        expected: Option<Version>,
+    ) -> Result<Version, StoreError> {
+        let dir = self.project_dir(&project.slug).map_err(store_invalid)?;
+        let path = dir.join("project.md");
+        if expected.is_none() && !dir.exists() {
+            fs::create_dir_all(&dir).map_err(StoreError::Io)?;
+        }
+        let content = serialize_project_file(project).map_err(store_invalid)?;
+        cas_write(&path, content.as_bytes(), expected)
+    }
+
+    async fn put_phase(
+        &self,
+        phase: &Phase,
+        expected: Option<Version>,
+    ) -> Result<Version, StoreError> {
+        let project_slug = project_slug_for_id(self, &phase.project)?;
+        let content = serialize_phase_file(phase).map_err(store_invalid)?;
+        let path = if expected.is_none() {
+            let phases_dir = self
+                .project_dir(&project_slug)
+                .map_err(store_invalid)?
+                .join("phases");
+            fs::create_dir_all(&phases_dir).map_err(StoreError::Io)?;
+            phases_dir.join(phase_filename(phase.order, &phase.slug))
+        } else {
+            self.find_phase_path(&project_slug, &phase.slug)
+                .map_err(|e| {
+                    let msg = e.to_string();
+                    if msg.contains("not found") {
+                        StoreError::NotFound
+                    } else {
+                        StoreError::Invalid(msg)
+                    }
+                })?
+        };
+        cas_write(&path, content.as_bytes(), expected)
+    }
+
+    async fn put_task(
+        &self,
+        task: &Task,
+        expected: Option<Version>,
+    ) -> Result<Version, StoreError> {
+        let path = self
+            .project_dir(&task.project_slug)
+            .map_err(store_invalid)?
+            .join("tasks")
+            .join(task_filename(&task.id, &task.slug));
+        if expected.is_none() {
+            let tasks_dir = path
+                .parent()
+                .ok_or_else(|| StoreError::Invalid("task path has no parent".to_owned()))?;
+            fs::create_dir_all(tasks_dir).map_err(StoreError::Io)?;
+        }
+        let notes_lines = notes_lines_for_task(task);
+        let content = serialize_task_file(task, &notes_lines).map_err(store_invalid)?;
+        cas_write(&path, content.as_bytes(), expected)
+    }
+
+    async fn put_artifact(&self, artifact: &Artifact) -> Result<(), StoreError> {
+        let project_slug = project_slug_for_id(self, &artifact.project)?;
+        let existing = Self::list_artifacts(self, &project_slug).map_err(store_invalid)?;
+        if existing.iter().any(|a| a.id == artifact.id) {
+            return Err(StoreError::Conflict);
+        }
+        let line =
+            serde_json::to_string(artifact).map_err(|e| StoreError::Invalid(e.to_string()))?;
+        let path = self
+            .project_dir(&project_slug)
+            .map_err(store_invalid)?
+            .join("artifacts.jsonl");
+        append_jsonl(&path, &line).map_err(store_io)?;
+        Ok(())
+    }
+}
 
 /// Filesystem-backed access to the on-disk dossier corpus at `root`.
 ///
@@ -838,6 +1182,16 @@ impl FsStore {
             }
         }
         bail!("phase not found: {project_slug}/{phase_slug}")
+    }
+
+    fn project_slug_for_phase_id(&self, phase_id: &str) -> Result<String> {
+        for slug in self.project_slugs()? {
+            let phases = self.load_phases_for(&slug)?;
+            if phases.iter().any(|p| p.id == phase_id) {
+                return Ok(slug);
+            }
+        }
+        bail!("phase id not found: {phase_id}")
     }
 }
 
@@ -1937,6 +2291,53 @@ mod tests {
         fs::create_dir_all(tmp.path().join(".dossier")).expect("mkdir .dossier");
         let store = FsStore::open(tmp.path()).expect("open fresh corpus");
         (tmp, store)
+    }
+
+    #[tokio::test]
+    async fn put_project_cas_round_trip() {
+        let (_tmp, store) = fresh_corpus();
+        let now = now_utc();
+        let project = Project {
+            id: new_id("prj"),
+            slug: "cas-proj".to_owned(),
+            title: "CAS".to_owned(),
+            description: "v0 body".to_owned(),
+            status: ProjectStatus::Planning,
+            created_at: now,
+            updated_at: now,
+            created_by: "human:test".to_owned(),
+        };
+        let v0 = store.put_project(&project, None).await.expect("create");
+
+        let mut updated = project.clone();
+        updated.title = "changed".to_owned();
+        updated.description = "v1 body".to_owned();
+        let wrong = Version("deadbeef".to_owned());
+        let err = store
+            .put_project(&updated, Some(wrong))
+            .await
+            .expect_err("stale version");
+        assert!(matches!(err, StoreError::Conflict));
+
+        let path = store
+            .project_dir("cas-proj")
+            .expect("project dir")
+            .join("project.md");
+        let on_disk = fs::read_to_string(&path).expect("read project");
+        assert!(on_disk.contains("CAS"));
+        assert!(!on_disk.contains("changed"));
+
+        let v1 = store
+            .put_project(&updated, Some(v0.clone()))
+            .await
+            .expect("update");
+        assert_ne!(v0, v1);
+
+        let err = store
+            .put_project(&project, None)
+            .await
+            .expect_err("duplicate create");
+        assert!(matches!(err, StoreError::Conflict));
     }
 
     #[test]
