@@ -90,7 +90,7 @@ proptest! {
             })
             .expect("create_project");
         let phase = store
-            .add_phase(NewPhase {
+            .add_phase(&NewPhase {
                 project: proj_slug.clone(),
                 slug: phase_slug.clone(),
                 title: "P".into(),
@@ -149,7 +149,7 @@ proptest! {
             description: String::new(),
             actor: "human:michael".into(),
         }).expect("create_project");
-        let result = store.add_phase(NewPhase {
+        let result = store.add_phase(&NewPhase {
             project: "host".into(),
             slug: s,
             title: "P".into(),

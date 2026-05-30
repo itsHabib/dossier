@@ -20,8 +20,8 @@ use ulid::Ulid;
 
 use crate::domain::{
     Artifact, Phase, PhaseListFilter, PhaseOrderField, PhaseStatus, Project, ProjectListFilter,
-    ProjectOrderField, ProjectStatus, SearchArgs, SearchHit, Task, TaskGetArgs, TaskListFilter,
-    TaskOrderField, TaskStatus,
+    ProjectOrderField, ProjectStatus, SearchArgs, SearchHit, SearchKind, Task, TaskGetArgs,
+    TaskListFilter, TaskOrderField, TaskStatus,
 };
 use crate::store::{
     ArtifactListFilter, ClaimTask, CompleteTask, FsStore, LinkArtifact, NewPhase, NewProject,
@@ -36,9 +36,8 @@ pub const VERSION: &str = "0.1.0";
 ///
 /// The `Arc<dyn Store>` lets `rmcp` clone the service cheaply across
 /// handler invocations; the paired `Arc<FsStore>` reaches inherent-only
-/// verbs (`search`, create/update helpers) until the service layer owns
-/// them. The `Mutex<()>` serializes writes inside this process so
-/// concurrent tool calls don't race each other.
+/// write verbs until the service layer owns them. The `Mutex<()>` serializes
+/// writes inside this process so concurrent tool calls don't race each other.
 #[derive(Clone)]
 pub struct MeshService {
     store: Arc<dyn Store>,
@@ -487,6 +486,214 @@ pub struct ArtifactLinkArgs {
     pub actor: String,
 }
 
+impl MeshService {
+    /// Case-insensitive literal substring search across the corpus via
+    /// [`Store`] reads. Application-layer query — not a storage verb.
+    // `too_many_lines`: single corpus walk; splitting adds indirection
+    // without clarity benefit on a structurally linear function.
+    // `cast_precision_loss`: `score` is a match count; f64 precision is
+    // only lost past 2^53 matches, which is unreachable in practice.
+    #[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
+    async fn search_corpus(&self, args: &SearchArgs) -> Result<Vec<SearchHit>, ErrorData> {
+        const SNIPPET_CHARS: usize = 80;
+        let needle = args.query.trim();
+        let limit = args.limit.unwrap_or(50);
+        let kinds = args
+            .kinds
+            .clone()
+            .unwrap_or_else(|| vec![SearchKind::Project, SearchKind::Phase, SearchKind::Task]);
+        let want_project = kinds.contains(&SearchKind::Project);
+        let want_phase = kinds.contains(&SearchKind::Phase);
+        let want_task = kinds.contains(&SearchKind::Task);
+
+        let project_slugs: Vec<String> = match &args.project {
+            Some(s) if s.is_empty() => {
+                return Err(ErrorData::invalid_params(
+                    "search: project filter must be non-empty (omit `project` field for corpus-wide search)",
+                    None,
+                ));
+            }
+            Some(s) => vec![s.clone()],
+            None => self
+                .store
+                .list_projects(ProjectListFilter::default())
+                .await
+                .map_err(store_err)?
+                .into_iter()
+                .map(|v| v.value.slug)
+                .collect(),
+        };
+
+        let mut ranked: Vec<(SearchHit, DateTime<Utc>)> = Vec::new();
+
+        for proj_slug in &project_slugs {
+            if want_project {
+                let Ok(p) = self.store.get_project(proj_slug).await else {
+                    continue;
+                };
+                let p = p.value;
+                let hay = format!("{}\n{}", p.title, p.description);
+                let score = count_ci_overlapping(&hay, needle);
+                if score > 0 {
+                    ranked.push((
+                        SearchHit {
+                            kind: SearchKind::Project,
+                            id: p.id.clone(),
+                            project: p.slug.clone(),
+                            phase: None,
+                            slug: p.slug.clone(),
+                            title: p.title.clone(),
+                            snippet: search_snippet(&hay, needle, SNIPPET_CHARS),
+                            score: score as f64,
+                        },
+                        p.updated_at,
+                    ));
+                }
+            }
+
+            let phase_list = if want_phase || want_task {
+                self.store
+                    .list_phases(PhaseListFilter {
+                        project: Some(proj_slug.clone()),
+                        ..Default::default()
+                    })
+                    .await
+                    .map_err(store_err)?
+                    .into_iter()
+                    .map(|v| v.value)
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            let id_to_phase_slug: std::collections::HashMap<&str, &str> = phase_list
+                .iter()
+                .map(|ph| (ph.id.as_str(), ph.slug.as_str()))
+                .collect();
+
+            if want_phase {
+                for ph in &phase_list {
+                    let hay = format!("{}\n{}", ph.title, ph.body);
+                    let score = count_ci_overlapping(&hay, needle);
+                    if score > 0 {
+                        ranked.push((
+                            SearchHit {
+                                kind: SearchKind::Phase,
+                                id: ph.id.clone(),
+                                project: proj_slug.clone(),
+                                phase: None,
+                                slug: ph.slug.clone(),
+                                title: ph.title.clone(),
+                                snippet: search_snippet(&hay, needle, SNIPPET_CHARS),
+                                score: score as f64,
+                            },
+                            ph.updated_at,
+                        ));
+                    }
+                }
+            }
+
+            if want_task {
+                let tasks = self
+                    .store
+                    .list_tasks(TaskListFilter {
+                        project: Some(proj_slug.clone()),
+                        ..Default::default()
+                    })
+                    .await
+                    .map_err(store_err)?
+                    .into_iter()
+                    .map(|v| v.value)
+                    .collect::<Vec<_>>();
+                for t in tasks {
+                    let hay = format!("{}\n{}", t.title, t.body);
+                    let score = count_ci_overlapping(&hay, needle);
+                    if score > 0 {
+                        let phase_slug = if t.phase.is_empty() {
+                            None
+                        } else {
+                            id_to_phase_slug
+                                .get(t.phase.as_str())
+                                .map(|s| (*s).to_owned())
+                        };
+                        ranked.push((
+                            SearchHit {
+                                kind: SearchKind::Task,
+                                id: t.id.clone(),
+                                project: proj_slug.clone(),
+                                phase: phase_slug,
+                                slug: t.slug.clone(),
+                                title: t.title.clone(),
+                                snippet: search_snippet(&hay, needle, SNIPPET_CHARS),
+                                score: score as f64,
+                            },
+                            t.updated_at,
+                        ));
+                    }
+                }
+            }
+        }
+
+        ranked.sort_by(|(ha, ta), (hb, tb)| hb.score.total_cmp(&ha.score).then_with(|| tb.cmp(ta)));
+
+        Ok(ranked.into_iter().take(limit).map(|(h, _)| h).collect())
+    }
+}
+
+fn unicode_ci_eq(a: char, b: char) -> bool {
+    let sa: String = a.to_lowercase().collect();
+    let sb: String = b.to_lowercase().collect();
+    sa == sb
+}
+
+fn find_ci_start_byte(haystack: &str, needle: &str) -> Option<usize> {
+    if needle.is_empty() {
+        return None;
+    }
+    'outer: for (start, _) in haystack.char_indices() {
+        let tail = &haystack[start..];
+        let mut t = tail;
+        for nc in needle.chars() {
+            let Some(hc) = t.chars().next() else {
+                continue 'outer;
+            };
+            if !unicode_ci_eq(hc, nc) {
+                continue 'outer;
+            }
+            t = &t[hc.len_utf8()..];
+        }
+        return Some(start);
+    }
+    None
+}
+
+fn count_ci_overlapping(haystack: &str, needle: &str) -> usize {
+    let h = haystack.to_lowercase();
+    let n = needle.to_lowercase();
+    if n.is_empty() {
+        return 0;
+    }
+    let mut count = 0;
+    let mut s = 0usize;
+    while let Some(i) = h[s..].find(&n) {
+        count += 1;
+        let first_char_len = h[s + i..].chars().next().map_or(1, char::len_utf8);
+        s += i + first_char_len;
+    }
+    count
+}
+
+fn search_snippet(haystack: &str, needle: &str, width: usize) -> String {
+    let Some(start_byte) = find_ci_start_byte(haystack, needle) else {
+        return String::new();
+    };
+    let start_char = haystack[..start_byte].chars().count();
+    let chars: Vec<char> = haystack.chars().collect();
+    let half = width / 2;
+    let lo = start_char.saturating_sub(half);
+    let hi = (lo + width).min(chars.len());
+    chars.into_iter().skip(lo).take(hi - lo).collect()
+}
+
 #[tool_router(server_handler)]
 impl MeshService {
     #[tool(
@@ -630,7 +837,7 @@ impl MeshService {
             .map_err(|e| internal(format!("write lock poisoned: {e}")))?;
         let phase = self
             .fs
-            .add_phase(NewPhase {
+            .add_phase(&NewPhase {
                 project: args.project,
                 slug: args.slug,
                 title: args.title,
@@ -891,7 +1098,7 @@ impl MeshService {
         name = "search",
         description = "Unified case-insensitive literal substring search across project titles + description bodies, phase titles + bodies, and task titles + spec bodies (not notes, assignee, or other frontmatter). One call returns a single ranked list so the model can pick rows to open — use this instead of three `body_contains` list round-trips when you don't already know the primitive kind. Each hit includes `score` overlapping literal match count in title+newline+body (higher is stronger), `snippet` (~80 characters centered on the first match, no markdown awareness), and rows are ordered by `score` descending then `updated_at` descending; `limit` (default 50) applies after sorting. `kinds` filters to one or more of `project` | `phase` | `task` (default: all). `project` restricts to one project slug; omit or null for the whole corpus. Empty `query` is rejected; no matches returns an empty list. Prefer list verbs with `body_contains` when you already know you're only looking for tasks (or phases, projects)."
     )]
-    fn search(
+    async fn search(
         &self,
         Parameters(args): Parameters<SearchArgs>,
     ) -> Result<Json<SearchResult>, ErrorData> {
@@ -901,7 +1108,7 @@ impl MeshService {
                 None,
             ));
         }
-        let hits = self.fs.search(&args).map_err(internal_or_invalid)?;
+        let hits = self.search_corpus(&args).await?;
         Ok(Json(SearchResult { hits }))
     }
 }
@@ -1019,12 +1226,106 @@ mod tests {
         clippy::unwrap_used,
         clippy::expect_used,
         clippy::indexing_slicing,
-        clippy::panic
+        clippy::panic,
+        clippy::cast_possible_truncation
     )]
 
     use super::*;
-    use crate::domain::{SearchArgs, TaskGetArgs};
+    use crate::domain::{SearchArgs, SearchKind, TaskGetArgs};
+    use crate::store::{NewPhase, NewProject, NewTask, UpdateTask};
     use rmcp::model::ErrorCode;
+    use std::path::{Path, PathBuf};
+
+    fn repo_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    }
+
+    fn search_hits(svc: &MeshService, args: SearchArgs) -> Vec<SearchHit> {
+        let Json(result) = block_on(svc.search(Parameters(args))).expect("search");
+        result.hits
+    }
+
+    fn seed_store(tmp: &Path) -> FsStore {
+        FsStore::open(tmp).expect("open seed store")
+    }
+
+    fn seed_project(store: &FsStore, slug: &str) -> Project {
+        store
+            .create_project(NewProject {
+                slug: slug.to_owned(),
+                title: format!("Project {slug}"),
+                description: String::new(),
+                actor: "human:test".to_owned(),
+            })
+            .expect("seed project")
+    }
+
+    fn seed_task(store: &FsStore, project: &str, slug: &str) -> Task {
+        store
+            .create_task(NewTask {
+                project: project.to_owned(),
+                phase: None,
+                slug: slug.to_owned(),
+                title: slug.to_owned(),
+                body: String::new(),
+                actor: "human:test".to_owned(),
+                depends_on: Vec::new(),
+            })
+            .expect("seed task")
+    }
+
+    fn task_file_path(corpus: &Path, task: &Task) -> PathBuf {
+        corpus
+            .join("projects")
+            .join(&task.project_slug)
+            .join("tasks")
+            .join(format!("{}-{}.md", task.id, task.slug))
+    }
+
+    fn set_task_field(corpus: &Path, task: &Task, field: &str, value: &str) {
+        use std::fmt::Write as _;
+        let path = task_file_path(corpus, task);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let needle = format!("{field}: ");
+        let parts: Vec<&str> = raw.splitn(3, "---").collect();
+        assert_eq!(parts.len(), 3, "task file missing frontmatter delimiters");
+        let front = parts[1];
+        let mut new_front = String::new();
+        let mut replaced = false;
+        for line in front.lines() {
+            if line.starts_with(&needle) {
+                let _ = writeln!(new_front, "{field}: {value}");
+                replaced = true;
+            } else {
+                new_front.push_str(line);
+                new_front.push('\n');
+            }
+        }
+        if !replaced {
+            let _ = writeln!(new_front, "{field}: {value}");
+        }
+        let body = parts[2].trim_start_matches('\n');
+        let new_raw = format!("---{new_front}---\n{body}");
+        std::fs::write(&path, new_raw).unwrap();
+    }
+
+    fn set_task_body(corpus: &Path, task: &Task, body: &str) {
+        let path = task_file_path(corpus, task);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let parts: Vec<&str> = raw.splitn(3, "---").collect();
+        assert_eq!(parts.len(), 3, "task file missing frontmatter delimiters");
+        let after_front = parts[2];
+        let notes = after_front
+            .find("## Notes")
+            .map_or("", |i| &after_front[i..]);
+        let front = parts[1];
+        let new_raw = if notes.is_empty() {
+            format!("---{front}---\n\n{body}\n")
+        } else {
+            format!("---{front}---\n\n{body}\n\n{notes}")
+        };
+        std::fs::write(&path, new_raw).unwrap();
+    }
 
     fn fresh_service() -> (tempfile::TempDir, MeshService) {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1384,7 +1685,7 @@ mod tests {
             query: "   ".to_owned(),
             ..Default::default()
         };
-        match svc.search(Parameters(args)) {
+        match block_on(svc.search(Parameters(args))) {
             Err(e) => assert!(
                 e.message.to_lowercase().contains("query") || e.message.contains("non-empty"),
                 "{}",
@@ -1400,6 +1701,352 @@ mod tests {
         assert!(
             serde_json::from_str::<SearchArgs>(raw).is_err(),
             "unknown kind must fail deserialization"
+        );
+    }
+
+    #[test]
+    fn dogfood_search_smoke_against_real_corpus() {
+        let store = FsStore::open(repo_root()).expect("open corpus");
+        let svc = MeshService::new(store);
+
+        let hits = search_hits(
+            &svc,
+            SearchArgs {
+                query: "dossier".to_owned(),
+                ..Default::default()
+            },
+        );
+        assert!(!hits.is_empty(), "expected at least one 'dossier' hit");
+
+        let none = search_hits(
+            &svc,
+            SearchArgs {
+                query: "DEFINITELY-NOT-IN-CORPUS-XYZ-9999".to_owned(),
+                ..Default::default()
+            },
+        );
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn search_filters_in_temp_corpus() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".dossier")).expect("mkdir .dossier");
+        let store = seed_store(tmp.path());
+        let svc = MeshService::new(FsStore::open(tmp.path()).expect("open service store"));
+
+        store
+            .create_project(NewProject {
+                slug: "alpha".to_owned(),
+                title: "alpha needle project".to_owned(),
+                description: "needle".to_owned(),
+                actor: "t".to_owned(),
+            })
+            .unwrap();
+        store
+            .create_project(NewProject {
+                slug: "beta".to_owned(),
+                title: "beta needle project".to_owned(),
+                description: "needle".to_owned(),
+                actor: "t".to_owned(),
+            })
+            .unwrap();
+        store
+            .add_phase(&NewPhase {
+                project: "alpha".to_owned(),
+                slug: "ph".to_owned(),
+                title: "phase has needle".to_owned(),
+                body: String::new(),
+                after_phase: None,
+                actor: "t".to_owned(),
+                owner: "human:test".to_owned(),
+            })
+            .unwrap();
+        store
+            .create_task(NewTask {
+                project: "alpha".to_owned(),
+                phase: None,
+                slug: "ta".to_owned(),
+                title: "task has needle".to_owned(),
+                body: String::new(),
+                actor: "t".to_owned(),
+                depends_on: Vec::new(),
+            })
+            .unwrap();
+        store
+            .create_task(NewTask {
+                project: "beta".to_owned(),
+                phase: None,
+                slug: "tb".to_owned(),
+                title: "task has needle".to_owned(),
+                body: String::new(),
+                actor: "t".to_owned(),
+                depends_on: Vec::new(),
+            })
+            .unwrap();
+
+        let all = search_hits(
+            &svc,
+            SearchArgs {
+                query: "needle".to_owned(),
+                ..Default::default()
+            },
+        );
+        let projects: std::collections::HashSet<_> =
+            all.iter().map(|h| h.project.clone()).collect();
+        assert_eq!(projects.len(), 2);
+
+        let tasks = search_hits(
+            &svc,
+            SearchArgs {
+                query: "needle".to_owned(),
+                kinds: Some(vec![SearchKind::Task]),
+                ..Default::default()
+            },
+        );
+        assert!(!tasks.is_empty());
+        assert!(tasks.iter().all(|h| h.kind == SearchKind::Task));
+
+        let alpha_only = search_hits(
+            &svc,
+            SearchArgs {
+                query: "needle".to_owned(),
+                project: Some("alpha".to_owned()),
+                ..Default::default()
+            },
+        );
+        assert!(!alpha_only.is_empty());
+        assert!(alpha_only.iter().all(|h| h.project == "alpha"));
+
+        let alpha_tasks = search_hits(
+            &svc,
+            SearchArgs {
+                query: "needle".to_owned(),
+                project: Some("alpha".to_owned()),
+                kinds: Some(vec![SearchKind::Task]),
+                ..Default::default()
+            },
+        );
+        assert!(!alpha_tasks.is_empty());
+        assert!(alpha_tasks
+            .iter()
+            .all(|h| h.project == "alpha" && h.kind == SearchKind::Task));
+    }
+
+    #[test]
+    fn search_title_and_body_hits_in_temp_corpus() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".dossier")).expect("mkdir .dossier");
+        let store = seed_store(tmp.path());
+        let svc = MeshService::new(FsStore::open(tmp.path()).expect("open service store"));
+
+        store
+            .create_project(NewProject {
+                slug: "p1".to_owned(),
+                title: "TITLEKEY-alpha project".to_owned(),
+                description: "minimal".to_owned(),
+                actor: "t".to_owned(),
+            })
+            .unwrap();
+        store
+            .add_phase(&NewPhase {
+                project: "p1".to_owned(),
+                slug: "ph1".to_owned(),
+                title: "TITLEKEY-beta phase".to_owned(),
+                body: "body has BODYKEY-gamma token".to_owned(),
+                after_phase: None,
+                actor: "t".to_owned(),
+                owner: "human:test".to_owned(),
+            })
+            .unwrap();
+        store
+            .create_task(NewTask {
+                project: "p1".to_owned(),
+                phase: Some("ph1".to_owned()),
+                slug: "tsk".to_owned(),
+                title: "TITLEKEY-delta task".to_owned(),
+                body: "BODYKEY-epsilon in spec".to_owned(),
+                actor: "t".to_owned(),
+                depends_on: Vec::new(),
+            })
+            .unwrap();
+
+        let t_alpha = search_hits(
+            &svc,
+            SearchArgs {
+                query: "titlekey-alpha".to_owned(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(t_alpha.len(), 1);
+        assert_eq!(t_alpha[0].kind, SearchKind::Project);
+
+        let t_beta = search_hits(
+            &svc,
+            SearchArgs {
+                query: "titlekey-beta".to_owned(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(t_beta.len(), 1);
+        assert_eq!(t_beta[0].kind, SearchKind::Phase);
+
+        let t_gamma = search_hits(
+            &svc,
+            SearchArgs {
+                query: "bodykey-gamma".to_owned(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(t_gamma.len(), 1);
+        assert_eq!(t_gamma[0].kind, SearchKind::Phase);
+
+        let t_delta = search_hits(
+            &svc,
+            SearchArgs {
+                query: "titlekey-delta".to_owned(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(t_delta.len(), 1);
+        assert_eq!(t_delta[0].kind, SearchKind::Task);
+
+        let t_eps = search_hits(
+            &svc,
+            SearchArgs {
+                query: "bodykey-epsilon".to_owned(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(t_eps.len(), 1);
+        assert_eq!(t_eps[0].kind, SearchKind::Task);
+
+        let uni = search_hits(
+            &svc,
+            SearchArgs {
+                query: "KEY-".to_owned(),
+                ..Default::default()
+            },
+        );
+        let kinds: std::collections::HashSet<_> = uni.iter().map(|h| h.kind).collect();
+        assert_eq!(kinds.len(), 3);
+    }
+
+    #[test]
+    fn search_ranks_higher_score_before_lower() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".dossier")).expect("mkdir .dossier");
+        let store = seed_store(tmp.path());
+        let svc = MeshService::new(FsStore::open(tmp.path()).expect("open service store"));
+        seed_project(&store, "alpha");
+        let a = seed_task(&store, "alpha", "one-match");
+        let b = seed_task(&store, "alpha", "triple");
+        set_task_body(tmp.path(), &a, "needleonce");
+        set_task_body(tmp.path(), &b, "needleneedleneedle");
+        let hits = search_hits(
+            &svc,
+            SearchArgs {
+                query: "needle".to_owned(),
+                project: Some("alpha".to_owned()),
+                kinds: Some(vec![SearchKind::Task]),
+                ..Default::default()
+            },
+        );
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].slug, "triple");
+        assert_eq!(hits[0].score as i64, 3);
+        assert_eq!(hits[1].score as i64, 1);
+    }
+
+    #[test]
+    fn search_tiebreaks_by_updated_at_desc() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".dossier")).expect("mkdir .dossier");
+        let store = seed_store(tmp.path());
+        let svc = MeshService::new(FsStore::open(tmp.path()).expect("open service store"));
+        seed_project(&store, "alpha");
+        let a = seed_task(&store, "alpha", "oldhit");
+        let b = seed_task(&store, "alpha", "newhit");
+        set_task_body(tmp.path(), &a, "sameneedle");
+        set_task_body(tmp.path(), &b, "sameneedle");
+        set_task_field(tmp.path(), &a, "updated_at", "2026-01-01T00:00:00Z");
+        set_task_field(tmp.path(), &b, "updated_at", "2026-06-01T00:00:00Z");
+        let hits = search_hits(
+            &svc,
+            SearchArgs {
+                query: "sameneedle".to_owned(),
+                project: Some("alpha".to_owned()),
+                kinds: Some(vec![SearchKind::Task]),
+                ..Default::default()
+            },
+        );
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].slug, "newhit");
+        assert_eq!(hits[1].slug, "oldhit");
+    }
+
+    #[test]
+    fn search_limit_after_sort() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".dossier")).expect("mkdir .dossier");
+        let store = seed_store(tmp.path());
+        let svc = MeshService::new(FsStore::open(tmp.path()).expect("open service store"));
+        seed_project(&store, "alpha");
+        for i in 0..5 {
+            let slug = format!("t{i}");
+            let task = seed_task(&store, "alpha", &slug);
+            set_task_body(tmp.path(), &task, &format!("{} needle", "x".repeat(i + 1)));
+            set_task_field(
+                tmp.path(),
+                &task,
+                "updated_at",
+                &format!("2026-05-{:02}T00:00:00Z", 10 + i),
+            );
+        }
+        let hits = search_hits(
+            &svc,
+            SearchArgs {
+                query: "needle".to_owned(),
+                project: Some("alpha".to_owned()),
+                kinds: Some(vec![SearchKind::Task]),
+                limit: Some(2),
+            },
+        );
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].slug, "t4");
+        assert_eq!(hits[1].slug, "t3");
+    }
+
+    #[test]
+    fn search_notes_section_not_indexed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".dossier")).expect("mkdir .dossier");
+        let store = seed_store(tmp.path());
+        let svc = MeshService::new(FsStore::open(tmp.path()).expect("open service store"));
+        seed_project(&store, "alpha");
+        let task = seed_task(&store, "alpha", "n");
+        set_task_body(tmp.path(), &task, "spec has no secret");
+        store
+            .update_task(UpdateTask {
+                id: task.id,
+                body: None,
+                status: None,
+                note: Some("note about zzzuniquezzz term".to_owned()),
+                actor: "t".to_owned(),
+                depends_on: None,
+            })
+            .unwrap();
+        let hits = search_hits(
+            &svc,
+            SearchArgs {
+                query: "zzzuniquezzz".to_owned(),
+                project: Some("alpha".to_owned()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            hits.is_empty(),
+            "notes must not be searchable, got {hits:?}"
         );
     }
 
