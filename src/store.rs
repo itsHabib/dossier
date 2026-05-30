@@ -795,7 +795,9 @@ pub struct UpdateProject {
     pub status: Option<ProjectStatus>,
 }
 
-/// Bounded retry budget for concurrent `phase.add` writers.
+/// Bounded retry budget for concurrent `phase.add` writers — enough to drain a
+/// burst of independent writers racing on one project; exhausting it signals
+/// pathological contention rather than normal load.
 const PHASE_ADD_MAX_RETRIES: u32 = 8;
 
 /// Arguments for `FsStore::add_phase`. Slug must be unique within the
@@ -990,10 +992,12 @@ impl FsStore {
     }
 
     fn try_add_phase_once(&self, args: &NewPhase, project_dir: &Path) -> Result<Phase, StoreError> {
+        // Load WITH body: the CAS gate below re-serializes this project back to
+        // project.md, so an empty description here would wipe it on every phase.add.
         let Versioned {
             value: project,
             version: project_version,
-        } = versioned_project(self, &args.project, false)?;
+        } = versioned_project(self, &args.project, true)?;
 
         let mut existing = self.load_phases_for(&args.project).map_err(store_invalid)?;
         if existing.iter().any(|p| p.slug == args.slug) {
@@ -1016,6 +1020,9 @@ impl FsStore {
             None => existing.iter().map(|p| p.order).max().unwrap_or(0) + 1,
         };
 
+        // Touch project.md (bump updated_at -> new version) under CAS: the gate that
+        // makes two concurrent phase.add writers conflict instead of both computing the
+        // same order and silently losing one.
         let mut project_gate = project.clone();
         project_gate.updated_at = now_utc();
         let project_path = project_dir.join("project.md");
@@ -2545,6 +2552,28 @@ mod tests {
             .find(|p| p.slug == "spec")
             .expect("phase listed");
         assert_eq!(round_trip.created_by, "claude-code:alice");
+    }
+
+    #[test]
+    fn add_phase_preserves_project_description() {
+        let (_tmp, store) = fresh_corpus();
+        store
+            .create_project(NewProject {
+                slug: "alpha".to_owned(),
+                title: "Alpha".to_owned(),
+                description: "important description body".to_owned(),
+                actor: "human:test".to_owned(),
+            })
+            .expect("create project");
+
+        // phase.add re-writes project.md as its CAS gate; it must not drop the body.
+        add_phase_simple(&store, "alpha", "spec");
+
+        let project = store.load_project("alpha", true).expect("load project");
+        assert_eq!(
+            project.description, "important description body",
+            "phase.add must not wipe the project description"
+        );
     }
 
     #[test]
