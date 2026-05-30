@@ -11,7 +11,7 @@ This is **Phase 0** of the cloud-backend rollout — the no-regret backend seam 
 
 | Bucket | Files | Est. LOC | Weighted |
 |---|---|---|---|
-| Production source | `src/store.rs` (trait + types + `impl Store for FsStore` + SHA-256 CAS in write path), `src/server.rs` (`Arc<FsStore>` → `Arc<dyn Store>` + `.await` ripple), `src/lib.rs` (re-exports) | ~195 | ~195 |
+| Production source | `src/store.rs` (trait + types + `impl Store for FsStore` + SHA-256 CAS in write path), `src/server.rs` (`Arc<FsStore>` → `Arc<dyn Store>` + `.await` ripple), `src/lib.rs` (re-exports), `Cargo.toml` (+`async-trait` dep, 0×) | ~195 | ~195 |
 | Tests | `src/store.rs` `mod tests` — CAS unit test | ~50 | ~25 |
 | **Total** | | | **~220** |
 
@@ -30,6 +30,7 @@ pub struct Version(String);                 // FsStore: SHA-256 of the file's ra
 pub struct Versioned<T> { pub value: T, pub version: Version }
 pub enum StoreError { NotFound, Conflict /*412*/, Unavailable, Invalid(String), Io(std::io::Error) }
 
+#[async_trait::async_trait]                  // boxes the futures → trait stays dyn-compatible (see note)
 pub trait Store: Send + Sync {
     // reads return the current version for a later CAS; list_* are versioned (D10)
     async fn get_project(&self, slug: &str) -> Result<Versioned<Project>, StoreError>;
@@ -51,7 +52,7 @@ pub trait Store: Send + Sync {
 
 Implementation notes:
 
-- **`async` trait (D8).** Use stable `async fn` in traits (RPITIT, stable since 1.75; repo is on 1.95+). `S3Store` will do network I/O later; a sync trait blocking a tokio worker would starve the executor, so the trait is async from day one even though `FsStore` is sync-on-disk. `MeshService` handlers that call the store gain `.await`.
+- **`async` trait via `#[async_trait]` (D8) — required for `dyn` (D1).** `S3Store` will do network I/O later; a sync trait blocking a tokio worker would starve the executor, so the trait is async from day one even though `FsStore` is sync-on-disk. **Do not use native `async fn` in traits (RPITIT):** an RPITIT trait is *not* dyn-compatible, so `Arc<dyn Store>` (D1) would fail to compile against it. Use the [`async-trait`](https://docs.rs/async-trait) crate — it desugars each method to `Pin<Box<dyn Future + Send>>`, which *is* object-safe — annotating **both** the `trait Store` and the `impl Store for FsStore` with `#[async_trait]`. The boxed-future indirection is negligible next to disk/network I/O. This reconciles TDD D8 (async) with D1 (`dyn Store`); the two as literally worded in §6 conflict, so feed this back so §6/D8 names `async-trait` (or boxed futures) explicitly. `MeshService` handlers that call the store gain `.await`.
 - **`Version` for `FsStore`** = SHA-256 of the file's raw bytes (intrinsic, not a stored field; platform-stable regardless of serialization order — see TDD §5).
 - **CAS** = compare-the-stored-file's-current-hash against `expected` before the atomic rename, all under the existing `write_lock` mutex. `expected = None` → create-only (fail if the file already exists, `Conflict`). `expected = Some(v)` → re-hash the on-disk file; if it differs from `v`, return `Conflict` and do not write; if it matches (or the prior contents hash to `v`), proceed with the existing `.tmp` + atomic-rename helper (`write_atomic`, `src/store.rs:1325`) and return the new `Version`.
 - **`list_*` returns `Vec<Versioned<T>>` (D10)** so a list→claim flow already has the version for CAS without an extra `get_*` round-trip.
@@ -62,6 +63,7 @@ Implementation notes:
 ## Acceptance
 
 - `MeshService` compiles against `Arc<dyn Store>`; `FsStore: Store`.
+- The `Store` trait is **object-safe** — `Arc<dyn Store>` compiles. (Rules out native `async fn`/RPITIT in the trait; uses `#[async_trait]`.)
 - The full existing test suite passes unchanged (read/write parity — no verb behavior change).
 - A write with a **stale** expected version returns `Conflict`; a write with the **correct** expected version succeeds and returns the new `Version`.
 - `make check` green (fmt + clippy `-D warnings` + test) on the repo's matrix.

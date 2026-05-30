@@ -24,6 +24,8 @@ Two concurrent `phase.add` calls against one project both read `project.md`, bot
 
 ## Behavior / fix
 
+> The `MeshService.write_lock` (`Arc<Mutex<()>>`) only serializes writes **within a single process** — it does *not* prevent the lost update across independent writers (multiple `Store` handles / processes), which is exactly the multi-writer case the cloud backend introduces. The fix is the **write-time CAS**, not the in-process lock. (This is also why the test must drive the CAS path directly rather than spawn two threads against one shared service — see Test plan.)
+
 Pick **one** of the two approaches from TDD §8 (either satisfies the acceptance criteria — choose by whichever comes out simpler against the current code):
 
 - **(a) CAS the `project.md` / phase-order writes** *(recommended — reuses the `extract-store-trait` model)*. Wrap the read-compute-order-write in `phase_add` in a compare-and-swap: read `project.md` (+ affected phase files) with their versions, compute the new `order`, `put_*` with `expected = <version read>`. On `Conflict`, re-read and recompute the `order`, then retry. A second concurrent `phase.add` that raced in gets a `Conflict`, re-reads the now-updated state, and recomputes a fresh distinct `order` — no lost update. This is the same CAS primitive `extract-store-trait` adds; this task wires it into the `phase.add` path.
@@ -39,8 +41,11 @@ Either way, the observable contract is the same and the bounded CAS retry must b
 
 ## Test plan
 
-- New concurrency test: fire two `phase.add` at a single project (e.g. two tasks / threads against a shared `MeshService` over a temp corpus), then assert **both** phases are present with **distinct** `order` values and a deterministic final ordering. The test must fail against the current read-compute-write (lost update) and pass after the fix.
-- If approach (a): add a unit test that a `phase.add` whose underlying `project.md` version changed out from under it retries and still produces a correct distinct `order` (rather than erroring or duplicating).
+> Two threads against a single shared `MeshService` would just queue behind the in-process `write_lock` and **never reproduce the race** — they serialize, so the second read already sees the first write. The lost update this task fixes is the *multi-writer* one (independent `Store` handles / processes) the lock doesn't cover, so the test must drive the CAS path directly, not rely on real thread contention through the service lock.
+
+- **Store/CAS-layer race test (the gate):** simulate two independent writers over one temp corpus. Both read the phase-collection state (`project.md` + phases) at version `v0`; writer A computes its `order` and `put_*(expected = v0)` → succeeds → `v1`; writer B `put_*(expected = v0)` → **`Conflict`**; B re-reads (now `v1`), recomputes a **fresh distinct** `order`, `put_*(expected = v1)` → succeeds. Assert both phases present with **distinct, stable** `order` and no lost update. Fails against the current read-compute-write (B would stomp A); passes after the fix.
+- **Retry-loop unit test (approach a):** a `phase.add` whose underlying `project.md` version changed out from under it takes the `Conflict` → re-read → recompute → re-put branch and still lands a correct distinct `order` (not an error or a duplicate), within the bounded retry budget.
+- **If approach (b) immutable-by-insertion instead:** assert two phases created from the same `v0` both persist with creation-ordered, distinct positions and **no shift-on-insert rewrite** of the sibling files — i.e. there is no read-modify-write left to lose.
 
 ## Non-goals
 
