@@ -35,6 +35,12 @@ impl Version {
     }
 }
 
+impl std::fmt::Display for Version {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// A domain value paired with its current storage version for CAS writes.
 #[derive(Debug, Clone)]
 pub struct Versioned<T> {
@@ -108,9 +114,19 @@ fn store_invalid(err: anyhow::Error) -> StoreError {
 }
 
 fn store_io(err: anyhow::Error) -> StoreError {
+    // Fast path: if the outermost error *is* an `io::Error`, take it whole. Otherwise
+    // `write_atomic` / `append_jsonl` wrapped it with `.with_context`, so `downcast` on the
+    // outermost error misses it — walk the source chain to find the io cause and keep its
+    // `kind` (the full context message is preserved in the reconstructed error's payload).
     match err.downcast::<std::io::Error>() {
         Ok(io) => StoreError::Io(io),
-        Err(err) => StoreError::Invalid(err.to_string()),
+        Err(err) => err
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+            .map_or_else(
+                || StoreError::Invalid(err.to_string()),
+                |io| StoreError::Io(std::io::Error::new(io.kind(), err.to_string())),
+            ),
     }
 }
 
@@ -159,6 +175,14 @@ fn notes_lines_for_task(task: &Task) -> Vec<String> {
         .collect()
 }
 
+/// Compare-and-swap write: verifies `expected` against the file's current version,
+/// then writes atomically. `None` = create-only (fail if the file already exists);
+/// `Some(v)` = update only if the current version matches `v`.
+///
+/// The version check and the write are not atomic with respect to other writers, so this
+/// assumes single-writer-per-corpus — the same invariant the inherent write verbs uphold
+/// by serializing through `MeshService.write_lock`. A caller invoking this via
+/// `Arc<dyn Store>` must serialize its own read-modify-write the same way.
 fn cas_write(
     path: &Path,
     content: &[u8],
@@ -343,6 +367,9 @@ impl Store for FsStore {
                 .ok_or_else(|| StoreError::Invalid("task path has no parent".to_owned()))?;
             fs::create_dir_all(tasks_dir).map_err(StoreError::Io)?;
         }
+        // Regenerates the `## Notes` section from the parsed `task.notes`; any raw note
+        // lines the in-memory `Task` doesn't carry are not round-tripped, so callers must
+        // load the full task (notes included) before mutating to avoid dropping history.
         let notes_lines = notes_lines_for_task(task);
         let content = serialize_task_file(task, &notes_lines).map_err(store_invalid)?;
         cas_write(&path, content.as_bytes(), expected)
