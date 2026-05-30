@@ -456,7 +456,9 @@ impl Store for S3Store {
                     })
                 }
             })
-            .buffer_unordered(LIST_CONCURRENCY)
+            // buffered (not buffer_unordered) so results stay in the sorted order
+            // established above — buffer_unordered would yield in completion order.
+            .buffered(LIST_CONCURRENCY)
             .try_collect()
             .await
     }
@@ -516,7 +518,9 @@ impl Store for S3Store {
                     version: obj.version,
                 })
             })
-            .buffer_unordered(LIST_CONCURRENCY)
+            // buffered (not buffer_unordered) so results stay in the sorted order
+            // established above — buffer_unordered would yield in completion order.
+            .buffered(LIST_CONCURRENCY)
             .try_collect()
             .await
     }
