@@ -32,6 +32,11 @@ impl Version {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Wrap a backend-specific content token (SHA-256 hex, S3 `ETag`, etc.).
+    pub fn new(token: impl Into<String>) -> Self {
+        Self(token.into())
+    }
 }
 
 impl std::fmt::Display for Version {
@@ -177,7 +182,7 @@ fn versioned_task(path: &Path, project_slug: &str) -> Result<Versioned<Task>, St
     })
 }
 
-fn notes_lines_for_task(task: &Task) -> Vec<String> {
+pub(crate) fn notes_lines_for_task(task: &Task) -> Vec<String> {
     task.notes
         .iter()
         .map(|n| format_note_line(n.posted_at, &n.actor, &n.body))
@@ -646,22 +651,14 @@ impl FsStore {
 
     fn load_project(&self, slug: &str, with_body: bool) -> Result<Project> {
         let path = self.project_dir(slug)?.join("project.md");
-        let (front, body) = read_frontmatter(&path)?;
-        let mut p: Project = serde_yml::from_str(&front)
-            .with_context(|| format!("parse project frontmatter {}", path.display()))?;
-        if with_body {
-            body.trim().clone_into(&mut p.description);
-        }
-        Ok(p)
+        let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        parse_project(&raw, with_body).with_context(|| format!("parse project {}", path.display()))
     }
 }
 
 fn load_phase(path: &Path) -> Result<Phase> {
-    let (front, body) = read_frontmatter(path)?;
-    let mut p: Phase = serde_yml::from_str(&front)
-        .with_context(|| format!("parse phase frontmatter {}", path.display()))?;
-    body.trim().clone_into(&mut p.body);
-    Ok(p)
+    let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    parse_phase(&raw).with_context(|| format!("parse phase {}", path.display()))
 }
 
 fn load_task(path: &Path, project_slug: &str) -> Result<Task> {
@@ -682,17 +679,8 @@ fn load_task(path: &Path, project_slug: &str) -> Result<Task> {
 /// JSON output) get the owning-project slug without having to thread it
 /// alongside every Task value. It is not read from frontmatter.
 fn load_task_with_notes(path: &Path, project_slug: &str) -> Result<(Task, Vec<String>)> {
-    let (front, body) = read_frontmatter(path)?;
-    let mut t: Task = serde_yml::from_str(&front)
-        .with_context(|| format!("parse task frontmatter {}", path.display()))?;
-    let (spec, notes_lines) = split_task_body(&body);
-    t.body = spec;
-    project_slug.clone_into(&mut t.project_slug);
-    t.notes = notes_lines
-        .iter()
-        .filter_map(|l| parse_note_line(l))
-        .collect();
-    Ok((t, notes_lines))
+    let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    parse_task(&raw, project_slug).with_context(|| format!("parse task {}", path.display()))
 }
 
 /// Parse a single `## Notes` line into a structured `Note`. Accepts the
@@ -755,19 +743,50 @@ fn split_task_body(raw: &str) -> (String, Vec<String>) {
     (spec, notes_lines)
 }
 
-fn read_frontmatter(path: &Path) -> Result<(String, String)> {
-    let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+fn split_frontmatter(raw: &str) -> Result<(String, String)> {
     let after_open = raw
         .strip_prefix("---\n")
         .or_else(|| raw.strip_prefix("---\r\n"))
-        .ok_or_else(|| anyhow!("{}: missing frontmatter delimiter", path.display()))?;
+        .ok_or_else(|| anyhow!("missing frontmatter delimiter"))?;
     let close_idx = after_open
         .find("\n---")
-        .ok_or_else(|| anyhow!("{}: unterminated frontmatter", path.display()))?;
+        .ok_or_else(|| anyhow!("unterminated frontmatter"))?;
     let front = after_open[..close_idx].to_owned();
     let after = &after_open[close_idx + 4..];
     let body = after.trim_start_matches(['\r', '\n']).to_owned();
     Ok((front, body))
+}
+
+/// Parse a project markdown blob (YAML frontmatter + optional description body).
+pub(crate) fn parse_project(raw: &str, with_body: bool) -> Result<Project> {
+    let (front, body) = split_frontmatter(raw)?;
+    let mut p: Project = serde_yml::from_str(&front).context("parse project frontmatter")?;
+    if with_body {
+        body.trim().clone_into(&mut p.description);
+    }
+    Ok(p)
+}
+
+/// Parse a phase markdown blob (YAML frontmatter + optional body).
+pub(crate) fn parse_phase(raw: &str) -> Result<Phase> {
+    let (front, body) = split_frontmatter(raw)?;
+    let mut p: Phase = serde_yml::from_str(&front).context("parse phase frontmatter")?;
+    body.trim().clone_into(&mut p.body);
+    Ok(p)
+}
+
+/// Parse a task markdown blob into a domain task and raw note lines.
+pub(crate) fn parse_task(raw: &str, project_slug: &str) -> Result<(Task, Vec<String>)> {
+    let (front, body) = split_frontmatter(raw)?;
+    let mut t: Task = serde_yml::from_str(&front).context("parse task frontmatter")?;
+    let (spec, notes_lines) = split_task_body(&body);
+    t.body = spec;
+    project_slug.clone_into(&mut t.project_slug);
+    t.notes = notes_lines
+        .iter()
+        .filter_map(|l| parse_note_line(l))
+        .collect();
+    Ok((t, notes_lines))
 }
 
 // =============================================================================
@@ -1536,13 +1555,13 @@ impl FsStore {
 
 /// Filename for a task: ULID + slug. ULID never contains a `-` so the
 /// split on the first `-` is unambiguous.
-fn task_filename(id: &str, slug: &str) -> String {
+pub(crate) fn task_filename(id: &str, slug: &str) -> String {
     format!("{id}-{slug}.md")
 }
 
 /// Filename for a phase: zero-padded order + slug. The order prefix
 /// gives stable sort in directory listings AND a human-readable hint.
-fn phase_filename(order: i32, slug: &str) -> String {
+pub(crate) fn phase_filename(order: i32, slug: &str) -> String {
     format!("{order:02}-{slug}.md")
 }
 
@@ -1712,7 +1731,7 @@ pub fn now_utc() -> DateTime<Utc> {
 /// Slugs are lowercase ASCII with `-` and `_` allowed. Keeps
 /// cross-platform filesystem behavior predictable (case-sensitivity
 /// differs between NTFS, APFS, ext4).
-fn is_valid_slug(slug: &str) -> bool {
+pub(crate) fn is_valid_slug(slug: &str) -> bool {
     !slug.is_empty()
         && slug
             .chars()
@@ -1748,7 +1767,7 @@ impl<'a> From<&'a Project> for ProjectFrontmatter<'a> {
 /// Serialize a project to its on-disk markdown form: YAML frontmatter,
 /// blank line, description body, trailing newline. Body absent when
 /// description is empty so the file stays tidy.
-fn serialize_project_file(project: &Project) -> Result<String> {
+pub(crate) fn serialize_project_file(project: &Project) -> Result<String> {
     let frontmatter = serde_yml::to_string(&ProjectFrontmatter::from(project))
         .context("serialize frontmatter")?;
     let body = project.description.trim();
@@ -1792,7 +1811,7 @@ impl<'a> From<&'a Phase> for PhaseFrontmatter<'a> {
     }
 }
 
-fn serialize_phase_file(phase: &Phase) -> Result<String> {
+pub(crate) fn serialize_phase_file(phase: &Phase) -> Result<String> {
     let frontmatter = serde_yml::to_string(&PhaseFrontmatter::from(phase))
         .context("serialize phase frontmatter")?;
     let body = phase.body.trim();
@@ -1847,7 +1866,7 @@ impl<'a> From<&'a Task> for TaskFrontmatter<'a> {
 /// spec body (if any), then a `## Notes` section reconstructed from
 /// `notes_lines`. Each note line is emitted verbatim with one trailing
 /// newline.
-fn serialize_task_file(task: &Task, notes_lines: &[String]) -> Result<String> {
+pub(crate) fn serialize_task_file(task: &Task, notes_lines: &[String]) -> Result<String> {
     let frontmatter =
         serde_yml::to_string(&TaskFrontmatter::from(task)).context("serialize task frontmatter")?;
     let spec = task.body.trim();
@@ -1902,7 +1921,7 @@ fn in_range(
     true
 }
 
-fn project_matches(p: &Project, f: &ProjectListFilter) -> bool {
+pub(crate) fn project_matches(p: &Project, f: &ProjectListFilter) -> bool {
     if let Some(statuses) = &f.status {
         if !statuses.is_empty() && !statuses.contains(&p.status) {
             return false;
@@ -1917,7 +1936,7 @@ fn project_matches(p: &Project, f: &ProjectListFilter) -> bool {
         && in_range(p.updated_at, f.updated_after, f.updated_before)
 }
 
-fn sort_projects(out: &mut [Project], f: &ProjectListFilter) {
+pub(crate) fn sort_projects(out: &mut [Project], f: &ProjectListFilter) {
     let order = f.order_by.unwrap_or(ProjectOrderField::CreatedAt);
     out.sort_by(|a, b| match order {
         ProjectOrderField::CreatedAt => a
@@ -1934,7 +1953,7 @@ fn sort_projects(out: &mut [Project], f: &ProjectListFilter) {
     }
 }
 
-fn phase_matches(p: &Phase, f: &PhaseListFilter) -> bool {
+pub(crate) fn phase_matches(p: &Phase, f: &PhaseListFilter) -> bool {
     if let Some(statuses) = &f.status {
         if !statuses.is_empty() && !statuses.contains(&p.status) {
             return false;
@@ -1949,7 +1968,7 @@ fn phase_matches(p: &Phase, f: &PhaseListFilter) -> bool {
         && in_range(p.updated_at, f.updated_after, f.updated_before)
 }
 
-fn sort_phases(out: &mut [Phase], f: &PhaseListFilter) {
+pub(crate) fn sort_phases(out: &mut [Phase], f: &PhaseListFilter) {
     let order = f.order_by.unwrap_or(PhaseOrderField::Order);
     out.sort_by(|a, b| match order {
         PhaseOrderField::CreatedAt => a
@@ -1973,7 +1992,7 @@ fn sort_phases(out: &mut [Phase], f: &PhaseListFilter) {
     }
 }
 
-fn task_matches(t: &Task, f: &TaskListFilter, resolved_phase_id: Option<&str>) -> bool {
+pub(crate) fn task_matches(t: &Task, f: &TaskListFilter, resolved_phase_id: Option<&str>) -> bool {
     if let Some(pid) = resolved_phase_id {
         if t.phase != pid {
             return false;
@@ -2019,7 +2038,7 @@ fn task_matches(t: &Task, f: &TaskListFilter, resolved_phase_id: Option<&str>) -
     true
 }
 
-fn sort_tasks(out: &mut Vec<Task>, f: &TaskListFilter) {
+pub(crate) fn sort_tasks(out: &mut Vec<Task>, f: &TaskListFilter) {
     let order = f.order_by.unwrap_or(TaskOrderField::CreatedAt);
     // Sort keys on nullable fields (`completed_at`, `claimed_at`)
     // implicitly drop nulls — sorting by a field you don't have is
@@ -5936,3 +5955,7 @@ updated_at: 2026-05-10T14:30:00Z
         assert_task_all_fields_persisted(&want, got);
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/common/proptest_serialize_roundtrip.rs"]
+mod proptest_serialize_roundtrip;
