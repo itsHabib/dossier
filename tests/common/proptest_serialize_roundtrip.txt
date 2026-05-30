@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 31a67d5192518dcdecee830fac51397f9c8b7d69442daf90435ea9323c41bd94 # shrinks to task = Task { id: "tsk_AA0A00A0AAAA0AAAAA00000A0A", project: "prj_00A0A0A00AAAAA000000000000", project_slug: "a", phase: "phs_AAAAA0000AAA000000A0A0A00A", slug: "_", title: "00", body: "", status: Todo, assignee: "", claimed_at: None, completed_at: None, created_at: 1970-01-01T00:00:00Z, updated_at: 1970-01-01T00:00:00Z, notes: [Note { actor: "human:a", body: "a ", posted_at: 1970-01-01T00:00:00Z }], depends_on: [] }
