@@ -31,7 +31,7 @@ mirroring the existing `try_add_phase_once` pattern but at the service layer.
 
 #### The `shift` step needs a trait primitive — `Arc<dyn Store>` has no atomic rename
 
-`try_add_phase_once` shifts displaced phases by renaming files: `fs::rename` of `{N}.<slug>.md` → `{N+1}.<slug>.md`, descending, then `write_atomic` the bumped content (`src/store.rs:1058-1073`). The `Store` trait has no rename — `put_phase(expected = Some(v))` CAS-writes to the path `find_phase_path(&slug)` returns, the *old* filename, so the content gets the new order number but the file never moves, orphaning `{N}.<slug>.md` next to the new `{N+1}.<slug>.md`. The shift has to be expressed through the trait, and that shapes the `S3Store` surface — so it must be declared before the agent starts unit 3.
+`try_add_phase_once` shifts displaced phases by renaming files: `fs::rename` of `{N}.<slug>.md` → `{N+1}.<slug>.md`, descending, then `write_atomic` the bumped content. The `Store` trait has no rename — `put_phase(expected = Some(v))` CAS-writes to the path `find_phase_path(&slug)` returns, the *old* filename, so the content gets the new order number but the file never moves, orphaning `{N}.<slug>.md` next to the new `{N+1}.<slug>.md`. The shift has to be expressed through the trait, and that shapes the `S3Store` surface — so it must be declared before the agent starts unit 3.
 
 **Decision to confirm at implementation — recommended: option A.**
 - **A (recommended).** Add a mechanism primitive to the `Store` trait: `shift_phases(project, from_order) -> Result<(), StoreError>` that bumps every phase at/above `from_order` by one. `FsStore` implements it with the existing rename loop; `S3Store` as copy+delete (or its batch-rename idiom). The **policy** (compute the new order, decide to shift) stays in the service; the trait gains only the **mechanism** (atomic reorder). This is the on-thesis choice for a policy/mechanism phase — the trait stays a thin mechanism, not a verb.
@@ -39,13 +39,13 @@ mirroring the existing `try_add_phase_once` pattern but at the service layer.
 
 Either way both backends must shift identically; record the choice here before the agent starts so `FsStore` and `S3Store` don't diverge.
 
-Delete the remaining inherent `FsStore` write methods. Then **drop the `fs: Arc<FsStore>` field** from `MeshService` (`src/server.rs:44`) — the service now runs on `Arc<dyn Store>` alone. `FsStore` is left implementing only the `Store` trait + `open` / `root` (plus the `shift_phases` mechanism under option A).
+Delete the remaining inherent `FsStore` write methods. Then **drop the `fs: Arc<FsStore>` field** from `MeshService` — the service now runs on `Arc<dyn Store>` alone. `FsStore` is left implementing only the `Store` trait + `open` / `root` (plus the `shift_phases` mechanism under option A).
 
 ## Acceptance
 
 - `MeshService` holds only `store: Arc<dyn Store>` (+ `write_lock`) — no concrete `FsStore` handle in `server.rs`.
 - All 9 write verbs run over the trait.
-- The `add_phase` CAS race tests (`src/store.rs:5510+`) pass through the service path.
+- The `add_phase` CAS race tests pass through the service path.
 - The phase `shift` runs through the trait (per the option-A/B decision); after an insert that displaces phases there are **no orphaned `{N}.<slug>.md` files** — every displaced file is renamed, not duplicated — and both backends shift identically.
 - `FsStore` has no inherent write methods.
 

@@ -17,7 +17,7 @@ Band: **amazing**. Single PR. **Depends on `domain-extract-pure-core`** (must la
 
 ## Goal
 
-The task write verbs (create / claim / update / complete) run as inherent sync methods on `FsStore` (`src/store.rs:1170-1367`), so `MeshService` must hold a concrete `fs: Arc<FsStore>` to call them. The state machine — the policy — lives in the mechanism layer. It needs to run at the service layer over `Arc<dyn Store>` so S3Store gets the identical state machine.
+The task write verbs (create / claim / update / complete) run as inherent sync methods on `FsStore`, so `MeshService` must hold a concrete `fs: Arc<FsStore>` to call them. The state machine — the policy — lives in the mechanism layer. It needs to run at the service layer over `Arc<dyn Store>` so S3Store gets the identical state machine.
 
 ## Behavior / fix
 
@@ -35,7 +35,7 @@ CAS loop, per cloud spec §7.1's three-way branch on `Conflict` (`docs/features/
 
 ### `create_task` — project-scoped uniqueness, not self-CAS
 
-`create` is **not** a mutate-existing transition, so it does **not** fit the loop above. A new task has no prior version, and `put_task(expected = None)` is keyed on the freshly-minted `tsk_…` id — so two concurrent creates with the same slug write *different* objects and **neither conflicts**, leaving the project with duplicate task slugs. (Today's `load_tasks_for` → `any(|t| t.slug == args.slug)` check inside `create_task`, `src/store.rs:1170-1367`, is only race-safe because FsStore's `write_lock` serializes it; that guarantee is gone once the verb runs over `Arc<dyn Store>` against S3.) The uniqueness invariant is **project-scoped**, so the CAS authority must be the *project*, not the task:
+`create` is **not** a mutate-existing transition, so it does **not** fit the loop above. A new task has no prior version, and `put_task(expected = None)` is keyed on the freshly-minted `tsk_…` id — so two concurrent creates with the same slug write *different* objects and **neither conflicts**, leaving the project with duplicate task slugs. (Today's `load_tasks_for` → `any(|t| t.slug == args.slug)` check inside `create_task` is only race-safe because FsStore's `write_lock` serializes it; that guarantee is gone once the verb runs over `Arc<dyn Store>` against S3.) The uniqueness invariant is **project-scoped**, so the CAS authority must be the *project*, not the task:
 
 ```
 get project (versioned) + list tasks → assert slug free → put_project(expected = project_version)  // claim the write slot, bump the project version
@@ -47,7 +47,7 @@ on Conflict(project) → re-read, re-check slug:
 
 This mirrors `add_phase`'s `project.md` CAS gate (the same pattern unit 3 lifts) and cloud spec **D2** (`project.md` is the CAS point for project-scoped invariants). **Decision to confirm at implementation:** the project-CAS gate is the recommended mechanism (consistent with `add_phase`); the alternatives Codex named — a per-project slug→id index object written create-only with `If-None-Match`, or a deterministic slug-keyed task object — are acceptable if they preserve the same invariant. Pick one and record it; do not ship the list-then-write race.
 
-Delete the inherent `FsStore` task methods once the service owns them. Rewrite the task test-seed helpers (`src/server.rs` ~1248-1265 + `tests/proptest_state_machine.rs`) to seed via the service rather than `fs.create_task`. Add a service-layer concurrent-claim CAS test: two writers race a claim on one task → exactly one `Ok`, the loser re-reads to a terminal "already claimed" (no third outcome), looped.
+Delete the inherent `FsStore` task methods once the service owns them. Rewrite the task test-seed helpers (in `src/server.rs` + `tests/proptest_state_machine.rs`) to seed via the service rather than `fs.create_task`. Add a service-layer concurrent-claim CAS test: two writers race a claim on one task → exactly one `Ok`, the loser re-reads to a terminal "already claimed" (no third outcome), looped.
 
 ## Acceptance
 

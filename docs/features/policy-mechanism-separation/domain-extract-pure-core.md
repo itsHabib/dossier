@@ -26,17 +26,17 @@ dossier's task state machine, validation, id minting, and phase-order computatio
 Extract to `src/domain.rs` as pure functions (no `std::fs`, no I/O):
 
 - **Task transitions** as pure `(Task, args) -> outcome`:
-  - claim: pure `(Task, actor) -> outcome` over the **full** matrix (mirrors `claim_task`, `src/store.rs:1255-1296`); the test plan exercises every branch:
+  - claim: pure `(Task, actor) -> outcome` over the **full** matrix (mirrors `claim_task`); the test plan exercises every branch:
     - `todo` + empty assignee → `claimed` (stamp assignee + `claimed_at`).
     - held state + `assignee == actor` → no-op, return the task unchanged.
     - held state + `assignee != actor` (non-empty) → reject `task already claimed by <assignee>`.
     - terminal (`done` / `cancelled`) → reject `cannot claim task in terminal state`.
     - corrupt (`todo` + non-empty assignee, or non-`todo` + empty assignee) → reject `corrupt state`.
-  - update: already pure — `validate_task_update_transition` (`src/store.rs:1584`); move as-is.
+  - update: already pure — `validate_task_update_transition`; move as-is.
   - complete: must be `in_progress` → `done`.
 - **Phase-order computation**: the `new_order` calc from `after_phase` / max+1 — pure given the existing-phases slice.
-- **Validation**: `is_valid_slug` (`src/store.rs:1734`), `validate_task_body` (`src/store.rs:1640`), the single-line / newline guards.
-- **`new_id` minting** (`src/store.rs:1721`).
+- **Validation**: `is_valid_slug`, `validate_task_body`, the single-line / newline guards.
+- **`new_id` minting**.
 - **The verb arg-structs** — `NewProject`, `NewTask`, `ClaimTask`, `UpdateTask`, `CompleteTask`, `NewPhase`, `UpdatePhase`, `UpdateProject`, `LinkArtifact` — protocol DTOs; move from `store.rs` to `domain.rs`.
 
 `FsStore`'s inherent write methods then delegate to the new pure fns — behavior-preserving, no verb behavior changes. House style: no `else` / early-return / line-of-sight, ≤2 nesting, errors-as-values.
