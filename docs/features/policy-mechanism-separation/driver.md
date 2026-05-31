@@ -135,6 +135,9 @@ Both edges are explicit `Depends on` lines in the task bodies (not inferred):
 - **`write_lock` fate** → KEEP the process-local `Mutex` as FsStore's intra-process guard; the get→put CAS is the cross-writer authority. Don't change two things at once.
 - **FsStore shims vs full strip** → FULL STRIP to the `Store` trait + `open`/`root`; rewrite test-seed helpers to seed via the service.
 - **pure-fn home** → `src/domain.rs` (no I/O, protocol-shaped).
+- **`task.create` uniqueness (unit 2)** *(surfaced in #66 review)* → `create` is project-scoped, not self-CAS: gate slug-uniqueness on a `put_project(expected=v)` CAS (recommended, mirrors `add_phase`), not `put_task` on the new id. Confirm the mechanism at impl; see [lift-task-state-machine.md](lift-task-state-machine.md).
+- **`add_phase` shift mechanism (unit 3)** *(surfaced in #66 review)* → `Arc<dyn Store>` has no atomic rename, so the displaced-phase shift needs a declared primitive: **option A** (a `shift_phases` mechanism on the `Store` trait — recommended, keeps policy in the service) vs **option B** (composite `add_phase` on the trait). Confirm at impl; see [lift-phase-project-artifact-drop-fs.md](lift-phase-project-artifact-drop-fs.md).
+- **retry budget** *(surfaced in #66 review)* → all lifted CAS loops use cloud spec §8 verbatim (`base=25ms`, `cap=2s`, max 5, typed `conflict` on exhaustion); supersedes the older `PHASE_ADD_MAX_RETRIES=8`.
 
 ## Validation gate (every unit)
 

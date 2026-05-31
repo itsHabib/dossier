@@ -26,7 +26,12 @@ dossier's task state machine, validation, id minting, and phase-order computatio
 Extract to `src/domain.rs` as pure functions (no `std::fs`, no I/O):
 
 - **Task transitions** as pure `(Task, args) -> outcome`:
-  - claim: `todo` + empty-assignee → `claimed`; same-actor re-claim is a no-op; terminal / corrupt-state → reject.
+  - claim: pure `(Task, actor) -> outcome` over the **full** matrix (mirrors `claim_task`, `src/store.rs:1255-1296`); the test plan exercises every branch:
+    - `todo` + empty assignee → `claimed` (stamp assignee + `claimed_at`).
+    - held state + `assignee == actor` → no-op, return the task unchanged.
+    - held state + `assignee != actor` (non-empty) → reject `task already claimed by <assignee>`.
+    - terminal (`done` / `cancelled`) → reject `cannot claim task in terminal state`.
+    - corrupt (`todo` + non-empty assignee, or non-`todo` + empty assignee) → reject `corrupt state`.
   - update: already pure — `validate_task_update_transition` (`src/store.rs:1584`); move as-is.
   - complete: must be `in_progress` → `done`.
 - **Phase-order computation**: the `new_order` calc from `after_phase` / max+1 — pure given the existing-phases slice.
@@ -46,6 +51,7 @@ Extract to `src/domain.rs` as pure functions (no `std::fs`, no I/O):
 
 - `make check` green (fmt + clippy-strict `-D warnings` + test).
 - `tests/proptest_state_machine.rs` retargeted to also drive the pure transition fns directly (no `FsStore`); state-machine invariants 1–5 hold.
+- The pure claim fn is asserted across **every** matrix branch: `todo`→claimed, same-actor no-op, different-actor reject, terminal reject, and both corrupt-state rejects (the different-actor and corrupt cases are the ones a summary drops — cover each explicitly so the proptest has no blind spot).
 - `grep -n "std::fs" src/domain.rs` returns nothing.
 
 ## Non-goals
