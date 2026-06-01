@@ -13,15 +13,13 @@ use std::sync::Mutex;
 
 // Read-model types + write-verb DTOs — re-exported for callers that reach
 // them through the `store` namespace (backward compat).
+use crate::domain::is_valid_slug;
 pub use crate::domain::{
     Artifact, ClaimTask, CompleteTask, LinkArtifact, NewPhase, NewProject, NewTask, Phase,
     PhaseListFilter, PhaseOrderField, PhaseStatus, Project, ProjectListFilter, ProjectOrderField,
     ProjectStatus, Task, TaskListFilter, TaskOrderField, TaskStatus, UpdatePhase, UpdateProject,
     UpdateTask,
 };
-// Pure policy — used internally by the delegating write methods. New code
-// imports these from `domain` directly, not through the mechanism layer.
-use crate::domain::{compute_new_phase_order, is_valid_slug, new_id, validate_single_line};
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -105,6 +103,10 @@ pub trait Store: Send + Sync {
     async fn put_task(&self, task: &Task, expected: Option<Version>)
         -> Result<Version, StoreError>;
     async fn put_artifact(&self, artifact: &Artifact) -> Result<(), StoreError>;
+
+    /// Bump every phase at or above `from_order` by one, renaming keys so
+    /// `{order}.<slug>` stays aligned with frontmatter `order`.
+    async fn shift_phases(&self, project: &str, from_order: i32) -> Result<(), StoreError>;
 }
 
 fn hash_bytes(bytes: &[u8]) -> String {
@@ -375,6 +377,29 @@ impl Store for FsStore {
             .map_err(store_invalid)?
             .join("artifacts.jsonl");
         append_jsonl(&path, &line).map_err(store_io)?;
+        Ok(())
+    }
+
+    async fn shift_phases(&self, project: &str, from_order: i32) -> Result<(), StoreError> {
+        let project_dir = self.project_dir(project).map_err(store_invalid)?;
+        let phases_dir = project_dir.join("phases");
+        fs::create_dir_all(&phases_dir).map_err(StoreError::Io)?;
+
+        let mut existing = self.load_phases_for(project).map_err(store_invalid)?;
+        existing.sort_by_key(|p| std::cmp::Reverse(p.order));
+        for phase in &mut existing {
+            if phase.order < from_order {
+                continue;
+            }
+            let old_name = phase_filename(phase.order, &phase.slug);
+            let new_name = phase_filename(phase.order + 1, &phase.slug);
+            fs::rename(phases_dir.join(&old_name), phases_dir.join(&new_name))
+                .map_err(StoreError::Io)?;
+            phase.order += 1;
+            let path = phases_dir.join(&new_name);
+            let content = serialize_phase_file(phase).map_err(store_invalid)?;
+            write_atomic(&path, content.as_bytes()).map_err(store_io)?;
+        }
         Ok(())
     }
 }
@@ -804,223 +829,7 @@ pub(crate) fn parse_task(raw: &str, project_slug: &str) -> Result<(Task, Vec<Str
     Ok((t, notes_lines))
 }
 
-// =============================================================================
-// Write side
-// =============================================================================
-
-/// Bounded retry budget for concurrent `phase.add` writers — enough to drain a
-/// burst of independent writers racing on one project; exhausting it signals
-/// pathological contention rather than normal load.
-const PHASE_ADD_MAX_RETRIES: u32 = 8;
-
 impl FsStore {
-    /// Create a new project on disk.
-    ///
-    /// Errors if the slug is already taken or fails the slug rules.
-    /// Server-stamps `id`, `created_at`, `updated_at`, and initial
-    /// `Planning` status.
-    pub fn create_project(&self, args: NewProject) -> Result<Project> {
-        if args.slug.is_empty() {
-            bail!("slug is required");
-        }
-        let dir = self.project_dir(&args.slug)?;
-        if dir.exists() {
-            bail!("project slug already exists: {}", args.slug);
-        }
-        fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-
-        let now = now_utc();
-        let project = Project {
-            id: new_id("prj"),
-            slug: args.slug,
-            title: args.title,
-            description: args.description,
-            status: ProjectStatus::Planning,
-            created_at: now,
-            updated_at: now,
-            created_by: args.actor,
-        };
-
-        let path = dir.join("project.md");
-        let content = serialize_project_file(&project)?;
-        write_atomic(&path, content.as_bytes())?;
-        Ok(project)
-    }
-
-    /// Update mutable fields of a project (`title`, `description`,
-    /// `status`). Slug is the addressing key; id and `created_at` are
-    /// preserved; `updated_at` is bumped.
-    pub fn update_project(&self, args: UpdateProject) -> Result<Project> {
-        if args.slug.is_empty() {
-            bail!("slug is required");
-        }
-        let project_dir = self.project_dir(&args.slug)?;
-        if !project_dir.try_exists()? {
-            bail!("project not found: {}", args.slug);
-        }
-        let mut project = self.load_project(&args.slug, true)?;
-        if let Some(title) = args.title {
-            project.title = title;
-        }
-        if let Some(description) = args.description {
-            project.description = description;
-        }
-        if let Some(status) = args.status {
-            project.status = status;
-        }
-        project.updated_at = now_utc();
-
-        let path = self.project_dir(&project.slug)?.join("project.md");
-        let content = serialize_project_file(&project)?;
-        write_atomic(&path, content.as_bytes())?;
-        Ok(project)
-    }
-
-    /// Add a new phase to a project.
-    ///
-    /// `after_phase` (a phase slug, optional) inserts the new phase
-    /// immediately after that phase, shifting subsequent phases up by 1.
-    /// When omitted, the new phase is appended to the end. The phase
-    /// slug must be unique within the project.
-    ///
-    /// Ordering is guarded by a compare-and-swap on `project.md`: two
-    /// concurrent writers racing on the same project version retry with
-    /// a freshly computed `order` rather than silently stomping.
-    pub fn add_phase(&self, args: &NewPhase) -> Result<Phase> {
-        if args.project.is_empty() {
-            bail!("project is required");
-        }
-        if args.actor.is_empty() {
-            bail!("actor is required to add a phase");
-        }
-        if args.owner.is_empty() {
-            bail!("owner is required to add a phase");
-        }
-        if !is_valid_slug(&args.slug) {
-            bail!(
-                "slug must be lowercase ascii (a-z, 0-9, -, _): {}",
-                args.slug
-            );
-        }
-        let project_dir = self.project_dir(&args.project)?;
-        if !project_dir.exists() {
-            bail!("project not found: {}", args.project);
-        }
-
-        for _ in 0..PHASE_ADD_MAX_RETRIES {
-            match self.try_add_phase_once(args, &project_dir) {
-                Ok(phase) => return Ok(phase),
-                Err(StoreError::Conflict) => (),
-                Err(e) => return Err(store_error_to_anyhow(e)),
-            }
-        }
-        bail!("phase add failed: too many concurrent writers (conflict)");
-    }
-
-    fn try_add_phase_once(&self, args: &NewPhase, project_dir: &Path) -> Result<Phase, StoreError> {
-        // Load WITH body: the CAS gate below re-serializes this project back to
-        // project.md, so an empty description here would wipe it on every phase.add.
-        let Versioned {
-            value: project,
-            version: project_version,
-        } = versioned_project(self, &args.project, true)?;
-
-        let mut existing = self.load_phases_for(&args.project).map_err(store_invalid)?;
-        if existing.iter().any(|p| p.slug == args.slug) {
-            return Err(StoreError::Invalid(format!(
-                "phase slug already exists in project: {}",
-                args.slug
-            )));
-        }
-
-        let new_order = compute_new_phase_order(&existing, args.after_phase.as_deref())
-            .map_err(|e| StoreError::Invalid(e.to_string()))?;
-
-        // Touch project.md (bump updated_at -> new version) under CAS: the gate that
-        // makes two concurrent phase.add writers conflict instead of both computing the
-        // same order and silently losing one.
-        let mut project_gate = project.clone();
-        project_gate.updated_at = now_utc();
-        let project_path = project_dir.join("project.md");
-        let project_content = serialize_project_file(&project_gate).map_err(store_invalid)?;
-        self.cas_write(
-            &project_path,
-            project_content.as_bytes(),
-            Some(project_version),
-        )?;
-
-        let phases_dir = project_dir.join("phases");
-        fs::create_dir_all(&phases_dir).map_err(StoreError::Io)?;
-
-        // Shift existing phases at or above new_order (descending so renames
-        // don't collide).
-        existing.sort_by_key(|p| std::cmp::Reverse(p.order));
-        for p in &mut existing {
-            if p.order < new_order {
-                continue;
-            }
-            let old_name = phase_filename(p.order, &p.slug);
-            let new_name = phase_filename(p.order + 1, &p.slug);
-            fs::rename(phases_dir.join(&old_name), phases_dir.join(&new_name))
-                .map_err(StoreError::Io)?;
-            p.order += 1;
-            let path = phases_dir.join(&new_name);
-            let content = serialize_phase_file(p).map_err(store_invalid)?;
-            write_atomic(&path, content.as_bytes()).map_err(store_io)?;
-        }
-
-        let now = now_utc();
-        let phase = Phase {
-            id: new_id("phs"),
-            project: project.id,
-            slug: args.slug.clone(),
-            title: args.title.clone(),
-            body: args.body.clone(),
-            order: new_order,
-            status: PhaseStatus::Pending,
-            created_at: now,
-            updated_at: now,
-            created_by: args.actor.clone(),
-            owner: args.owner.clone(),
-        };
-        let path = phases_dir.join(phase_filename(new_order, &args.slug));
-        let content = serialize_phase_file(&phase).map_err(store_invalid)?;
-        write_atomic(&path, content.as_bytes()).map_err(store_io)?;
-        Ok(phase)
-    }
-
-    /// Update mutable fields of a phase (`title`, `body`, `status`).
-    ///
-    /// (`project`, `slug`) is the addressing key; both are immutable.
-    /// `id`, `order`, and `created_at` are preserved; `updated_at` is
-    /// bumped.
-    pub fn update_phase(&self, args: UpdatePhase) -> Result<Phase> {
-        if args.project.is_empty() || args.slug.is_empty() {
-            bail!("project and slug are required");
-        }
-        let path = self.find_phase_path(&args.project, &args.slug)?;
-        let mut phase = load_phase(&path)?;
-        if let Some(title) = args.title {
-            phase.title = title;
-        }
-        if let Some(body) = args.body {
-            phase.body = body;
-        }
-        if let Some(status) = args.status {
-            phase.status = status;
-        }
-        if let Some(owner) = args.owner {
-            if owner.is_empty() {
-                bail!("owner must not be empty");
-            }
-            phase.owner = owner;
-        }
-        phase.updated_at = now_utc();
-        let content = serialize_phase_file(&phase)?;
-        write_atomic(&path, content.as_bytes())?;
-        Ok(phase)
-    }
-
     fn find_phase_path(&self, project_slug: &str, phase_slug: &str) -> Result<PathBuf> {
         let phases_dir = self.project_dir(project_slug)?.join("phases");
         if !phases_dir.exists() {
@@ -1123,124 +932,6 @@ impl FsStore {
             }
         }
         Ok(found)
-    }
-}
-
-impl FsStore {
-    /// Append an artifact pointing at something concrete (a commit, PR,
-    /// file, URL, run, doc, …). Append-only — `artifacts.jsonl` never
-    /// rewrites a prior entry; deletes are tombstones if we ever need
-    /// them.
-    ///
-    /// Validates that the project exists and (when supplied) the task
-    /// belongs to that same project. `kind`, `reference`, `label`, and
-    /// `actor` are required and rejected if they contain newline / CR.
-    /// JSON serialization would *escape* embedded newlines (so the
-    /// JSONL framing stays valid), but a multi-line label or ref is
-    /// almost certainly a caller bug and breaks grep-ability of the
-    /// file; cheap to refuse at the boundary.
-    pub fn link_artifact(&self, args: LinkArtifact) -> Result<Artifact> {
-        if args.actor.is_empty() {
-            bail!("actor is required to link an artifact");
-        }
-        if args.project.is_empty() {
-            bail!("project is required");
-        }
-        if args.kind.is_empty() {
-            bail!("kind is required");
-        }
-        if args.reference.is_empty() {
-            bail!("ref is required");
-        }
-        if args.label.is_empty() {
-            bail!("label is required");
-        }
-        for (field, value) in [
-            ("kind", &args.kind),
-            ("ref", &args.reference),
-            ("label", &args.label),
-            ("actor", &args.actor),
-        ] {
-            validate_single_line(field, value)?;
-        }
-
-        let project_dir = self.project_dir(&args.project)?;
-        if !project_dir.exists() {
-            bail!("project not found: {}", args.project);
-        }
-        let project = self.load_project(&args.project, false)?;
-
-        let task_id = match &args.task {
-            Some(task_id) if task_id.is_empty() => {
-                bail!("task is empty (omit the field entirely for a project-wide artifact)")
-            }
-            Some(task_id) => {
-                // Project-scoped lookup: the artifact's project is already
-                // known, so walking the whole corpus is wasteful and the
-                // resulting error ("task not found") doesn't tell the
-                // caller *where* dossier looked. Scan only this project's
-                // tasks/ directory, mirroring `list_tasks`' file filter
-                // (regular `.md` files only) and propagating I/O errors
-                // rather than silently dropping them — a permissions hit
-                // mid-walk shouldn't masquerade as "not found".
-                let tasks_dir = project_dir.join("tasks");
-                let mut found = false;
-                if tasks_dir.exists() {
-                    let entries = fs::read_dir(&tasks_dir)
-                        .with_context(|| format!("read {}", tasks_dir.display()))?;
-                    for entry in entries {
-                        let entry = entry?;
-                        let path = entry.path();
-                        if path.is_dir() {
-                            continue;
-                        }
-                        if path.extension().and_then(|s| s.to_str()) != Some("md") {
-                            continue;
-                        }
-                        let stem = path
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or_default();
-                        if let Some((id, _)) = stem.split_once('-') {
-                            if id == task_id {
-                                found = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-                if !found {
-                    bail!("task {task_id} not found in project {}", args.project);
-                }
-                task_id.clone()
-            }
-            None => String::new(),
-        };
-
-        let existing = self.list_artifacts(&args.project)?;
-        if let Some(artifact) = existing
-            .into_iter()
-            .find(|a| a.task == task_id && a.kind == args.kind && a.reference == args.reference)
-        {
-            return Ok(artifact);
-        }
-
-        let now = now_utc();
-        let artifact = Artifact {
-            id: new_id("art"),
-            project: project.id,
-            task: task_id,
-            kind: args.kind,
-            reference: args.reference,
-            label: args.label,
-            linked_at: now,
-            actor: args.actor,
-        };
-
-        let line = serde_json::to_string(&artifact).context("serialize artifact")?;
-        let path = project_dir.join("artifacts.jsonl");
-        append_jsonl(&path, &line)?;
-        Ok(artifact)
     }
 }
 
@@ -1667,7 +1358,7 @@ mod tests {
     )]
 
     use super::*;
-    use crate::domain::{Note, TaskListFilter};
+    use crate::domain::{new_id, Note, TaskListFilter};
 
     fn repo_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1758,6 +1449,14 @@ mod tests {
         fs::create_dir_all(tmp.path().join(".dossier")).expect("mkdir .dossier");
         let store = FsStore::open(tmp.path()).expect("open fresh corpus");
         (tmp, store)
+    }
+
+    fn block_on_store<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+            .block_on(future)
     }
 
     #[tokio::test]
@@ -1861,79 +1560,6 @@ mod tests {
     }
 
     #[test]
-    fn create_project_round_trip() {
-        let (_tmp, store) = fresh_corpus();
-
-        let project = store
-            .create_project(NewProject {
-                slug: "alpha".to_owned(),
-                title: "Alpha".to_owned(),
-                description: "First project body.\n\nA second paragraph.".to_owned(),
-                actor: "human:test".to_owned(),
-            })
-            .expect("create alpha");
-
-        assert_eq!(project.slug, "alpha");
-        assert!(project.id.starts_with("prj_"));
-        assert_eq!(project.status, ProjectStatus::Planning);
-        assert_eq!(project.created_by, "human:test");
-        assert_eq!(project.created_at, project.updated_at);
-
-        // Round-trip through the read side.
-        let listed = store.list_projects(&ProjectListFilter::default()).unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].id, project.id);
-
-        let fetched = store.get_project("alpha").unwrap();
-        assert_eq!(fetched.id, project.id);
-        assert!(
-            fetched.description.contains("First project body."),
-            "body lost: {:?}",
-            fetched.description
-        );
-    }
-
-    #[test]
-    fn create_project_rejects_duplicate_slug() {
-        let (_tmp, store) = fresh_corpus();
-        store
-            .create_project(NewProject {
-                slug: "alpha".to_owned(),
-                title: "Alpha".to_owned(),
-                description: String::new(),
-                actor: "human:test".to_owned(),
-            })
-            .unwrap();
-
-        let err = store
-            .create_project(NewProject {
-                slug: "alpha".to_owned(),
-                title: "Alpha v2".to_owned(),
-                description: String::new(),
-                actor: "human:test".to_owned(),
-            })
-            .expect_err("duplicate slug");
-        assert!(
-            err.to_string().contains("slug already exists"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn create_project_rejects_invalid_slug() {
-        let (_tmp, store) = fresh_corpus();
-        let err = store
-            .create_project(NewProject {
-                slug: "Bad Slug!".to_owned(),
-                title: "x".to_owned(),
-                description: String::new(),
-                actor: "human:test".to_owned(),
-            })
-            .expect_err("invalid slug");
-        assert!(err.to_string().contains("invalid slug"), "got: {err}");
-    }
-
-    #[test]
     fn get_project_rejects_invalid_slug() {
         let (_tmp, store) = fresh_corpus();
         let err = store
@@ -1975,577 +1601,109 @@ mod tests {
         assert!(err.to_string().contains("invalid slug"), "got: {err}");
     }
 
-    #[test]
-    fn update_project_rejects_invalid_slug() {
-        let (_tmp, store) = fresh_corpus();
-        let err = store
-            .update_project(UpdateProject {
-                slug: BAD_PROJECT_SLUG.to_owned(),
-                title: Some("x".to_owned()),
-                ..Default::default()
-            })
-            .expect_err("invalid slug");
-        assert!(err.to_string().contains("invalid slug"), "got: {err}");
-    }
-
-    #[test]
-    fn update_project_errors_on_nonexistent_slug() {
-        let (_tmp, store) = fresh_corpus();
-        let slug = "ghost";
-        let err = store
-            .update_project(UpdateProject {
-                slug: slug.to_owned(),
-                title: Some("x".to_owned()),
-                ..Default::default()
-            })
-            .expect_err("unknown project");
-        let msg = err.to_string();
-        assert!(msg.contains("project not found"), "got: {err}");
-        assert!(msg.contains(slug), "got: {err}");
-    }
-
-    #[test]
-    fn update_phase_rejects_invalid_project_slug() {
-        let (_tmp, store) = fresh_corpus();
-        let err = store
-            .update_phase(UpdatePhase {
-                project: BAD_PROJECT_SLUG.to_owned(),
-                slug: "spec".to_owned(),
-                title: Some("x".to_owned()),
-                ..Default::default()
-            })
-            .expect_err("invalid slug");
-        assert!(err.to_string().contains("invalid slug"), "got: {err}");
-    }
-
-    #[test]
-    fn add_phase_rejects_invalid_project_slug() {
-        let (_tmp, store) = fresh_corpus();
-        let err = store
-            .add_phase(&NewPhase {
-                project: BAD_PROJECT_SLUG.to_owned(),
-                slug: "spec".to_owned(),
-                title: "x".to_owned(),
-                body: String::new(),
-                after_phase: None,
-                actor: "human:test".to_owned(),
-                owner: "human:test".to_owned(),
-            })
-            .expect_err("invalid slug");
-        assert!(err.to_string().contains("invalid slug"), "got: {err}");
-    }
-
-    #[test]
-    fn link_artifact_rejects_invalid_project_slug() {
-        let (_tmp, store) = fresh_corpus();
-        let err = store
-            .link_artifact(LinkArtifact {
-                project: BAD_PROJECT_SLUG.to_owned(),
-                task: None,
-                kind: "pr".to_owned(),
-                reference: "https://example.com/pr/1".to_owned(),
-                label: "PR #1".to_owned(),
-                actor: "human:test".to_owned(),
-            })
-            .expect_err("invalid slug");
-        assert!(err.to_string().contains("invalid slug"), "got: {err}");
-    }
-
-    #[test]
-    fn update_project_preserves_id_and_created_at() {
-        let (_tmp, store) = fresh_corpus();
-        let original = store
-            .create_project(NewProject {
-                slug: "alpha".to_owned(),
-                title: "Alpha".to_owned(),
-                description: "v1 body".to_owned(),
-                actor: "human:test".to_owned(),
-            })
-            .unwrap();
-
-        // Force a measurable gap so updated_at differs.
-        std::thread::sleep(std::time::Duration::from_millis(10));
-
-        let updated = store
-            .update_project(UpdateProject {
-                slug: "alpha".to_owned(),
-                title: Some("Alpha v2".to_owned()),
-                description: Some("v2 body".to_owned()),
-                status: Some(ProjectStatus::Active),
-            })
-            .unwrap();
-
-        assert_eq!(updated.id, original.id, "id changed");
-        assert_eq!(
-            updated.created_at, original.created_at,
-            "created_at changed"
-        );
-        assert!(
-            updated.updated_at > original.updated_at,
-            "updated_at not bumped"
-        );
-        assert_eq!(updated.title, "Alpha v2");
-        assert_eq!(updated.description, "v2 body");
-        assert_eq!(updated.status, ProjectStatus::Active);
-
-        // And confirm via re-read.
-        let fetched = store.get_project("alpha").unwrap();
-        assert_eq!(fetched.title, "Alpha v2");
-        assert_eq!(fetched.description, "v2 body");
-        assert_eq!(fetched.status, ProjectStatus::Active);
-    }
-
     fn seed_project(store: &FsStore, slug: &str) -> Project {
-        store
-            .create_project(NewProject {
-                slug: slug.to_owned(),
-                title: format!("Project {slug}"),
-                description: String::new(),
-                actor: "human:test".to_owned(),
-            })
-            .expect("seed project")
+        let now = now_utc();
+        let project = Project {
+            id: new_id("prj"),
+            slug: slug.to_owned(),
+            title: format!("Project {slug}"),
+            description: String::new(),
+            status: ProjectStatus::Planning,
+            created_at: now,
+            updated_at: now,
+            created_by: "human:test".to_owned(),
+        };
+        block_on_store(Store::put_project(store, &project, None)).expect("seed project");
+        project
+    }
+
+    fn seed_project_with_body(
+        store: &FsStore,
+        slug: &str,
+        title: &str,
+        description: &str,
+    ) -> Project {
+        let now = now_utc();
+        let project = Project {
+            id: new_id("prj"),
+            slug: slug.to_owned(),
+            title: title.to_owned(),
+            description: description.to_owned(),
+            status: ProjectStatus::Planning,
+            created_at: now,
+            updated_at: now,
+            created_by: "human:test".to_owned(),
+        };
+        block_on_store(Store::put_project(store, &project, None)).expect("seed project");
+        project
+    }
+
+    fn set_project_status(store: &FsStore, slug: &str, status: ProjectStatus) {
+        let Versioned {
+            value: mut project,
+            version,
+        } = block_on_store(Store::get_project(store, slug)).expect("get project");
+        project.status = status;
+        project.updated_at = now_utc();
+        block_on_store(Store::put_project(store, &project, Some(version))).expect("set status");
     }
 
     fn add_phase_simple(store: &FsStore, project: &str, slug: &str) -> Phase {
-        store
-            .add_phase(&NewPhase {
-                project: project.to_owned(),
-                slug: slug.to_owned(),
-                title: slug.to_owned(),
-                body: String::new(),
-                after_phase: None,
-                actor: "human:test".to_owned(),
-                owner: "human:test".to_owned(),
-            })
-            .expect("add phase")
-    }
-
-    #[test]
-    fn add_phase_persists_created_by() {
-        let (_tmp, store) = fresh_corpus();
-        seed_project(&store, "alpha");
-
-        let created = store
-            .add_phase(&NewPhase {
-                project: "alpha".to_owned(),
-                slug: "spec".to_owned(),
-                title: "Spec phase".to_owned(),
-                body: String::new(),
-                after_phase: None,
-                actor: "claude-code:alice".to_owned(),
-                owner: "human:test".to_owned(),
-            })
-            .expect("add_phase");
-
-        assert_eq!(created.created_by, "claude-code:alice");
-
-        let phases = store.list_phases(&phase_filter_for("alpha")).unwrap();
-        let round_trip = phases
+        let project_row = store.get_project(project).expect("get project");
+        let order = store
+            .list_phases(&phase_filter_for(project))
+            .expect("list phases")
             .iter()
-            .find(|p| p.slug == "spec")
-            .expect("phase listed");
-        assert_eq!(round_trip.created_by, "claude-code:alice");
+            .map(|p| p.order)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let now = now_utc();
+        let phase = Phase {
+            id: new_id("phs"),
+            project: project_row.id,
+            slug: slug.to_owned(),
+            title: slug.to_owned(),
+            body: String::new(),
+            order,
+            status: PhaseStatus::Pending,
+            created_at: now,
+            updated_at: now,
+            created_by: "human:test".to_owned(),
+            owner: "human:test".to_owned(),
+        };
+        block_on_store(Store::put_phase(store, &phase, None)).expect("seed phase");
+        phase
     }
 
-    #[test]
-    fn add_phase_preserves_project_description() {
-        let (_tmp, store) = fresh_corpus();
-        store
-            .create_project(NewProject {
-                slug: "alpha".to_owned(),
-                title: "Alpha".to_owned(),
-                description: "important description body".to_owned(),
-                actor: "human:test".to_owned(),
-            })
-            .expect("create project");
-
-        // phase.add re-writes project.md as its CAS gate; it must not drop the body.
-        add_phase_simple(&store, "alpha", "spec");
-
-        let project = store.load_project("alpha", true).expect("load project");
-        assert_eq!(
-            project.description, "important description body",
-            "phase.add must not wipe the project description"
-        );
-    }
-
-    #[test]
-    fn add_phase_rejects_empty_actor() {
-        let (_tmp, store) = fresh_corpus();
-        seed_project(&store, "alpha");
-
-        let err = store
-            .add_phase(&NewPhase {
-                project: "alpha".to_owned(),
-                slug: "spec".to_owned(),
-                title: "Spec phase".to_owned(),
-                body: String::new(),
-                after_phase: None,
-                actor: String::new(),
-                owner: "human:test".to_owned(),
-            })
-            .expect_err("empty actor");
-        assert!(err.to_string().contains("actor is required"), "got: {err}");
-    }
-
-    #[test]
-    fn add_phase_persists_owner() {
-        let (_tmp, store) = fresh_corpus();
-        seed_project(&store, "alpha");
-
-        let created = store
-            .add_phase(&NewPhase {
-                project: "alpha".to_owned(),
-                slug: "owned".to_owned(),
-                title: "Owned phase".to_owned(),
-                body: String::new(),
-                after_phase: None,
-                actor: "claude-code:alice".to_owned(),
-                owner: "team:frontend".to_owned(),
-            })
-            .expect("add_phase");
-
-        assert_eq!(created.owner, "team:frontend");
-
-        let phases = store.list_phases(&phase_filter_for("alpha")).unwrap();
-        let round_trip = phases
-            .iter()
-            .find(|p| p.slug == "owned")
-            .expect("phase listed");
-        assert_eq!(round_trip.owner, "team:frontend");
-    }
-
-    #[test]
-    fn add_phase_rejects_empty_owner() {
-        let (_tmp, store) = fresh_corpus();
-        seed_project(&store, "alpha");
-
-        let err = store
-            .add_phase(&NewPhase {
-                project: "alpha".to_owned(),
-                slug: "spec".to_owned(),
-                title: "Spec phase".to_owned(),
-                body: String::new(),
-                after_phase: None,
-                actor: "human:test".to_owned(),
-                owner: String::new(),
-            })
-            .expect_err("empty owner");
-        assert!(err.to_string().contains("owner is required"), "got: {err}");
-    }
-
-    #[test]
-    fn update_phase_replaces_owner() {
-        let (_tmp, store) = fresh_corpus();
-        seed_project(&store, "alpha");
-        add_phase_simple(&store, "alpha", "spec");
-
-        let updated = store
-            .update_phase(UpdatePhase {
-                project: "alpha".to_owned(),
-                slug: "spec".to_owned(),
-                owner: Some("team:platform".to_owned()),
-                ..Default::default()
-            })
-            .expect("update_phase");
-        assert_eq!(updated.owner, "team:platform");
-    }
-
-    #[test]
-    fn update_phase_rejects_empty_owner() {
-        let (_tmp, store) = fresh_corpus();
-        seed_project(&store, "alpha");
-        add_phase_simple(&store, "alpha", "spec");
-
-        let err = store
-            .update_phase(UpdatePhase {
-                project: "alpha".to_owned(),
-                slug: "spec".to_owned(),
-                owner: Some(String::new()),
-                ..Default::default()
-            })
-            .expect_err("empty owner update");
-        assert!(
-            err.to_string().contains("owner must not be empty"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn update_phase_leaves_owner_when_none() {
-        let (_tmp, store) = fresh_corpus();
-        seed_project(&store, "alpha");
-        store
-            .add_phase(&NewPhase {
-                project: "alpha".to_owned(),
-                slug: "spec".to_owned(),
-                title: "Spec".to_owned(),
-                body: String::new(),
-                after_phase: None,
-                actor: "human:test".to_owned(),
-                owner: "team:frontend".to_owned(),
-            })
-            .expect("add_phase");
-
-        let updated = store
-            .update_phase(UpdatePhase {
-                project: "alpha".to_owned(),
-                slug: "spec".to_owned(),
-                title: Some("Renamed".to_owned()),
-                owner: None,
-                ..Default::default()
-            })
-            .expect("update_phase");
-        assert_eq!(updated.title, "Renamed");
-        assert_eq!(updated.owner, "team:frontend");
-    }
-
-    #[test]
-    fn read_phase_with_missing_owner_defaults_empty() {
-        let (tmp, store) = fresh_corpus();
-        let project = seed_project(&store, "alpha");
-        let phs_id = new_id("phs");
-        let phases_dir = tmp.path().join("projects").join("alpha").join("phases");
-        fs::create_dir_all(&phases_dir).expect("mkdir phases");
-
-        let file_body = format!(
-            "---
-id: {phs_id}
-project: {}
-slug: legacy-owner
-title: Legacy
-order: 1
-status: pending
-created_at: 2026-05-10T14:30:00Z
-updated_at: 2026-05-10T14:30:00Z
-created_by: human:test
----
-",
-            project.id
-        );
-        fs::write(phases_dir.join("01-legacy-owner.md"), file_body).expect("write legacy phase");
-
-        let phases = store.list_phases(&phase_filter_for("alpha")).unwrap();
-        let p = phases
-            .iter()
-            .find(|ph| ph.slug == "legacy-owner")
-            .expect("legacy phase readable");
-        assert_eq!(p.owner, "");
-    }
-
-    #[test]
-    fn read_phase_with_missing_created_by_defaults_gracefully() {
-        let (tmp, store) = fresh_corpus();
-        let project = seed_project(&store, "alpha");
-        let phs_id = new_id("phs");
-        let phases_dir = tmp.path().join("projects").join("alpha").join("phases");
-        fs::create_dir_all(&phases_dir).expect("mkdir phases");
-
-        let file_body = format!(
-            "---\nid: {phs_id}\nproject: {}\nslug: legacy\ntitle: Legacy\norder: 1\nstatus: pending\ncreated_at: 2026-05-10T14:30:00Z\nupdated_at: 2026-05-10T14:30:00Z\n---\n",
-            project.id
-        );
-        fs::write(phases_dir.join("01-legacy.md"), file_body).expect("write legacy phase");
-
-        let phases = store.list_phases(&phase_filter_for("alpha")).unwrap();
-        let p = phases
-            .iter()
-            .find(|ph| ph.slug == "legacy")
-            .expect("legacy phase readable");
-        assert_eq!(p.created_by, "unknown");
-        assert_eq!(&p.id, &phs_id);
-    }
-
-    #[test]
-    fn add_phase_appends_to_end() {
-        let (_tmp, store) = fresh_corpus();
-        seed_project(&store, "alpha");
-
-        let p1 = add_phase_simple(&store, "alpha", "spec");
-        let p2 = add_phase_simple(&store, "alpha", "build");
-        let p3 = add_phase_simple(&store, "alpha", "ship");
-
-        assert_eq!(p1.order, 1);
-        assert_eq!(p2.order, 2);
-        assert_eq!(p3.order, 3);
-
-        let listed = store.list_phases(&phase_filter_for("alpha")).unwrap();
-        let slugs: Vec<&str> = listed.iter().map(|p| p.slug.as_str()).collect();
-        assert_eq!(slugs, vec!["spec", "build", "ship"]);
-    }
-
-    #[test]
-    fn add_phase_inserts_after_and_shifts() {
-        let (tmp, store) = fresh_corpus();
-        seed_project(&store, "alpha");
-        add_phase_simple(&store, "alpha", "spec"); // order 1
-        add_phase_simple(&store, "alpha", "build"); // order 2
-        add_phase_simple(&store, "alpha", "ship"); // order 3
-
-        // Insert after "spec": new phase becomes order 2; build/ship shift to 3/4.
-        let inserted = store
-            .add_phase(&NewPhase {
-                project: "alpha".to_owned(),
-                slug: "design".to_owned(),
-                title: "design".to_owned(),
-                body: String::new(),
-                after_phase: Some("spec".to_owned()),
-                actor: "human:test".to_owned(),
-                owner: "human:test".to_owned(),
-            })
-            .unwrap();
-        assert_eq!(inserted.order, 2);
-
-        let listed = store.list_phases(&phase_filter_for("alpha")).unwrap();
-        let pairs: Vec<(&str, i32)> = listed.iter().map(|p| (p.slug.as_str(), p.order)).collect();
-        assert_eq!(
-            pairs,
-            vec![("spec", 1), ("design", 2), ("build", 3), ("ship", 4)]
-        );
-
-        // Files on disk reflect the new ordering.
-        let phases_dir = tmp.path().join("projects").join("alpha").join("phases");
-        let mut names: Vec<String> = fs::read_dir(&phases_dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        names.sort();
-        assert_eq!(
-            names,
-            vec![
-                "01-spec.md".to_owned(),
-                "02-design.md".to_owned(),
-                "03-build.md".to_owned(),
-                "04-ship.md".to_owned(),
-            ]
-        );
-    }
-
-    #[test]
-    fn add_phase_rejects_duplicate_slug() {
-        let (_tmp, store) = fresh_corpus();
-        seed_project(&store, "alpha");
-        add_phase_simple(&store, "alpha", "spec");
-
-        let err = store
-            .add_phase(&NewPhase {
-                project: "alpha".to_owned(),
-                slug: "spec".to_owned(),
-                title: "Another spec".to_owned(),
-                body: String::new(),
-                after_phase: None,
-                actor: "human:test".to_owned(),
-                owner: "human:test".to_owned(),
-            })
-            .expect_err("duplicate slug");
-        assert!(
-            err.to_string().contains("phase slug already exists"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn add_phase_rejects_unknown_after_phase() {
-        let (_tmp, store) = fresh_corpus();
-        seed_project(&store, "alpha");
-        add_phase_simple(&store, "alpha", "spec");
-
-        let err = store
-            .add_phase(&NewPhase {
-                project: "alpha".to_owned(),
-                slug: "design".to_owned(),
-                title: "design".to_owned(),
-                body: String::new(),
-                after_phase: Some("nonexistent".to_owned()),
-                actor: "human:test".to_owned(),
-                owner: "human:test".to_owned(),
-            })
-            .expect_err("unknown after_phase");
-        assert!(
-            err.to_string().contains("after_phase not found"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn add_phase_rejects_unknown_project() {
-        let (_tmp, store) = fresh_corpus();
-        let err = store
-            .add_phase(&NewPhase {
-                project: "ghost".to_owned(),
-                slug: "spec".to_owned(),
-                title: "spec".to_owned(),
-                body: String::new(),
-                after_phase: None,
-                actor: "human:test".to_owned(),
-                owner: "human:test".to_owned(),
-            })
-            .expect_err("unknown project");
-        assert!(err.to_string().contains("project not found"), "got: {err}");
-    }
-
-    #[test]
-    fn update_phase_preserves_id_order_created_at() {
-        let (_tmp, store) = fresh_corpus();
-        seed_project(&store, "alpha");
-        let original = add_phase_simple(&store, "alpha", "spec");
-
-        std::thread::sleep(std::time::Duration::from_millis(10));
-
-        let updated = store
-            .update_phase(UpdatePhase {
-                project: "alpha".to_owned(),
-                slug: "spec".to_owned(),
-                title: Some("Spec v2".to_owned()),
-                body: Some("acceptance criteria here".to_owned()),
-                status: Some(PhaseStatus::Active),
-                owner: None,
-            })
-            .unwrap();
-
-        assert_eq!(updated.id, original.id, "id changed");
-        assert_eq!(updated.order, original.order, "order changed");
-        assert_eq!(
-            updated.created_at, original.created_at,
-            "created_at changed"
-        );
-        assert!(
-            updated.updated_at > original.updated_at,
-            "updated_at not bumped"
-        );
-        assert_eq!(updated.title, "Spec v2");
-        assert_eq!(updated.body, "acceptance criteria here");
-        assert_eq!(updated.status, PhaseStatus::Active);
-
-        // Confirm round-trip.
-        let listed = store.list_phases(&phase_filter_for("alpha")).unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].title, "Spec v2");
-        assert_eq!(listed[0].status, PhaseStatus::Active);
-    }
-
-    #[test]
-    fn update_phase_unknown_errors() {
-        let (_tmp, store) = fresh_corpus();
-        seed_project(&store, "alpha");
-
-        let err = store
-            .update_phase(UpdatePhase {
-                project: "alpha".to_owned(),
-                slug: "ghost".to_owned(),
-                title: Some("x".to_owned()),
-                ..Default::default()
-            })
-            .expect_err("missing phase");
-        assert!(err.to_string().contains("phase not found"), "got: {err}");
-    }
-
-    fn block_on_store<F: std::future::Future>(future: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime")
-            .block_on(future)
+    fn update_phase_via_store(store: &FsStore, args: UpdatePhase) -> Result<Phase, StoreError> {
+        if args.project.is_empty() || args.slug.is_empty() {
+            return Err(StoreError::Invalid("project and slug are required".into()));
+        }
+        block_on_store(async {
+            let Versioned {
+                value: mut phase,
+                version,
+            } = Store::get_phase(store, &args.project, &args.slug).await?;
+            if let Some(title) = args.title {
+                phase.title = title;
+            }
+            if let Some(body) = args.body {
+                phase.body = body;
+            }
+            if let Some(status) = args.status {
+                phase.status = status;
+            }
+            if let Some(owner) = args.owner {
+                if owner.is_empty() {
+                    return Err(StoreError::Invalid("owner must not be empty".into()));
+                }
+                phase.owner = owner;
+            }
+            phase.updated_at = now_utc();
+            store.put_phase(&phase, Some(version)).await?;
+            Ok(phase)
+        })
     }
 
     fn seed_task(store: &FsStore, project: &str, slug: &str) -> Task {
@@ -2746,273 +1904,6 @@ updated_at: 2026-05-10T14:30:00Z
         assert!(parse_note_line("  ").is_none());
     }
 
-    fn link_simple(
-        store: &FsStore,
-        project: &str,
-        task: Option<&str>,
-        kind: &str,
-        reference: &str,
-        label: &str,
-    ) -> Artifact {
-        store
-            .link_artifact(LinkArtifact {
-                project: project.to_owned(),
-                task: task.map(str::to_owned),
-                kind: kind.to_owned(),
-                reference: reference.to_owned(),
-                label: label.to_owned(),
-                actor: "human:test".to_owned(),
-            })
-            .expect("link artifact")
-    }
-
-    #[test]
-    fn link_artifact_project_wide_round_trip() {
-        let (_tmp, store) = fresh_corpus();
-        let project = seed_project(&store, "alpha");
-
-        let art = link_simple(&store, "alpha", None, "pr", "https://example/pr/7", "PR #7");
-        assert!(art.id.starts_with("art_"));
-        assert_eq!(art.project, project.id);
-        assert!(art.task.is_empty());
-        assert_eq!(art.kind, "pr");
-        assert_eq!(art.reference, "https://example/pr/7");
-        assert_eq!(art.label, "PR #7");
-        assert_eq!(art.actor, "human:test");
-
-        let listed = store.list_artifacts("alpha").unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].id, art.id);
-    }
-
-    #[test]
-    fn link_artifact_anchored_to_task() {
-        let (_tmp, store) = fresh_corpus();
-        seed_project(&store, "alpha");
-        let task = seed_task(&store, "alpha", "implement-x");
-
-        let art = link_simple(
-            &store,
-            "alpha",
-            Some(&task.id),
-            "commit",
-            "abc123",
-            "first commit",
-        );
-        assert_eq!(art.task, task.id);
-
-        let listed = store.list_artifacts("alpha").unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].task, task.id);
-    }
-
-    #[test]
-    fn link_artifact_appends_in_order() {
-        let (_tmp, store) = fresh_corpus();
-        seed_project(&store, "alpha");
-
-        let a = link_simple(&store, "alpha", None, "pr", "https://example/pr/1", "PR #1");
-        let b = link_simple(&store, "alpha", None, "pr", "https://example/pr/2", "PR #2");
-        let c = link_simple(&store, "alpha", None, "pr", "https://example/pr/3", "PR #3");
-
-        let listed = store.list_artifacts("alpha").unwrap();
-        let ids: Vec<&str> = listed.iter().map(|x| x.id.as_str()).collect();
-        assert_eq!(ids, vec![a.id.as_str(), b.id.as_str(), c.id.as_str()]);
-    }
-
-    #[test]
-    fn link_artifact_same_tuple_is_idempotent() {
-        let (_tmp, store) = fresh_corpus();
-        seed_project(&store, "alpha");
-
-        let first = link_simple(&store, "alpha", None, "pr", "https://example/pr/1", "PR #1");
-        let second = link_simple(
-            &store,
-            "alpha",
-            None,
-            "pr",
-            "https://example/pr/1",
-            "different label",
-        );
-
-        assert_eq!(first.id, second.id);
-        let listed = store.list_artifacts("alpha").unwrap();
-        assert_eq!(listed.len(), 1);
-    }
-
-    #[test]
-    fn link_artifact_different_ref_appends() {
-        let (_tmp, store) = fresh_corpus();
-        seed_project(&store, "alpha");
-
-        link_simple(&store, "alpha", None, "pr", "https://example/pr/1", "PR #1");
-        link_simple(&store, "alpha", None, "pr", "https://example/pr/2", "PR #2");
-
-        let listed = store.list_artifacts("alpha").unwrap();
-        assert_eq!(listed.len(), 2);
-    }
-
-    #[test]
-    fn link_artifact_rejects_unknown_project() {
-        let (_tmp, store) = fresh_corpus();
-        let err = store
-            .link_artifact(LinkArtifact {
-                project: "ghost".to_owned(),
-                task: None,
-                kind: "pr".to_owned(),
-                reference: "x".to_owned(),
-                label: "x".to_owned(),
-                actor: "human:test".to_owned(),
-            })
-            .expect_err("unknown project");
-        assert!(err.to_string().contains("project not found"), "got: {err}");
-    }
-
-    #[test]
-    fn link_artifact_rejects_task_in_wrong_project() {
-        let (_tmp, store) = fresh_corpus();
-        seed_project(&store, "alpha");
-        seed_project(&store, "beta");
-        let alpha_task = seed_task(&store, "alpha", "owned-by-alpha");
-
-        let err = store
-            .link_artifact(LinkArtifact {
-                project: "beta".to_owned(),
-                task: Some(alpha_task.id),
-                kind: "pr".to_owned(),
-                reference: "x".to_owned(),
-                label: "x".to_owned(),
-                actor: "human:test".to_owned(),
-            })
-            .expect_err("cross-project task should be rejected");
-        assert!(
-            err.to_string().contains("not found in project beta"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn link_artifact_rejects_unknown_task() {
-        let (_tmp, store) = fresh_corpus();
-        seed_project(&store, "alpha");
-        let err = store
-            .link_artifact(LinkArtifact {
-                project: "alpha".to_owned(),
-                task: Some("tsk_does_not_exist".to_owned()),
-                kind: "pr".to_owned(),
-                reference: "x".to_owned(),
-                label: "x".to_owned(),
-                actor: "human:test".to_owned(),
-            })
-            .expect_err("unknown task should be rejected");
-        assert!(
-            err.to_string().contains("not found in project alpha"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn link_artifact_rejects_empty_task_string() {
-        // Some(\"\") is a caller bug — telling them to omit the field is
-        // friendlier than treating it as a project-wide artifact.
-        let (_tmp, store) = fresh_corpus();
-        seed_project(&store, "alpha");
-        let err = store
-            .link_artifact(LinkArtifact {
-                project: "alpha".to_owned(),
-                task: Some(String::new()),
-                kind: "pr".to_owned(),
-                reference: "x".to_owned(),
-                label: "x".to_owned(),
-                actor: "human:test".to_owned(),
-            })
-            .expect_err("Some(empty) task must be rejected");
-        assert!(err.to_string().contains("task is empty"), "got: {err}");
-    }
-
-    #[test]
-    fn link_artifact_rejects_required_field_emptiness() {
-        let (_tmp, store) = fresh_corpus();
-        seed_project(&store, "alpha");
-
-        // Each required field, blanked one at a time. Builds a fresh
-        // baseline before each mutation so a single failure doesn't
-        // mask later ones.
-        let baseline = || LinkArtifact {
-            project: "alpha".to_owned(),
-            task: None,
-            kind: "pr".to_owned(),
-            reference: "x".to_owned(),
-            label: "x".to_owned(),
-            actor: "human:test".to_owned(),
-        };
-        let mut a = baseline();
-        a.actor = String::new();
-        assert!(store
-            .link_artifact(a)
-            .expect_err("empty actor")
-            .to_string()
-            .contains("actor is required"));
-        let mut a = baseline();
-        a.project = String::new();
-        assert!(store
-            .link_artifact(a)
-            .expect_err("empty project")
-            .to_string()
-            .contains("project is required"));
-        let mut a = baseline();
-        a.kind = String::new();
-        assert!(store
-            .link_artifact(a)
-            .expect_err("empty kind")
-            .to_string()
-            .contains("kind is required"));
-        let mut a = baseline();
-        a.reference = String::new();
-        assert!(store
-            .link_artifact(a)
-            .expect_err("empty ref")
-            .to_string()
-            .contains("ref is required"));
-        let mut a = baseline();
-        a.label = String::new();
-        assert!(store
-            .link_artifact(a)
-            .expect_err("empty label")
-            .to_string()
-            .contains("label is required"));
-    }
-
-    #[test]
-    fn link_artifact_rejects_newlines_in_text_fields() {
-        let (_tmp, store) = fresh_corpus();
-        seed_project(&store, "alpha");
-        for field in ["kind", "ref", "label", "actor"] {
-            let mut a = LinkArtifact {
-                project: "alpha".to_owned(),
-                task: None,
-                kind: "pr".to_owned(),
-                reference: "x".to_owned(),
-                label: "x".to_owned(),
-                actor: "human:test".to_owned(),
-            };
-            match field {
-                "kind" => a.kind = "p\nr".to_owned(),
-                "ref" => a.reference = "line1\nline2".to_owned(),
-                "label" => a.label = "label\r\ninjected".to_owned(),
-                "actor" => a.actor = "human\nadmin".to_owned(),
-                _ => unreachable!(),
-            }
-            let err = store
-                .link_artifact(a)
-                .expect_err("newline must be rejected");
-            assert!(
-                err.to_string().contains("single-line"),
-                "field={field}, got: {err}"
-            );
-        }
-    }
-
     // =========================================================================
     // Filter expansion: per-predicate, combo, validation, dogfood
     // =========================================================================
@@ -3072,14 +1963,16 @@ updated_at: 2026-05-10T14:30:00Z
 
     /// Seed a phase with a controlled body for `body_contains` tests.
     fn set_phase_body(store: &FsStore, project_slug: &str, phase_slug: &str, body: &str) {
-        store
-            .update_phase(UpdatePhase {
+        update_phase_via_store(
+            store,
+            UpdatePhase {
                 project: project_slug.to_owned(),
                 slug: phase_slug.to_owned(),
                 body: Some(body.to_owned()),
                 ..Default::default()
-            })
-            .unwrap();
+            },
+        )
+        .expect("set phase body");
     }
 
     /// Overwrite a frontmatter scalar on project.md (`created_at` /
@@ -3339,41 +2232,49 @@ updated_at: 2026-05-10T14:30:00Z
         );
         set_phase_body(&store, "alpha", "cold", "nothing");
 
-        store
-            .update_phase(UpdatePhase {
+        update_phase_via_store(
+            &store,
+            UpdatePhase {
                 project: "alpha".to_owned(),
                 slug: "hit".to_owned(),
                 status: Some(PhaseStatus::Active),
                 ..Default::default()
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
-        store
-            .update_phase(UpdatePhase {
+        update_phase_via_store(
+            &store,
+            UpdatePhase {
                 project: "alpha".to_owned(),
                 slug: "active-plain".to_owned(),
                 status: Some(PhaseStatus::Active),
                 ..Default::default()
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
-        store
-            .update_phase(UpdatePhase {
+        update_phase_via_store(
+            &store,
+            UpdatePhase {
                 project: "alpha".to_owned(),
                 slug: "pending-design".to_owned(),
                 status: Some(PhaseStatus::Pending),
                 ..Default::default()
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
-        store
-            .update_phase(UpdatePhase {
+        update_phase_via_store(
+            &store,
+            UpdatePhase {
                 project: "alpha".to_owned(),
                 slug: "cold".to_owned(),
                 status: Some(PhaseStatus::Pending),
                 ..Default::default()
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let phases = store
             .list_phases(&PhaseListFilter {
@@ -3392,73 +2293,20 @@ updated_at: 2026-05-10T14:30:00Z
     fn list_projects_matches_status_and_body_contains_intersection() {
         let (_tmp, store) = fresh_corpus();
 
-        store
-            .create_project(NewProject {
-                slug: "hit".to_owned(),
-                title: "Hit".to_owned(),
-                description: "team CORE platform rollout".to_owned(),
-                actor: "human:test".to_owned(),
-            })
-            .unwrap();
+        seed_project_with_body(&store, "hit", "Hit", "team CORE platform rollout");
+        seed_project_with_body(&store, "active-no-core", "Bare", "edge tooling only");
+        seed_project_with_body(
+            &store,
+            "paused-core-text",
+            "Paused core",
+            "contains CORE mention but wrong status fixture",
+        );
+        seed_project_with_body(&store, "miss", "Miss", "unrelated backlog");
 
-        store
-            .create_project(NewProject {
-                slug: "active-no-core".to_owned(),
-                title: "Bare".to_owned(),
-                description: "edge tooling only".to_owned(),
-                actor: "human:test".to_owned(),
-            })
-            .unwrap();
-
-        store
-            .create_project(NewProject {
-                slug: "paused-core-text".to_owned(),
-                title: "Paused core".to_owned(),
-                description: "contains CORE mention but wrong status fixture".to_owned(),
-                actor: "human:test".to_owned(),
-            })
-            .unwrap();
-
-        store
-            .create_project(NewProject {
-                slug: "miss".to_owned(),
-                title: "Miss".to_owned(),
-                description: "unrelated backlog".to_owned(),
-                actor: "human:test".to_owned(),
-            })
-            .unwrap();
-
-        store
-            .update_project(UpdateProject {
-                slug: "hit".to_owned(),
-                status: Some(ProjectStatus::Active),
-                ..Default::default()
-            })
-            .unwrap();
-
-        store
-            .update_project(UpdateProject {
-                slug: "active-no-core".to_owned(),
-                status: Some(ProjectStatus::Active),
-                ..Default::default()
-            })
-            .unwrap();
-
-        store
-            .update_project(UpdateProject {
-                slug: "paused-core-text".to_owned(),
-                status: Some(ProjectStatus::Paused),
-                ..Default::default()
-            })
-            .unwrap();
-
-        store
-            .update_project(UpdateProject {
-                slug: "miss".to_owned(),
-                status: Some(ProjectStatus::Done),
-                ..Default::default()
-            })
-            .unwrap();
+        set_project_status(&store, "hit", ProjectStatus::Active);
+        set_project_status(&store, "active-no-core", ProjectStatus::Active);
+        set_project_status(&store, "paused-core-text", ProjectStatus::Paused);
+        set_project_status(&store, "miss", ProjectStatus::Done);
 
         let hits = store
             .list_projects(&ProjectListFilter {
@@ -3537,15 +2385,20 @@ updated_at: 2026-05-10T14:30:00Z
             (String::new(), "spec".to_owned()),
             ("alpha".to_owned(), String::new()),
         ] {
-            let err = store
-                .update_phase(UpdatePhase {
+            let err = update_phase_via_store(
+                &store,
+                UpdatePhase {
                     project,
                     slug,
                     title: Some("x".to_owned()),
                     ..Default::default()
-                })
-                .expect_err("requires both keys");
-            let msg = err.to_string();
+                },
+            )
+            .expect_err("requires both keys");
+            let msg = match &err {
+                StoreError::Invalid(s) => s.clone(),
+                other => format!("{other:?}"),
+            };
             assert!(
                 msg.contains("project and slug are required"),
                 "unexpected message: {msg}"
@@ -3947,14 +2800,16 @@ updated_at: 2026-05-10T14:30:00Z
         add_phase_simple(&store, "alpha", "build");
         set_phase_body(&store, "alpha", "spec", "Design OIDC auth handshake");
         set_phase_body(&store, "alpha", "build", "Implement the cache layer");
-        store
-            .update_phase(UpdatePhase {
+        update_phase_via_store(
+            &store,
+            UpdatePhase {
                 project: "alpha".to_owned(),
                 slug: "spec".to_owned(),
                 status: Some(PhaseStatus::Active),
                 ..Default::default()
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let hits = store
             .list_phases(&PhaseListFilter {
@@ -4016,29 +2871,9 @@ updated_at: 2026-05-10T14:30:00Z
     #[test]
     fn list_projects_filter_by_status_and_body_contains() {
         let (_tmp, store) = fresh_corpus();
-        store
-            .create_project(NewProject {
-                slug: "alpha".to_owned(),
-                title: "Alpha".to_owned(),
-                description: "auth flows for HYROX dashboards".to_owned(),
-                actor: "human:test".to_owned(),
-            })
-            .unwrap();
-        store
-            .create_project(NewProject {
-                slug: "beta".to_owned(),
-                title: "Beta".to_owned(),
-                description: "unrelated caching tier".to_owned(),
-                actor: "human:test".to_owned(),
-            })
-            .unwrap();
-        store
-            .update_project(UpdateProject {
-                slug: "beta".to_owned(),
-                status: Some(ProjectStatus::Paused),
-                ..Default::default()
-            })
-            .unwrap();
+        seed_project_with_body(&store, "alpha", "Alpha", "auth flows for HYROX dashboards");
+        seed_project_with_body(&store, "beta", "Beta", "unrelated caching tier");
+        set_project_status(&store, "beta", ProjectStatus::Paused);
 
         let hits = store
             .list_projects(&ProjectListFilter {
@@ -4184,144 +3019,6 @@ updated_at: 2026-05-10T14:30:00Z
 
     // ----- phase.add CAS ordering -----
 
-    #[tokio::test]
-    async fn add_phase_cas_race_two_independent_writers() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        fs::create_dir_all(tmp.path().join(".dossier")).expect("mkdir .dossier");
-        let path = tmp.path();
-
-        let store_a = FsStore::open(path).expect("writer a");
-        store_a
-            .create_project(NewProject {
-                slug: "race".to_owned(),
-                title: "Race".to_owned(),
-                description: String::new(),
-                actor: "human:test".to_owned(),
-            })
-            .expect("create project");
-        let store_b = FsStore::open(path).expect("writer b");
-
-        let va = Store::get_project(&store_a, "race")
-            .await
-            .expect("read v0 from a");
-        let vb = Store::get_project(&store_b, "race")
-            .await
-            .expect("read v0 from b");
-        assert_eq!(va.version, vb.version);
-
-        let args_a = NewPhase {
-            project: "race".to_owned(),
-            slug: "phase-a".to_owned(),
-            title: "Phase A".to_owned(),
-            body: String::new(),
-            after_phase: None,
-            actor: "human:test".to_owned(),
-            owner: "human:test".to_owned(),
-        };
-        let args_b = NewPhase {
-            project: "race".to_owned(),
-            slug: "phase-b".to_owned(),
-            title: "Phase B".to_owned(),
-            body: String::new(),
-            after_phase: None,
-            actor: "human:test".to_owned(),
-            owner: "human:test".to_owned(),
-        };
-
-        let phase_a = store_a.add_phase(&args_a).expect("writer a lands");
-        assert_eq!(phase_a.order, 1);
-
-        let mut stale_gate = vb.value;
-        stale_gate.updated_at = now_utc();
-        let err = store_b
-            .put_project(&stale_gate, Some(vb.version))
-            .await
-            .expect_err("writer b stale project CAS");
-        assert!(matches!(err, StoreError::Conflict));
-
-        let phase_b = store_b.add_phase(&args_b).expect("writer b retry lands");
-        assert_eq!(phase_b.order, 2);
-        assert_ne!(phase_a.order, phase_b.order);
-
-        let mut phases = store_a
-            .list_phases(&phase_filter_for("race"))
-            .expect("list phases");
-        assert_eq!(phases.len(), 2);
-        phases.sort_by_key(|p| p.order);
-        assert_eq!(phases[0].order, 1);
-        assert_eq!(phases[1].order, 2);
-    }
-
-    #[tokio::test]
-    async fn add_phase_cas_project_gate_conflict_then_retry() {
-        let (_tmp, store) = fresh_corpus();
-        store
-            .create_project(NewProject {
-                slug: "cas".to_owned(),
-                title: "CAS".to_owned(),
-                description: String::new(),
-                actor: "human:test".to_owned(),
-            })
-            .expect("create");
-
-        let Versioned {
-            value: project,
-            version: v0,
-        } = Store::get_project(&store, "cas").await.expect("read v0");
-
-        let mut writer_a = project.clone();
-        writer_a.updated_at = now_utc();
-        let v1 = store
-            .put_project(&writer_a, Some(v0.clone()))
-            .await
-            .expect("writer a wins project CAS");
-
-        let mut writer_b = project;
-        writer_b.updated_at = now_utc();
-        let err = store
-            .put_project(&writer_b, Some(v0))
-            .await
-            .expect_err("writer b stale");
-        assert!(matches!(err, StoreError::Conflict));
-
-        let mut writer_b_retry = writer_a;
-        writer_b_retry.updated_at = now_utc();
-        store
-            .put_project(&writer_b_retry, Some(v1))
-            .await
-            .expect("writer b retry on v1");
-
-        let phase_a = store
-            .add_phase(&NewPhase {
-                project: "cas".to_owned(),
-                slug: "a".to_owned(),
-                title: "A".to_owned(),
-                body: String::new(),
-                after_phase: None,
-                actor: "human:test".to_owned(),
-                owner: "human:test".to_owned(),
-            })
-            .expect("add a");
-        let phase_b = store
-            .add_phase(&NewPhase {
-                project: "cas".to_owned(),
-                slug: "b".to_owned(),
-                title: "B".to_owned(),
-                body: String::new(),
-                after_phase: None,
-                actor: "human:test".to_owned(),
-                owner: "human:test".to_owned(),
-            })
-            .expect("add b");
-        assert_ne!(phase_a.order, phase_b.order);
-
-        let phases = store.list_phases(&phase_filter_for("cas")).expect("list");
-        assert_eq!(phases.len(), 2);
-    }
-
-    /// Exhaustive field comparison after project.md write + read. If a new
-    /// `Project` field is added, this list must grow — otherwise drift from
-    /// `ProjectFrontmatter` goes uncaught.
     fn assert_project_all_fields_persisted(want: &Project, got: &Project) {
         assert_eq!(
             want.id, got.id,

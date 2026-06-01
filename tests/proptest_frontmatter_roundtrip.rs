@@ -17,7 +17,7 @@ use dossier::store::{FsStore, NewPhase, NewProject, NewTask};
 use proptest::prelude::*;
 
 mod common;
-use common::{block_on, fresh_corpus, fresh_service};
+use common::{add_phase, block_on, create_project, fresh_service};
 
 // ---------- generators ---------------------------------------------------
 
@@ -62,15 +62,17 @@ proptest! {
         title in title(),
         description in body(),
     ) {
-        let (_tmp, store) = fresh_corpus();
-        let created = store
-            .create_project(NewProject {
+        let (tmp, svc) = fresh_service();
+        let store = FsStore::open(tmp.path()).expect("reopen");
+        let created = create_project(
+            &svc,
+            NewProject {
                 slug: slug.clone(),
                 title: title.clone(),
                 description: description.clone(),
                 actor: "human:michael".into(),
-            })
-            .expect("create_project");
+            },
+        );
         let fetched = store.get_project(&slug).expect("get_project");
         prop_assert_eq!(&fetched.slug, &slug);
         prop_assert_eq!(&fetched.title, &title);
@@ -91,18 +93,21 @@ proptest! {
         body in body(),
     ) {
         prop_assume!(proj_slug != phase_slug);
-        let (_tmp, store) = fresh_corpus();
-        store
-            .create_project(NewProject {
+        let (tmp, svc) = fresh_service();
+        let store = FsStore::open(tmp.path()).expect("reopen");
+        create_project(
+            &svc,
+            NewProject {
                 slug: proj_slug.clone(),
                 title: "P".into(),
                 description: String::new(),
                 actor: "human:michael".into(),
-            })
-            .expect("create_project");
+            },
+        );
         let owner = "team:frontend".to_owned();
-        let created = store
-            .add_phase(&NewPhase {
+        let created = add_phase(
+            &svc,
+            &NewPhase {
                 project: proj_slug.clone(),
                 slug: phase_slug.clone(),
                 title: title.clone(),
@@ -110,8 +115,8 @@ proptest! {
                 after_phase: None,
                 actor: "human:michael".into(),
                 owner: owner.clone(),
-            })
-            .expect("add_phase");
+            },
+        );
         let phases = store
             .list_phases(&PhaseListFilter {
                 project: Some(proj_slug),
@@ -147,14 +152,15 @@ proptest! {
         prop_assume!(proj_slug != task_slug);
         let (tmp, svc) = fresh_service();
         let store = FsStore::open(tmp.path()).expect("reopen");
-        store
-            .create_project(NewProject {
+        create_project(
+            &svc,
+            NewProject {
                 slug: proj_slug.clone(),
                 title: "P".into(),
                 description: String::new(),
                 actor: "human:michael".into(),
-            })
-            .expect("create_project");
+            },
+        );
         let depends_on = if use_deps {
             vec![dep_id]
         } else {

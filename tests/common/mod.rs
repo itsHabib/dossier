@@ -18,8 +18,9 @@
 
 use std::fs;
 
+use dossier::domain::{Phase, Project};
 use dossier::server::MeshService;
-use dossier::store::{FsStore, StoreError};
+use dossier::store::{FsStore, NewPhase, NewProject, StoreError};
 use tempfile::TempDir;
 
 /// A fresh, isolated corpus rooted in a `TempDir`. The `TempDir` is held
@@ -46,4 +47,12 @@ pub fn block_on<F: std::future::Future<Output = Result<T, StoreError>>, T>(
         .build()
         .expect("tokio runtime")
         .block_on(future)
+}
+
+pub fn create_project(svc: &MeshService, args: NewProject) -> Project {
+    block_on(svc.create_project(args)).expect("create_project")
+}
+
+pub fn add_phase(svc: &MeshService, args: &NewPhase) -> Phase {
+    block_on(svc.add_phase(args)).expect("add_phase")
 }

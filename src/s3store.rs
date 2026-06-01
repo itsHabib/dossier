@@ -226,6 +226,17 @@ impl S3Store {
         etag_from_output(resp.e_tag())
     }
 
+    async fn delete_object(&self, key: &str) -> Result<(), StoreError> {
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(map_sdk_err)?;
+        Ok(())
+    }
+
     async fn load_phases_for(&self, project_slug: &str) -> Result<Vec<Phase>, StoreError> {
         Self::validate_slug(project_slug)?;
         let prefix = format!("{}/", self.join_key(&["projects", project_slug, "phases"]));
@@ -612,6 +623,29 @@ impl Store for S3Store {
             }
         }
         Err(StoreError::Conflict)
+    }
+
+    async fn shift_phases(&self, project: &str, from_order: i32) -> Result<(), StoreError> {
+        Self::validate_slug(project)?;
+        let mut phases = self.load_phases_for(project).await?;
+        phases.sort_by_key(|p| std::cmp::Reverse(p.order));
+        for phase in &mut phases {
+            if phase.order < from_order {
+                continue;
+            }
+            let old_key = self.find_phase_key(project, &phase.slug).await?;
+            phase.order += 1;
+            let content = serialize_phase_file(phase).map_err(invalid_err)?;
+            let new_key = self.join_key(&[
+                "projects",
+                project,
+                "phases",
+                &phase_filename(phase.order, &phase.slug),
+            ]);
+            self.cas_put(&new_key, content.as_bytes(), None).await?;
+            self.delete_object(&old_key).await?;
+        }
+        Ok(())
     }
 }
 

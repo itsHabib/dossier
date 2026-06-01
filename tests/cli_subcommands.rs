@@ -42,15 +42,16 @@ fn parse_json<T: DeserializeOwned>(raw: &str) -> T {
     serde_json::from_str(raw.trim()).expect("parse json")
 }
 
-fn seed_project(store: &FsStore, slug: &str) {
-    store
-        .create_project(NewProject {
+fn seed_project(svc: &MeshService, slug: &str) {
+    common::create_project(
+        svc,
+        NewProject {
             slug: slug.to_owned(),
             title: format!("Project {slug}"),
             description: String::new(),
             actor: "human:test".to_owned(),
-        })
-        .expect("create project");
+        },
+    );
 }
 
 fn seed_task(svc: &MeshService, project: &str, slug: &str) -> Task {
@@ -84,8 +85,7 @@ fn advance_to_in_progress(svc: &MeshService, id: &str) {
 #[test]
 fn cli_task_complete_transitions_in_progress_task_to_done() {
     let (tmp, svc) = fresh_service();
-    let store = FsStore::open(tmp.path()).expect("reopen for reads");
-    seed_project(&store, "alpha");
+    seed_project(&svc, "alpha");
     let task = seed_task(&svc, "alpha", "ship-it");
     advance_to_in_progress(&svc, &task.id);
 
@@ -112,8 +112,7 @@ fn cli_task_complete_transitions_in_progress_task_to_done() {
 #[test]
 fn cli_task_complete_is_idempotent_when_already_done() {
     let (tmp, svc) = fresh_service();
-    let store = FsStore::open(tmp.path()).expect("reopen for reads");
-    seed_project(&store, "alpha");
+    seed_project(&svc, "alpha");
     let task = seed_task(&svc, "alpha", "already-done");
     advance_to_in_progress(&svc, &task.id);
     block_on(svc.complete_task(CompleteTask {
@@ -138,7 +137,7 @@ fn cli_task_complete_is_idempotent_when_already_done() {
 fn cli_task_update_appends_duplicate_notes() {
     let (tmp, svc) = fresh_service();
     let store = FsStore::open(tmp.path()).expect("reopen for reads");
-    seed_project(&store, "alpha");
+    seed_project(&svc, "alpha");
     let task = seed_task(&svc, "alpha", "note-me");
 
     for note in ["first", "first"] {
@@ -185,8 +184,9 @@ fn cli_task_update_appends_duplicate_notes() {
 
 #[test]
 fn cli_artifact_link_dedupes_same_tuple() {
-    let (tmp, store) = common::fresh_corpus();
-    seed_project(&store, "alpha");
+    let (tmp, svc) = fresh_service();
+    let store = FsStore::open(tmp.path()).expect("reopen for reads");
+    seed_project(&svc, "alpha");
 
     let args = [
         "artifact_link",
@@ -215,8 +215,9 @@ fn cli_artifact_link_dedupes_same_tuple() {
 
 #[test]
 fn cli_artifact_link_appends_different_tuple() {
-    let (tmp, store) = common::fresh_corpus();
-    seed_project(&store, "alpha");
+    let (tmp, svc) = fresh_service();
+    let store = FsStore::open(tmp.path()).expect("reopen for reads");
+    seed_project(&svc, "alpha");
 
     for reference in ["https://example/pr/1", "https://example/pr/2"] {
         let (code, _, stderr) = run_cli(
@@ -246,8 +247,9 @@ fn cli_artifact_link_rejects_explicit_empty_task() {
     // Regression for codex PR #38 P2: ensure --task "" is rejected before the
     // existing-artifact dedupe short-circuit (which would otherwise return Ok
     // when a project-wide artifact already exists).
-    let (tmp, store) = common::fresh_corpus();
-    seed_project(&store, "alpha");
+    let (tmp, svc) = fresh_service();
+    let _store = FsStore::open(tmp.path()).expect("reopen for reads");
+    seed_project(&svc, "alpha");
 
     // Pre-seed a project-wide artifact so the dedupe path is reachable.
     let (code, _, stderr) = run_cli(
@@ -296,7 +298,7 @@ fn cli_artifact_link_rejects_explicit_empty_task() {
 fn cli_task_list_filters_match_store() {
     let (tmp, svc) = fresh_service();
     let store = FsStore::open(tmp.path()).expect("reopen for reads");
-    seed_project(&store, "alpha");
+    seed_project(&svc, "alpha");
     let todo = seed_task(&svc, "alpha", "todo-one");
     let active = seed_task(&svc, "alpha", "active-one");
     advance_to_in_progress(&svc, &active.id);
@@ -335,7 +337,7 @@ fn cli_task_list_filters_match_store() {
 fn cli_json_matches_store_for_write_verbs() {
     let (tmp, svc) = fresh_service();
     let store = FsStore::open(tmp.path()).expect("reopen for reads");
-    seed_project(&store, "alpha");
+    seed_project(&svc, "alpha");
     let task = seed_task(&svc, "alpha", "parity");
     advance_to_in_progress(&svc, &task.id);
     let corpus = tmp.path();

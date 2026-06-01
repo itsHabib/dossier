@@ -1,10 +1,9 @@
-//! `MCP` server wrapping the `FsStore` as dossier verbs.
+//! `MCP` server wrapping a [`Store`] backend as dossier verbs.
 //!
 //! Read side: `project.list` / `project.get` / `phase.list` / `task.list`
-//! / `task.get` / `artifact.list`. Write side: project / phase verbs route
-//! through the shared `write_lock`; task verbs use optimistic CAS loops
-//! (atomic via `FsStore`'s internal `cas_lock`). Artifact writes and conflict
-//! detection are not yet wired.
+//! / `task.get` / `artifact.list`. Write side: all verbs route through
+//! [`MeshService`] policy over `Arc<dyn Store>`; task verbs use optimistic
+//! CAS loops on the store primitives.
 
 use std::sync::{Arc, Mutex};
 
@@ -21,10 +20,10 @@ use ulid::Ulid;
 
 use crate::domain::{
     append_task_note, apply_claim_task, apply_complete_task, apply_task_body_update,
-    apply_task_status_update, is_valid_slug, new_id, validate_task_body, Artifact, Phase,
-    PhaseListFilter, PhaseOrderField, PhaseStatus, Project, ProjectListFilter, ProjectOrderField,
-    ProjectStatus, SearchArgs, SearchHit, SearchKind, Task, TaskGetArgs, TaskListFilter,
-    TaskOrderField, TaskStatus,
+    apply_task_status_update, compute_new_phase_order, is_valid_slug, new_id, validate_single_line,
+    validate_task_body, Artifact, Phase, PhaseListFilter, PhaseOrderField, PhaseStatus, Project,
+    ProjectListFilter, ProjectOrderField, ProjectStatus, SearchArgs, SearchHit, SearchKind, Task,
+    TaskGetArgs, TaskListFilter, TaskOrderField, TaskStatus,
 };
 use crate::store::{
     now_utc, ArtifactListFilter, ClaimTask, CompleteTask, FsStore, LinkArtifact, NewPhase,
@@ -38,24 +37,19 @@ pub const VERSION: &str = "0.1.0";
 /// Service holding a shared [`Store`] backend and a process-local write lock.
 ///
 /// The `Arc<dyn Store>` lets `rmcp` clone the service cheaply across
-/// handler invocations; the paired `Arc<FsStore>` reaches inherent-only
-/// write verbs until the service layer owns them. The `Mutex<()>` serializes
-/// writes inside this process so concurrent tool calls don't race each other.
+/// handler invocations. The `Mutex<()>` serializes writes inside this
+/// process so concurrent tool calls don't race each other.
 #[derive(Clone)]
 pub struct MeshService {
     store: Arc<dyn Store>,
-    fs: Arc<FsStore>,
     write_lock: Arc<Mutex<()>>,
 }
 
 impl MeshService {
     /// Wrap an opened [`FsStore`] with shared handles and a process-local write lock.
     pub fn new(store: FsStore) -> Self {
-        let fs = Arc::new(store);
-        let store: Arc<dyn Store> = fs.clone();
         Self {
-            store,
-            fs,
+            store: Arc::new(store),
             write_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -730,15 +724,13 @@ impl MeshService {
             .write_lock
             .lock()
             .map_err(|e| internal(format!("write lock poisoned: {e}")))?;
-        let project = self
-            .fs
-            .create_project(NewProject {
-                slug: args.slug,
-                title: args.title,
-                description: args.description,
-                actor: args.actor,
-            })
-            .map_err(internal_or_invalid)?;
+        let project = block_on(self.create_project(NewProject {
+            slug: args.slug,
+            title: args.title,
+            description: args.description,
+            actor: args.actor,
+        }))
+        .map_err(store_err_to_invalid)?;
         Ok(Json(project))
     }
 
@@ -757,15 +749,13 @@ impl MeshService {
         if matches!(args.actor.as_deref(), Some("")) {
             return Err(ErrorData::invalid_params("actor must not be empty", None));
         }
-        let project = self
-            .fs
-            .update_project(UpdateProject {
-                slug: args.slug,
-                title: args.title,
-                description: args.description,
-                status: args.status,
-            })
-            .map_err(internal_or_invalid)?;
+        let project = block_on(self.update_project(UpdateProject {
+            slug: args.slug,
+            title: args.title,
+            description: args.description,
+            status: args.status,
+        }))
+        .map_err(store_err_to_invalid)?;
         Ok(Json(project))
     }
 
@@ -838,18 +828,16 @@ impl MeshService {
             .write_lock
             .lock()
             .map_err(|e| internal(format!("write lock poisoned: {e}")))?;
-        let phase = self
-            .fs
-            .add_phase(&NewPhase {
-                project: args.project,
-                slug: args.slug,
-                title: args.title,
-                body: args.body,
-                after_phase: args.after_phase,
-                actor: args.actor,
-                owner: args.owner,
-            })
-            .map_err(internal_or_invalid)?;
+        let phase = block_on(self.add_phase(&NewPhase {
+            project: args.project,
+            slug: args.slug,
+            title: args.title,
+            body: args.body,
+            after_phase: args.after_phase,
+            actor: args.actor,
+            owner: args.owner,
+        }))
+        .map_err(store_err_to_invalid)?;
         Ok(Json(phase))
     }
 
@@ -865,17 +853,15 @@ impl MeshService {
             .write_lock
             .lock()
             .map_err(|e| internal(format!("write lock poisoned: {e}")))?;
-        let phase = self
-            .fs
-            .update_phase(UpdatePhase {
-                project: args.project,
-                slug: args.slug,
-                title: args.title,
-                body: args.body,
-                status: args.status,
-                owner: args.owner,
-            })
-            .map_err(internal_or_invalid)?;
+        let phase = block_on(self.update_phase(UpdatePhase {
+            project: args.project,
+            slug: args.slug,
+            title: args.title,
+            body: args.body,
+            status: args.status,
+            owner: args.owner,
+        }))
+        .map_err(store_err_to_invalid)?;
         Ok(Json(phase))
     }
 
@@ -990,17 +976,15 @@ impl MeshService {
             .write_lock
             .lock()
             .map_err(|e| internal(format!("write lock poisoned: {e}")))?;
-        let artifact = self
-            .fs
-            .link_artifact(LinkArtifact {
-                project: args.project,
-                task: args.task,
-                kind: args.kind,
-                reference: args.reference,
-                label: args.label,
-                actor: args.actor,
-            })
-            .map_err(internal_or_invalid)?;
+        let artifact = block_on(self.link_artifact(LinkArtifact {
+            project: args.project,
+            task: args.task,
+            kind: args.kind,
+            reference: args.reference,
+            label: args.label,
+            actor: args.actor,
+        }))
+        .map_err(store_err_to_invalid)?;
         Ok(Json(artifact))
     }
 
@@ -1096,6 +1080,8 @@ impl MeshService {
 const CAS_RETRY_BASE_MS: u64 = 25;
 const CAS_RETRY_CAP_MS: u64 = 2000;
 const CAS_MAX_ATTEMPTS: u32 = 5;
+/// Bounded retry budget for concurrent `phase.add` writers racing on one project.
+const PHASE_ADD_MAX_RETRIES: u32 = 8;
 
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
     #[allow(
@@ -1431,6 +1417,275 @@ impl MeshService {
         }
         Err(StoreError::Conflict)
     }
+
+    /// Service-layer `project.create` — rejects duplicate slugs before `put_project`.
+    pub async fn create_project(&self, args: NewProject) -> Result<Project, StoreError> {
+        if args.slug.is_empty() {
+            return Err(invalid_msg("slug is required"));
+        }
+        match self.store.get_project(&args.slug).await {
+            Ok(_) => {
+                return Err(invalid_msg(format!(
+                    "project slug already exists: {}",
+                    args.slug
+                )));
+            }
+            Err(StoreError::NotFound) => {}
+            Err(e) => return Err(e),
+        }
+
+        let now = now_utc();
+        let project = Project {
+            id: new_id("prj"),
+            slug: args.slug,
+            title: args.title,
+            description: args.description,
+            status: ProjectStatus::Planning,
+            created_at: now,
+            updated_at: now,
+            created_by: args.actor,
+        };
+        self.store.put_project(&project, None).await?;
+        Ok(project)
+    }
+
+    /// Service-layer `project.update` — CAS on `project.md`.
+    pub async fn update_project(&self, args: UpdateProject) -> Result<Project, StoreError> {
+        if args.slug.is_empty() {
+            return Err(invalid_msg("slug is required"));
+        }
+        let Versioned {
+            value: mut project,
+            version,
+        } = match self.store.get_project(&args.slug).await {
+            Ok(v) => v,
+            Err(StoreError::NotFound) => {
+                return Err(invalid_msg(format!("project not found: {}", args.slug)));
+            }
+            Err(e) => return Err(e),
+        };
+        if let Some(title) = args.title {
+            project.title = title;
+        }
+        if let Some(description) = args.description {
+            project.description = description;
+        }
+        if let Some(status) = args.status {
+            project.status = status;
+        }
+        project.updated_at = now_utc();
+        self.store.put_project(&project, Some(version)).await?;
+        Ok(project)
+    }
+
+    /// Service-layer `phase.add` — project.md CAS gate, domain order compute, trait shift.
+    pub async fn add_phase(&self, args: &NewPhase) -> Result<Phase, StoreError> {
+        if args.project.is_empty() {
+            return Err(invalid_msg("project is required"));
+        }
+        if args.actor.is_empty() {
+            return Err(invalid_msg("actor is required to add a phase"));
+        }
+        if args.owner.is_empty() {
+            return Err(invalid_msg("owner is required to add a phase"));
+        }
+        if !is_valid_slug(&args.slug) {
+            return Err(invalid_msg(format!(
+                "slug must be lowercase ascii (a-z, 0-9, -, _): {}",
+                args.slug
+            )));
+        }
+
+        for _ in 0..PHASE_ADD_MAX_RETRIES {
+            match self.try_add_phase_once(args).await {
+                Ok(phase) => return Ok(phase),
+                Err(StoreError::Conflict) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Err(StoreError::Conflict)
+    }
+
+    async fn try_add_phase_once(&self, args: &NewPhase) -> Result<Phase, StoreError> {
+        let Versioned {
+            value: project,
+            version: project_version,
+        } = match self.store.get_project(&args.project).await {
+            Ok(v) => v,
+            Err(StoreError::NotFound) => {
+                return Err(invalid_msg(format!("project not found: {}", args.project)));
+            }
+            Err(e) => return Err(e),
+        };
+
+        let existing = self
+            .store
+            .list_phases(PhaseListFilter {
+                project: Some(args.project.clone()),
+                ..Default::default()
+            })
+            .await?;
+        let phases: Vec<Phase> = existing.into_iter().map(|v| v.value).collect();
+        if phases.iter().any(|p| p.slug == args.slug) {
+            return Err(invalid_msg(format!(
+                "phase slug already exists in project: {}",
+                args.slug
+            )));
+        }
+
+        let new_order = compute_new_phase_order(&phases, args.after_phase.as_deref())
+            .map_err(|e| invalid_msg(e.to_string()))?;
+
+        let mut project_gate = project.clone();
+        project_gate.updated_at = now_utc();
+        self.store
+            .put_project(&project_gate, Some(project_version))
+            .await?;
+
+        self.store.shift_phases(&args.project, new_order).await?;
+
+        let now = now_utc();
+        let phase = Phase {
+            id: new_id("phs"),
+            project: project.id,
+            slug: args.slug.clone(),
+            title: args.title.clone(),
+            body: args.body.clone(),
+            order: new_order,
+            status: PhaseStatus::Pending,
+            created_at: now,
+            updated_at: now,
+            created_by: args.actor.clone(),
+            owner: args.owner.clone(),
+        };
+        self.store.put_phase(&phase, None).await?;
+        Ok(phase)
+    }
+
+    /// Service-layer `phase.update` — CAS on the phase object.
+    pub async fn update_phase(&self, args: UpdatePhase) -> Result<Phase, StoreError> {
+        if args.project.is_empty() || args.slug.is_empty() {
+            return Err(invalid_msg("project and slug are required"));
+        }
+        let Versioned {
+            value: mut phase,
+            version,
+        } = match self.store.get_phase(&args.project, &args.slug).await {
+            Ok(v) => v,
+            Err(StoreError::NotFound) => {
+                return Err(invalid_msg(format!(
+                    "phase not found: {}/{}",
+                    args.project, args.slug
+                )));
+            }
+            Err(e) => return Err(e),
+        };
+        if let Some(title) = args.title {
+            phase.title = title;
+        }
+        if let Some(body) = args.body {
+            phase.body = body;
+        }
+        if let Some(status) = args.status {
+            phase.status = status;
+        }
+        if let Some(owner) = args.owner {
+            if owner.is_empty() {
+                return Err(invalid_msg("owner must not be empty"));
+            }
+            phase.owner = owner;
+        }
+        phase.updated_at = now_utc();
+        self.store.put_phase(&phase, Some(version)).await?;
+        Ok(phase)
+    }
+
+    /// Service-layer `artifact.link` — validates inputs, idempotent on (task, kind, ref).
+    pub async fn link_artifact(&self, args: LinkArtifact) -> Result<Artifact, StoreError> {
+        if args.actor.is_empty() {
+            return Err(invalid_msg("actor is required to link an artifact"));
+        }
+        if args.project.is_empty() {
+            return Err(invalid_msg("project is required"));
+        }
+        if args.kind.is_empty() {
+            return Err(invalid_msg("kind is required"));
+        }
+        if args.reference.is_empty() {
+            return Err(invalid_msg("ref is required"));
+        }
+        if args.label.is_empty() {
+            return Err(invalid_msg("label is required"));
+        }
+        for (field, value) in [
+            ("kind", &args.kind),
+            ("ref", &args.reference),
+            ("label", &args.label),
+            ("actor", &args.actor),
+        ] {
+            validate_single_line(field, value).map_err(|e| domain_err(&e))?;
+        }
+
+        let Versioned { value: project, .. } = match self.store.get_project(&args.project).await {
+            Ok(v) => v,
+            Err(StoreError::NotFound) => {
+                return Err(invalid_msg(format!("project not found: {}", args.project)));
+            }
+            Err(e) => return Err(e),
+        };
+
+        let task_id = match &args.task {
+            Some(task_id) if task_id.is_empty() => {
+                return Err(invalid_msg(
+                    "task is empty (omit the field entirely for a project-wide artifact)",
+                ));
+            }
+            Some(task_id) => {
+                let tasks = self
+                    .store
+                    .list_tasks(TaskListFilter {
+                        project: Some(args.project.clone()),
+                        ..Default::default()
+                    })
+                    .await?;
+                if !tasks.iter().any(|t| t.value.id == *task_id) {
+                    return Err(invalid_msg(format!(
+                        "task {task_id} not found in project {}",
+                        args.project
+                    )));
+                }
+                task_id.clone()
+            }
+            None => String::new(),
+        };
+
+        let existing = self
+            .store
+            .list_artifacts(ArtifactListFilter {
+                project: args.project.clone(),
+            })
+            .await?;
+        if let Some(artifact) = existing
+            .iter()
+            .find(|a| a.task == task_id && a.kind == args.kind && a.reference == args.reference)
+        {
+            return Ok(artifact.clone());
+        }
+
+        let now = now_utc();
+        let artifact = Artifact {
+            id: new_id("art"),
+            project: project.id,
+            task: task_id,
+            kind: args.kind,
+            reference: args.reference,
+            label: args.label,
+            linked_at: now,
+            actor: args.actor,
+        };
+        self.store.put_artifact(&artifact).await?;
+        Ok(artifact)
+    }
 }
 
 /// Substrings matching `bail!` / validation messages in `store.rs`, lowercased
@@ -1503,28 +1758,22 @@ fn store_err(err: StoreError) -> ErrorData {
     }
 }
 
-/// Classify `anyhow` errors from [`FsStore`] into MCP request validation vs
-/// server faults by matching substrings from the error chain against the
-/// `bail!` messages in `store.rs`.
-///
-/// `map_err` hands the error to its callback by value — same rationale as
-/// [`internal`].
+/// Classify `anyhow` errors from store-layer failures into MCP request validation vs
+/// server faults by matching substrings from the error chain.
+#[cfg(test)]
 #[allow(clippy::needless_pass_by_value)]
 fn internal_or_invalid(err: AnyhowError) -> ErrorData {
     let msg = err.to_string();
-    let chain = error_chain_text(&err);
-    if is_user_domain_error(&chain) {
+    let chain = err
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if is_user_domain_error(&chain.to_lowercase()) {
         ErrorData::invalid_params(msg, None)
     } else {
         ErrorData::internal_error(msg, None)
     }
-}
-
-fn error_chain_text(err: &AnyhowError) -> String {
-    err.chain()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn is_user_domain_error(chain: &str) -> bool {
@@ -1569,15 +1818,14 @@ mod tests {
         FsStore::open(tmp).expect("open seed store")
     }
 
-    fn seed_project(store: &FsStore, slug: &str) -> Project {
-        store
-            .create_project(NewProject {
-                slug: slug.to_owned(),
-                title: format!("Project {slug}"),
-                description: String::new(),
-                actor: "human:test".to_owned(),
-            })
-            .expect("seed project")
+    fn seed_project(svc: &MeshService, slug: &str) -> Project {
+        block_on(svc.create_project(NewProject {
+            slug: slug.to_owned(),
+            title: format!("Project {slug}"),
+            description: String::new(),
+            actor: "human:test".to_owned(),
+        }))
+        .expect("seed project")
     }
 
     fn seed_task(svc: &MeshService, project: &str, slug: &str) -> Task {
@@ -2051,36 +2299,33 @@ mod tests {
     fn search_filters_in_temp_corpus() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(tmp.path().join(".dossier")).expect("mkdir .dossier");
-        let store = seed_store(tmp.path());
+        let _store = seed_store(tmp.path());
         let svc = MeshService::new(FsStore::open(tmp.path()).expect("open service store"));
 
-        store
-            .create_project(NewProject {
-                slug: "alpha".to_owned(),
-                title: "alpha needle project".to_owned(),
-                description: "needle".to_owned(),
-                actor: "t".to_owned(),
-            })
-            .unwrap();
-        store
-            .create_project(NewProject {
-                slug: "beta".to_owned(),
-                title: "beta needle project".to_owned(),
-                description: "needle".to_owned(),
-                actor: "t".to_owned(),
-            })
-            .unwrap();
-        store
-            .add_phase(&NewPhase {
-                project: "alpha".to_owned(),
-                slug: "ph".to_owned(),
-                title: "phase has needle".to_owned(),
-                body: String::new(),
-                after_phase: None,
-                actor: "t".to_owned(),
-                owner: "human:test".to_owned(),
-            })
-            .unwrap();
+        block_on(svc.create_project(NewProject {
+            slug: "alpha".to_owned(),
+            title: "alpha needle project".to_owned(),
+            description: "needle".to_owned(),
+            actor: "t".to_owned(),
+        }))
+        .expect("seed alpha project");
+        block_on(svc.create_project(NewProject {
+            slug: "beta".to_owned(),
+            title: "beta needle project".to_owned(),
+            description: "needle".to_owned(),
+            actor: "t".to_owned(),
+        }))
+        .expect("seed beta project");
+        block_on(svc.add_phase(&NewPhase {
+            project: "alpha".to_owned(),
+            slug: "ph".to_owned(),
+            title: "phase has needle".to_owned(),
+            body: String::new(),
+            after_phase: None,
+            actor: "t".to_owned(),
+            owner: "human:test".to_owned(),
+        }))
+        .expect("seed alpha phase");
         block_on(svc.create_task(NewTask {
             project: "alpha".to_owned(),
             phase: None,
@@ -2154,28 +2399,26 @@ mod tests {
     fn search_title_and_body_hits_in_temp_corpus() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(tmp.path().join(".dossier")).expect("mkdir .dossier");
-        let store = seed_store(tmp.path());
+        let _store = seed_store(tmp.path());
         let svc = MeshService::new(FsStore::open(tmp.path()).expect("open service store"));
 
-        store
-            .create_project(NewProject {
-                slug: "p1".to_owned(),
-                title: "TITLEKEY-alpha project".to_owned(),
-                description: "minimal".to_owned(),
-                actor: "t".to_owned(),
-            })
-            .unwrap();
-        store
-            .add_phase(&NewPhase {
-                project: "p1".to_owned(),
-                slug: "ph1".to_owned(),
-                title: "TITLEKEY-beta phase".to_owned(),
-                body: "body has BODYKEY-gamma token".to_owned(),
-                after_phase: None,
-                actor: "t".to_owned(),
-                owner: "human:test".to_owned(),
-            })
-            .unwrap();
+        block_on(svc.create_project(NewProject {
+            slug: "p1".to_owned(),
+            title: "TITLEKEY-alpha project".to_owned(),
+            description: "minimal".to_owned(),
+            actor: "t".to_owned(),
+        }))
+        .expect("seed project");
+        block_on(svc.add_phase(&NewPhase {
+            project: "p1".to_owned(),
+            slug: "ph1".to_owned(),
+            title: "TITLEKEY-beta phase".to_owned(),
+            body: "body has BODYKEY-gamma token".to_owned(),
+            after_phase: None,
+            actor: "t".to_owned(),
+            owner: "human:test".to_owned(),
+        }))
+        .expect("seed phase");
         block_on(svc.create_task(NewTask {
             project: "p1".to_owned(),
             phase: Some("ph1".to_owned()),
@@ -2252,9 +2495,9 @@ mod tests {
     fn search_ranks_higher_score_before_lower() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(tmp.path().join(".dossier")).expect("mkdir .dossier");
-        let store = seed_store(tmp.path());
+        let _store = seed_store(tmp.path());
         let svc = MeshService::new(FsStore::open(tmp.path()).expect("open service store"));
-        seed_project(&store, "alpha");
+        seed_project(&svc, "alpha");
         let a = seed_task(&svc, "alpha", "one-match");
         let b = seed_task(&svc, "alpha", "triple");
         set_task_body(tmp.path(), &a, "needleonce");
@@ -2278,9 +2521,9 @@ mod tests {
     fn search_tiebreaks_by_updated_at_desc() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(tmp.path().join(".dossier")).expect("mkdir .dossier");
-        let store = seed_store(tmp.path());
+        let _store = seed_store(tmp.path());
         let svc = MeshService::new(FsStore::open(tmp.path()).expect("open service store"));
-        seed_project(&store, "alpha");
+        seed_project(&svc, "alpha");
         let a = seed_task(&svc, "alpha", "oldhit");
         let b = seed_task(&svc, "alpha", "newhit");
         set_task_body(tmp.path(), &a, "sameneedle");
@@ -2305,9 +2548,9 @@ mod tests {
     fn search_limit_after_sort() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(tmp.path().join(".dossier")).expect("mkdir .dossier");
-        let store = seed_store(tmp.path());
+        let _store = seed_store(tmp.path());
         let svc = MeshService::new(FsStore::open(tmp.path()).expect("open service store"));
-        seed_project(&store, "alpha");
+        seed_project(&svc, "alpha");
         for i in 0..5 {
             let slug = format!("t{i}");
             let task = seed_task(&svc, "alpha", &slug);
@@ -2337,9 +2580,9 @@ mod tests {
     fn search_notes_section_not_indexed() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(tmp.path().join(".dossier")).expect("mkdir .dossier");
-        let store = seed_store(tmp.path());
+        let _store = seed_store(tmp.path());
         let svc = MeshService::new(FsStore::open(tmp.path()).expect("open service store"));
-        seed_project(&store, "alpha");
+        seed_project(&svc, "alpha");
         let task = seed_task(&svc, "alpha", "n");
         set_task_body(tmp.path(), &task, "spec has no secret");
         block_on(svc.update_task(UpdateTask {
@@ -2821,9 +3064,8 @@ mod tests {
     fn create_task_persists_depends_on() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(tmp.path().join(".dossier")).expect("mkdir .dossier");
-        let store = seed_store(tmp.path());
-        seed_project(&store, "alpha");
         let svc = MeshService::new(FsStore::open(tmp.path()).expect("open service store"));
+        seed_project(&svc, "alpha");
 
         let created = block_on(svc.create_task(NewTask {
             project: "alpha".to_owned(),
@@ -2865,9 +3107,8 @@ mod tests {
     fn update_task_replaces_depends_on() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(tmp.path().join(".dossier")).expect("mkdir .dossier");
-        let store = seed_store(tmp.path());
-        seed_project(&store, "alpha");
         let svc = MeshService::new(FsStore::open(tmp.path()).expect("open service store"));
+        seed_project(&svc, "alpha");
         let task = block_on(svc.create_task(NewTask {
             project: "alpha".to_owned(),
             phase: None,
@@ -2896,9 +3137,8 @@ mod tests {
     fn update_task_clears_depends_on_with_empty_list() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(tmp.path().join(".dossier")).expect("mkdir .dossier");
-        let store = seed_store(tmp.path());
-        seed_project(&store, "alpha");
         let svc = MeshService::new(FsStore::open(tmp.path()).expect("open service store"));
+        seed_project(&svc, "alpha");
         let task = block_on(svc.create_task(NewTask {
             project: "alpha".to_owned(),
             phase: None,
@@ -2927,9 +3167,8 @@ mod tests {
     fn update_task_leaves_depends_on_when_none() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(tmp.path().join(".dossier")).expect("mkdir .dossier");
-        let store = seed_store(tmp.path());
-        seed_project(&store, "alpha");
         let svc = MeshService::new(FsStore::open(tmp.path()).expect("open service store"));
+        seed_project(&svc, "alpha");
         let task = block_on(svc.create_task(NewTask {
             project: "alpha".to_owned(),
             phase: None,
@@ -2964,9 +3203,8 @@ mod tests {
         for _ in 0..8 {
             let tmp = tempfile::tempdir().expect("tempdir");
             std::fs::create_dir_all(tmp.path().join(".dossier")).expect("mkdir .dossier");
-            let store = seed_store(tmp.path());
-            seed_project(&store, "race");
             let svc = MeshService::new(FsStore::open(tmp.path()).expect("open race corpus"));
+            seed_project(&svc, "race");
             let task = seed_task(&svc, "race", "target");
 
             block_on(svc.claim_task(&ClaimTask {
@@ -2992,15 +3230,13 @@ mod tests {
 
     #[test]
     fn create_task_cas_slug_one_winner_one_terminal() {
-        use crate::domain::TaskListFilter;
         use crate::store::StoreError;
 
         for _ in 0..8 {
             let tmp = tempfile::tempdir().expect("tempdir");
             std::fs::create_dir_all(tmp.path().join(".dossier")).expect("mkdir .dossier");
-            let store = seed_store(tmp.path());
-            seed_project(&store, "race");
             let svc = MeshService::new(FsStore::open(tmp.path()).expect("open race corpus"));
+            seed_project(&svc, "race");
             let args = NewTask {
                 project: "race".to_owned(),
                 phase: None,
@@ -3021,17 +3257,157 @@ mod tests {
                 "unexpected terminal message: {msg}"
             );
 
-            let listed = store
-                .list_tasks(&TaskListFilter {
-                    project: Some("race".to_owned()),
-                    ..Default::default()
-                })
-                .expect("list tasks");
+            let Json(listed) = block_on(svc.task_list(Parameters(TaskListArgs {
+                project: Some("race".to_owned()),
+                ..Default::default()
+            })))
+            .expect("list tasks");
             assert_eq!(
-                listed.iter().filter(|t| t.slug == "dupe").count(),
+                listed.tasks.iter().filter(|t| t.slug == "dupe").count(),
                 1,
                 "project must hold exactly one task with slug dupe"
             );
         }
+    }
+
+    fn add_phase_simple(svc: &MeshService, project: &str, slug: &str) -> Phase {
+        block_on(svc.add_phase(&NewPhase {
+            project: project.to_owned(),
+            slug: slug.to_owned(),
+            title: slug.to_owned(),
+            body: String::new(),
+            after_phase: None,
+            actor: "human:test".to_owned(),
+            owner: "human:test".to_owned(),
+        }))
+        .expect("add phase")
+    }
+
+    #[test]
+    fn add_phase_inserts_after_and_shifts_without_orphans() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".dossier")).expect("mkdir .dossier");
+        let svc = MeshService::new(FsStore::open(tmp.path()).expect("open corpus"));
+        seed_project(&svc, "alpha");
+        add_phase_simple(&svc, "alpha", "spec");
+        add_phase_simple(&svc, "alpha", "build");
+        add_phase_simple(&svc, "alpha", "ship");
+
+        let inserted = block_on(svc.add_phase(&NewPhase {
+            project: "alpha".to_owned(),
+            slug: "design".to_owned(),
+            title: "design".to_owned(),
+            body: String::new(),
+            after_phase: Some("spec".to_owned()),
+            actor: "human:test".to_owned(),
+            owner: "human:test".to_owned(),
+        }))
+        .expect("insert after spec");
+        assert_eq!(inserted.order, 2);
+
+        let phases_dir = tmp.path().join("projects").join("alpha").join("phases");
+        let mut names: Vec<String> = std::fs::read_dir(&phases_dir)
+            .expect("read phases dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "01-spec.md".to_owned(),
+                "02-design.md".to_owned(),
+                "03-build.md".to_owned(),
+                "04-ship.md".to_owned(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn add_phase_cas_race_two_independent_writers() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".dossier")).expect("mkdir .dossier");
+        let path = tmp.path();
+
+        let svc_a = MeshService::new(FsStore::open(path).expect("writer a"));
+        svc_a
+            .create_project(NewProject {
+                slug: "race".to_owned(),
+                title: "Race".to_owned(),
+                description: String::new(),
+                actor: "human:test".to_owned(),
+            })
+            .await
+            .expect("create project");
+        let svc_b = MeshService::new(FsStore::open(path).expect("writer b"));
+
+        let args_a = NewPhase {
+            project: "race".to_owned(),
+            slug: "phase-a".to_owned(),
+            title: "Phase A".to_owned(),
+            body: String::new(),
+            after_phase: None,
+            actor: "human:test".to_owned(),
+            owner: "human:test".to_owned(),
+        };
+        let args_b = NewPhase {
+            project: "race".to_owned(),
+            slug: "phase-b".to_owned(),
+            title: "Phase B".to_owned(),
+            body: String::new(),
+            after_phase: None,
+            actor: "human:test".to_owned(),
+            owner: "human:test".to_owned(),
+        };
+
+        let phase_a = svc_a.add_phase(&args_a).await.expect("writer a lands");
+        assert_eq!(phase_a.order, 1);
+
+        let phase_b = svc_b
+            .add_phase(&args_b)
+            .await
+            .expect("writer b retry lands");
+        assert_eq!(phase_b.order, 2);
+        assert_ne!(phase_a.order, phase_b.order);
+    }
+
+    #[tokio::test]
+    async fn add_phase_cas_project_gate_conflict_then_retry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".dossier")).expect("mkdir .dossier");
+        let svc = MeshService::new(FsStore::open(tmp.path()).expect("open corpus"));
+        svc.create_project(NewProject {
+            slug: "cas".to_owned(),
+            title: "CAS".to_owned(),
+            description: String::new(),
+            actor: "human:test".to_owned(),
+        })
+        .await
+        .expect("create");
+
+        let phase_a = svc
+            .add_phase(&NewPhase {
+                project: "cas".to_owned(),
+                slug: "a".to_owned(),
+                title: "A".to_owned(),
+                body: String::new(),
+                after_phase: None,
+                actor: "human:test".to_owned(),
+                owner: "human:test".to_owned(),
+            })
+            .await
+            .expect("add a");
+        let phase_b = svc
+            .add_phase(&NewPhase {
+                project: "cas".to_owned(),
+                slug: "b".to_owned(),
+                title: "B".to_owned(),
+                body: String::new(),
+                after_phase: None,
+                actor: "human:test".to_owned(),
+                owner: "human:test".to_owned(),
+            })
+            .await
+            .expect("add b");
+        assert_ne!(phase_a.order, phase_b.order);
     }
 }
