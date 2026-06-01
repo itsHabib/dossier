@@ -383,7 +383,6 @@ impl Store for FsStore {
     async fn shift_phases(&self, project: &str, from_order: i32) -> Result<(), StoreError> {
         let project_dir = self.project_dir(project).map_err(store_invalid)?;
         let phases_dir = project_dir.join("phases");
-        fs::create_dir_all(&phases_dir).map_err(StoreError::Io)?;
 
         let mut existing = self.load_phases_for(project).map_err(store_invalid)?;
         existing.sort_by_key(|p| std::cmp::Reverse(p.order));

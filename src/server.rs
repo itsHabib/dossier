@@ -1503,7 +1503,7 @@ impl MeshService {
                 Err(e) => return Err(e),
             }
         }
-        Err(StoreError::Conflict)
+        Err(invalid_msg("phase add failed: too many concurrent writers"))
     }
 
     async fn try_add_phase_once(&self, args: &NewPhase) -> Result<Phase, StoreError> {
@@ -1542,6 +1542,10 @@ impl MeshService {
             .put_project(&project_gate, Some(project_version))
             .await?;
 
+        // If put_phase (below) fails after shift_phases succeeds, existing phases
+        // are renumbered but new_order has no occupant until the next successful
+        // add. The write_lock prevents concurrent observation of the gap; a crash
+        // between the two leaves it until a later write reconciles.
         self.store.shift_phases(&args.project, new_order).await?;
 
         let now = now_utc();
