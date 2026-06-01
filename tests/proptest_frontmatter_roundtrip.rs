@@ -13,11 +13,11 @@
 )]
 
 use dossier::domain::{new_id, PhaseListFilter, TaskListFilter};
-use dossier::store::{NewPhase, NewProject, NewTask};
+use dossier::store::{FsStore, NewPhase, NewProject, NewTask};
 use proptest::prelude::*;
 
 mod common;
-use common::fresh_corpus;
+use common::{block_on, fresh_corpus, fresh_service};
 
 // ---------- generators ---------------------------------------------------
 
@@ -145,7 +145,8 @@ proptest! {
         dep_id in dep_id(),
     ) {
         prop_assume!(proj_slug != task_slug);
-        let (_tmp, store) = fresh_corpus();
+        let (tmp, svc) = fresh_service();
+        let store = FsStore::open(tmp.path()).expect("reopen");
         store
             .create_project(NewProject {
                 slug: proj_slug.clone(),
@@ -159,17 +160,16 @@ proptest! {
         } else {
             vec![]
         };
-        let created = store
-            .create_task(NewTask {
-                project: proj_slug.clone(),
-                phase: None,
-                slug: task_slug.clone(),
-                title: title.clone(),
-                body: body.clone(),
-                actor: "human:michael".into(),
-                depends_on: depends_on.clone(),
-            })
-            .expect("create_task");
+        let created = block_on(svc.create_task(NewTask {
+            project: proj_slug.clone(),
+            phase: None,
+            slug: task_slug.clone(),
+            title: title.clone(),
+            body: body.clone(),
+            actor: "human:michael".into(),
+            depends_on: depends_on.clone(),
+        }))
+        .expect("create_task");
         let tasks = store
             .list_tasks(&TaskListFilter {
                 project: Some(proj_slug),

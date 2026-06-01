@@ -113,7 +113,7 @@ pub struct Task {
 }
 
 /// One append-only entry in a task's `## Notes` section.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Note {
     pub actor: String,
     pub body: String,
@@ -558,6 +558,27 @@ pub fn apply_task_body_update(mut task: Task, body: String, now: DateTime<Utc>) 
     task.body = body;
     task.updated_at = now;
     Ok(task)
+}
+
+/// Append a single-line note to a task's in-memory note list. Rejects
+/// multi-line input and actor strings containing the note delimiter.
+pub fn append_task_note(task: &mut Task, at: DateTime<Utc>, actor: &str, body: &str) -> Result<()> {
+    if actor.contains(['\n', '\r']) || body.contains(['\n', '\r']) {
+        bail!("note must be single-line (no newline or carriage return)");
+    }
+    if actor.contains(": ") {
+        bail!("actor must not contain `: ` (reserved as the actor/body delimiter in note lines)");
+    }
+    let body_trimmed = body.trim();
+    if body_trimmed.is_empty() {
+        bail!("note body must not be empty");
+    }
+    task.notes.push(Note {
+        actor: actor.to_owned(),
+        body: body_trimmed.to_owned(),
+        posted_at: at,
+    });
+    Ok(())
 }
 
 /// Pure `task.complete` transition (status + timestamps only; notes stay
