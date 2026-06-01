@@ -10,17 +10,25 @@ use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+// Read-model types + write-verb DTOs — re-exported for callers that reach
+// them through the `store` namespace (backward compat).
+pub use crate::domain::{
+    Artifact, ClaimTask, CompleteTask, LinkArtifact, NewPhase, NewProject, NewTask, Phase,
+    PhaseListFilter, PhaseOrderField, PhaseStatus, Project, ProjectListFilter, ProjectOrderField,
+    ProjectStatus, Task, TaskListFilter, TaskOrderField, TaskStatus, UpdatePhase, UpdateProject,
+    UpdateTask,
+};
+// Pure policy — used internally by the delegating write methods. New code
+// imports these from `domain` directly, not through the mechanism layer.
+use crate::domain::{
+    apply_claim_task, apply_complete_task, apply_task_body_update, apply_task_status_update,
+    compute_new_phase_order, is_valid_slug, new_id, validate_single_line, validate_task_body,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use ulid::Ulid;
-
-use crate::domain::{
-    Artifact, Phase, PhaseListFilter, PhaseOrderField, PhaseStatus, Project, ProjectListFilter,
-    ProjectOrderField, ProjectStatus, Task, TaskListFilter, TaskOrderField, TaskStatus,
-};
 
 /// Opaque content version token — for `FsStore`, the SHA-256 hex digest of
 /// the object's raw on-disk bytes.
@@ -793,118 +801,10 @@ pub(crate) fn parse_task(raw: &str, project_slug: &str) -> Result<(Task, Vec<Str
 // Write side
 // =============================================================================
 
-/// Arguments for `FsStore::create_project`. Slug must be unique within
-/// the corpus.
-#[derive(Debug, Clone)]
-pub struct NewProject {
-    pub slug: String,
-    pub title: String,
-    pub description: String,
-    pub actor: String,
-}
-
-/// Arguments for `FsStore::update_project`. Slug is the addressing key;
-/// every other field is optional. `id`, `created_at`, and `slug` itself
-/// are immutable.
-#[derive(Debug, Clone, Default)]
-pub struct UpdateProject {
-    pub slug: String,
-    pub title: Option<String>,
-    pub description: Option<String>,
-    pub status: Option<ProjectStatus>,
-}
-
 /// Bounded retry budget for concurrent `phase.add` writers — enough to drain a
 /// burst of independent writers racing on one project; exhausting it signals
 /// pathological contention rather than normal load.
 const PHASE_ADD_MAX_RETRIES: u32 = 8;
-
-/// Arguments for `FsStore::add_phase`. Slug must be unique within the
-/// project. `after_phase` (also a slug) inserts in order; default appends.
-#[derive(Debug, Clone)]
-pub struct NewPhase {
-    pub project: String,
-    pub slug: String,
-    pub title: String,
-    pub body: String,
-    pub after_phase: Option<String>,
-    pub actor: String,
-    pub owner: String,
-}
-
-/// Arguments for `FsStore::update_phase`. (project, slug) is the
-/// addressing key. Order is managed via `add_phase` only — bulk reorder
-/// is out of scope for v0.
-#[derive(Debug, Clone, Default)]
-pub struct UpdatePhase {
-    pub project: String,
-    pub slug: String,
-    pub title: Option<String>,
-    pub body: Option<String>,
-    pub status: Option<PhaseStatus>,
-    pub owner: Option<String>,
-}
-
-/// Arguments for `FsStore::create_task`. Slug must be unique within the
-/// project. `phase` (optional, a slug) anchors the task to a phase;
-/// omit for project-wide tasks.
-#[derive(Debug, Clone)]
-pub struct NewTask {
-    pub project: String,
-    pub phase: Option<String>,
-    pub slug: String,
-    pub title: String,
-    pub body: String,
-    pub actor: String,
-    pub depends_on: Vec<String>,
-}
-
-/// Arguments for `FsStore::claim_task`. Same-actor re-claim on a
-/// non-terminal task is a no-op (no `updated_at` bump).
-#[derive(Debug, Clone)]
-pub struct ClaimTask {
-    pub id: String,
-    pub actor: String,
-}
-
-/// Arguments for `FsStore::update_task`.
-///
-/// `status=claimed` and `status=done` are rejected — use `claim_task`
-/// or `complete_task` instead. `note`, when supplied, appends a
-/// timestamped line to the task's `## Notes` section.
-#[derive(Debug, Clone, Default)]
-pub struct UpdateTask {
-    pub id: String,
-    pub body: Option<String>,
-    pub status: Option<TaskStatus>,
-    pub note: Option<String>,
-    pub actor: String,
-    pub depends_on: Option<Vec<String>>,
-}
-
-/// Arguments for `FsStore::complete_task`. Errors unless the task is in
-/// `InProgress`.
-#[derive(Debug, Clone)]
-pub struct CompleteTask {
-    pub id: String,
-    pub note: Option<String>,
-    pub actor: String,
-}
-
-/// Arguments for `FsStore::link_artifact`.
-///
-/// `task` is optional — omit for a project-wide artifact. `kind` is
-/// free-form (`commit`, `pr`, `file`, `url`, `run`, `doc`, or whatever
-/// else makes sense); unknown kinds round-trip untouched.
-#[derive(Debug, Clone)]
-pub struct LinkArtifact {
-    pub project: String,
-    pub task: Option<String>,
-    pub kind: String,
-    pub reference: String,
-    pub label: String,
-    pub actor: String,
-}
 
 impl FsStore {
     /// Create a new project on disk.
@@ -1026,18 +926,8 @@ impl FsStore {
             )));
         }
 
-        let new_order = match &args.after_phase {
-            Some(after_slug) => {
-                let after = existing
-                    .iter()
-                    .find(|p| &p.slug == after_slug)
-                    .ok_or_else(|| {
-                        StoreError::Invalid(format!("after_phase not found: {after_slug}"))
-                    })?;
-                after.order + 1
-            }
-            None => existing.iter().map(|p| p.order).max().unwrap_or(0) + 1,
-        };
+        let new_order = compute_new_phase_order(&existing, args.after_phase.as_deref())
+            .map_err(|e| StoreError::Invalid(e.to_string()))?;
 
         // Touch project.md (bump updated_at -> new version) under CAS: the gate that
         // makes two concurrent phase.add writers conflict instead of both computing the
@@ -1251,51 +1141,17 @@ impl FsStore {
     /// - Non-terminal status with `assignee == actor` → no-op return.
     /// - Different actor on a held task → error.
     /// - Terminal (`done` / `cancelled`) → error.
-    pub fn claim_task(&self, args: ClaimTask) -> Result<Task> {
-        if args.actor.is_empty() {
-            bail!("actor is required to claim a task");
-        }
+    pub fn claim_task(&self, args: &ClaimTask) -> Result<Task> {
         let (project_slug, path) = self.find_task_path(&args.id)?;
         let (task, notes_lines) = load_task_with_notes(&path, &project_slug)?;
-
-        if matches!(task.status, TaskStatus::Done | TaskStatus::Cancelled) {
-            bail!(
-                "cannot claim task in terminal state: {}",
-                task_status_str(task.status)
-            );
-        }
-        // Surface corrupt frontmatter combinations up front, regardless of
-        // who is asking — claim sets both fields atomically, so `Todo` with
-        // an assignee or a held state with an empty assignee is structural
-        // damage, not a routing decision.
-        if matches!(task.status, TaskStatus::Todo) && !task.assignee.is_empty() {
-            bail!(
-                "task in todo has assignee {} (corrupt state)",
-                task.assignee
-            );
-        }
-        if !matches!(task.status, TaskStatus::Todo) && task.assignee.is_empty() {
-            bail!(
-                "task in state {} has no assignee (corrupt state)",
-                task_status_str(task.status)
-            );
-        }
-        // Same-actor re-claim on a held state is a no-op.
-        if task.assignee == args.actor {
+        let prior_updated_at = task.updated_at;
+        let task = apply_claim_task(task, &args.actor, now_utc())?;
+        // Same-actor re-claim is a documented no-op: apply_claim_task leaves
+        // updated_at untouched, so skip the rewrite. Re-serializing in place
+        // would bump the file's mtime and storage version for no state change.
+        if task.updated_at == prior_updated_at {
             return Ok(task);
         }
-        // Different actor on a held task.
-        if !task.assignee.is_empty() {
-            bail!("task already claimed by {}", task.assignee);
-        }
-
-        let now = now_utc();
-        let mut task = task;
-        task.assignee = args.actor;
-        task.status = TaskStatus::Claimed;
-        task.claimed_at = Some(now);
-        task.updated_at = now;
-
         let content = serialize_task_file(&task, &notes_lines)?;
         write_atomic(&path, content.as_bytes())?;
         Ok(task)
@@ -1313,21 +1169,22 @@ impl FsStore {
         let (project_slug, path) = self.find_task_path(&args.id)?;
         let (mut task, mut notes_lines) = load_task_with_notes(&path, &project_slug)?;
 
+        let now = now_utc();
         if let Some(target) = args.status {
-            validate_task_update_transition(task.status, target)?;
-            task.status = target;
+            task = apply_task_status_update(task, target, now)?;
         }
         if let Some(body) = args.body {
-            validate_task_body(&body)?;
-            task.body = body;
+            task = apply_task_body_update(task, body, now)?;
         }
         if let Some(depends_on) = args.depends_on {
             task.depends_on = depends_on;
         }
-        let now = now_utc();
         if let Some(note) = args.note {
             append_note(&mut task, &mut notes_lines, now, &args.actor, &note)?;
         }
+        // Catch-all for depends_on / note-only updates: the apply_* fns stamp
+        // updated_at when they run, but a bare depends_on or note change does
+        // not go through them.
         task.updated_at = now;
 
         let content = serialize_task_file(&task, &notes_lines)?;
@@ -1346,17 +1203,8 @@ impl FsStore {
         let (project_slug, path) = self.find_task_path(&args.id)?;
         let (mut task, mut notes_lines) = load_task_with_notes(&path, &project_slug)?;
 
-        if !matches!(task.status, TaskStatus::InProgress) {
-            bail!(
-                "task must be in_progress to complete (got {})",
-                task_status_str(task.status)
-            );
-        }
-
         let now = now_utc();
-        task.status = TaskStatus::Done;
-        task.completed_at = Some(now);
-        task.updated_at = now;
+        task = apply_complete_task(task, now)?;
         if let Some(note) = args.note {
             append_note(&mut task, &mut notes_lines, now, &args.actor, &note)?;
         }
@@ -1468,9 +1316,7 @@ impl FsStore {
             ("label", &args.label),
             ("actor", &args.actor),
         ] {
-            if value.contains(['\n', '\r']) {
-                bail!("{field} must be single-line (no newline or carriage return)");
-            }
+            validate_single_line(field, value)?;
         }
 
         let project_dir = self.project_dir(&args.project)?;
@@ -1565,62 +1411,6 @@ pub(crate) fn phase_filename(order: i32, slug: &str) -> String {
     format!("{order:02}-{slug}.md")
 }
 
-/// Snake-case wire name for a status, for error messages that need to
-/// match the JSON enum form rather than the Rust `Debug` `PascalCase`.
-const fn task_status_str(s: TaskStatus) -> &'static str {
-    match s {
-        TaskStatus::Todo => "todo",
-        TaskStatus::Claimed => "claimed",
-        TaskStatus::InProgress => "in_progress",
-        TaskStatus::Blocked => "blocked",
-        TaskStatus::Done => "done",
-        TaskStatus::Cancelled => "cancelled",
-    }
-}
-
-/// Guard the subset of transitions reachable via `task.update`. The
-/// `claimed` and `done` targets are sole-property of `task.claim` and
-/// `task.complete` respectively; terminal states accept nothing.
-fn validate_task_update_transition(from: TaskStatus, to: TaskStatus) -> Result<()> {
-    // Order matters. claimed/done targets are owned by task.claim and
-    // task.complete; terminal sources reject *every* status write
-    // (including idempotent same-state). Both gates must fire before
-    // the `from == to` no-op short-circuit.
-    if matches!(to, TaskStatus::Claimed) {
-        bail!("use task.claim to transition into claimed");
-    }
-    if matches!(to, TaskStatus::Done) {
-        bail!("use task.complete to transition into done");
-    }
-    if matches!(from, TaskStatus::Done | TaskStatus::Cancelled) {
-        bail!(
-            "task is in a terminal state ({}); transitions are not allowed",
-            task_status_str(from)
-        );
-    }
-    if from == to {
-        return Ok(());
-    }
-    let allowed = matches!(
-        (from, to),
-        (
-            TaskStatus::Todo | TaskStatus::Claimed | TaskStatus::InProgress | TaskStatus::Blocked,
-            TaskStatus::Cancelled,
-        ) | (
-            TaskStatus::Claimed | TaskStatus::Blocked,
-            TaskStatus::InProgress
-        ) | (TaskStatus::InProgress, TaskStatus::Blocked)
-    );
-    if !allowed {
-        bail!(
-            "invalid task transition: {} -> {}",
-            task_status_str(from),
-            task_status_str(to)
-        );
-    }
-    Ok(())
-}
-
 /// Format a single Notes line: `- <RFC3339> — <actor>: <body>`.
 fn format_note_line(at: DateTime<Utc>, actor: &str, body: &str) -> String {
     use chrono::SecondsFormat;
@@ -1630,18 +1420,6 @@ fn format_note_line(at: DateTime<Utc>, actor: &str, body: &str) -> String {
         actor,
         body
     )
-}
-
-/// Reject task body content that would collide with the `## Notes`
-/// section delimiter on the next read. `split_task_body` consumes the
-/// first line that trims to exactly `## Notes` as the boundary, so a
-/// body containing one would silently re-partition on round-trip and
-/// drop content out of `body` into `notes`.
-fn validate_task_body(body: &str) -> Result<()> {
-    if body.lines().any(|l| l.trim() == "## Notes") {
-        bail!("task body must not contain a `## Notes` heading (reserved as the notes-section delimiter; use a different heading like `### Notes`)");
-    }
-    Ok(())
 }
 
 /// Append a note to both the on-disk lines and the in-memory `Task`
@@ -1716,26 +1494,10 @@ pub fn append_jsonl(path: &Path, line: &str) -> Result<()> {
     write_result.and(unlock_result)
 }
 
-/// Generate a new prefixed ULID. Type prefix matches `LAYOUT.md`
-/// conventions: `prj_`, `phs_`, `tsk_`, `art_`.
-pub fn new_id(prefix: &str) -> String {
-    format!("{prefix}_{}", Ulid::new())
-}
-
 /// Current UTC timestamp. Wrapper for testability — callers that want
 /// deterministic time can stub at the boundary.
 pub fn now_utc() -> DateTime<Utc> {
     Utc::now()
-}
-
-/// Slugs are lowercase ASCII with `-` and `_` allowed. Keeps
-/// cross-platform filesystem behavior predictable (case-sensitivity
-/// differs between NTFS, APFS, ext4).
-pub(crate) fn is_valid_slug(slug: &str) -> bool {
-    !slug.is_empty()
-        && slug
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
 }
 
 #[derive(Serialize)]
@@ -2982,7 +2744,7 @@ created_by: human:test
 
     fn claim(store: &FsStore, id: &str, actor: &str) -> Task {
         store
-            .claim_task(ClaimTask {
+            .claim_task(&ClaimTask {
                 id: id.to_owned(),
                 actor: actor.to_owned(),
             })
@@ -3440,6 +3202,9 @@ updated_at: 2026-05-10T14:30:00Z
         let task = seed_task(&store, "alpha", "write-protocol");
         let first = claim(&store, &task.id, "ship");
 
+        let (_proj, path) = store.find_task_path(&task.id).unwrap();
+        let mtime_before = fs::metadata(&path).unwrap().modified().unwrap();
+
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         let second = claim(&store, &task.id, "ship");
@@ -3449,6 +3214,12 @@ updated_at: 2026-05-10T14:30:00Z
         );
         assert_eq!(second.claimed_at, first.claimed_at, "claimed_at preserved");
         assert_eq!(second.assignee, "ship");
+
+        let mtime_after = fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(
+            mtime_before, mtime_after,
+            "no-op re-claim must not rewrite the task file"
+        );
     }
 
     #[test]
@@ -3459,7 +3230,7 @@ updated_at: 2026-05-10T14:30:00Z
         claim(&store, &task.id, "ship");
 
         let err = store
-            .claim_task(ClaimTask {
+            .claim_task(&ClaimTask {
                 id: task.id,
                 actor: "claude-code:michael".to_owned(),
             })
@@ -3485,7 +3256,7 @@ updated_at: 2026-05-10T14:30:00Z
             .unwrap();
 
         let err = store
-            .claim_task(ClaimTask {
+            .claim_task(&ClaimTask {
                 id: task.id,
                 actor: "ship".to_owned(),
             })
@@ -3912,7 +3683,7 @@ updated_at: 2026-05-10T14:30:00Z
         fs::write(&path, injected).unwrap();
 
         let err = store
-            .claim_task(ClaimTask {
+            .claim_task(&ClaimTask {
                 id: task.id,
                 actor: "ship".to_owned(),
             })
@@ -3984,7 +3755,7 @@ updated_at: 2026-05-10T14:30:00Z
         fs::write(&path, injected).unwrap();
 
         let err = store
-            .claim_task(ClaimTask {
+            .claim_task(&ClaimTask {
                 id: task.id,
                 actor: "different-actor".to_owned(),
             })

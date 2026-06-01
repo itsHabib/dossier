@@ -11,13 +11,14 @@ use futures::stream::{self, StreamExt};
 use futures::TryStreamExt;
 
 use crate::domain::{
-    Artifact, Phase, PhaseListFilter, Project, ProjectListFilter, Task, TaskListFilter,
+    is_valid_slug, Artifact, Phase, PhaseListFilter, Project, ProjectListFilter, Task,
+    TaskListFilter,
 };
 use crate::store::{
-    is_valid_slug, notes_lines_for_task, parse_phase, parse_project, parse_task, phase_filename,
-    phase_matches, project_matches, serialize_phase_file, serialize_project_file,
-    serialize_task_file, sort_phases, sort_projects, sort_tasks, task_filename, task_matches,
-    ArtifactListFilter, Store, StoreError, Version, Versioned,
+    notes_lines_for_task, parse_phase, parse_project, parse_task, phase_filename, phase_matches,
+    project_matches, serialize_phase_file, serialize_project_file, serialize_task_file,
+    sort_phases, sort_projects, sort_tasks, task_filename, task_matches, ArtifactListFilter, Store,
+    StoreError, Version, Versioned,
 };
 
 const LIST_CONCURRENCY: usize = 16;

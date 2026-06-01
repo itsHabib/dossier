@@ -66,7 +66,7 @@ fn seed_task(store: &FsStore, project: &str, slug: &str) -> Task {
 
 fn advance_to_in_progress(store: &FsStore, id: &str) {
     store
-        .claim_task(ClaimTask {
+        .claim_task(&ClaimTask {
             id: id.to_owned(),
             actor: "human:test".to_owned(),
         })

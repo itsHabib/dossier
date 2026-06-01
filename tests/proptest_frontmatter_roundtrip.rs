@@ -12,8 +12,8 @@
     reason = "test module"
 )]
 
-use dossier::domain::{PhaseListFilter, TaskListFilter};
-use dossier::store::{new_id, NewPhase, NewProject, NewTask};
+use dossier::domain::{new_id, PhaseListFilter, TaskListFilter};
+use dossier::store::{NewPhase, NewProject, NewTask};
 use proptest::prelude::*;
 
 mod common;
