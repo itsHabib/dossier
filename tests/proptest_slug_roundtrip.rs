@@ -15,7 +15,7 @@ use dossier::store::{FsStore, NewPhase, NewProject, NewTask};
 use proptest::prelude::*;
 
 mod common;
-use common::{block_on, fresh_corpus, fresh_service};
+use common::{add_phase, block_on, create_project, fresh_service};
 
 /// Oracle predicate mirroring `is_valid_slug` in src/store.rs. Replicated
 /// here so the property test catches divergence — if the production
@@ -50,18 +50,19 @@ proptest! {
     /// returned project's slug must equal the input verbatim.
     #[test]
     fn project_create_round_trips_valid_slug(slug in valid_slug_strategy()) {
-        let (_tmp, store) = fresh_corpus();
-        let project = store
-            .create_project(NewProject {
+        let (tmp, svc) = fresh_service();
+        let project = create_project(
+            &svc,
+            NewProject {
                 slug: slug.clone(),
                 title: "T".into(),
                 description: String::new(),
                 actor: "human:michael".into(),
-            })
-            .expect("create_project on valid slug");
+            },
+        );
         prop_assert_eq!(&project.slug, &slug);
 
-        // get_project by the same slug returns the same record.
+        let store = FsStore::open(tmp.path()).expect("reopen");
         let fetched = store.get_project(&slug).expect("get_project");
         prop_assert_eq!(&fetched.slug, &slug);
     }
@@ -81,17 +82,18 @@ proptest! {
         prop_assume!(proj_slug != phase_slug && proj_slug != task_slug && phase_slug != task_slug);
 
         let (tmp, svc) = fresh_service();
-        let store = FsStore::open(tmp.path()).expect("reopen");
-        store
-            .create_project(NewProject {
+        create_project(
+            &svc,
+            NewProject {
                 slug: proj_slug.clone(),
                 title: "T".into(),
                 description: String::new(),
                 actor: "human:michael".into(),
-            })
-            .expect("create_project");
-        let phase = store
-            .add_phase(&NewPhase {
+            },
+        );
+        let phase = add_phase(
+            &svc,
+            &NewPhase {
                 project: proj_slug.clone(),
                 slug: phase_slug.clone(),
                 title: "P".into(),
@@ -99,9 +101,10 @@ proptest! {
                 after_phase: None,
                 actor: "human:michael".into(),
                 owner: "human:test".to_owned(),
-            })
-            .expect("add_phase on valid slug");
+            },
+        );
         prop_assert_eq!(phase.slug, phase_slug);
+        let _store = FsStore::open(tmp.path()).expect("reopen");
 
         let task = block_on(svc.create_task(NewTask {
             project: proj_slug,
@@ -123,13 +126,13 @@ proptest! {
     #[test]
     fn project_create_rejects_invalid_slug(s in arbitrary_string_strategy()) {
         prop_assume!(!looks_like_a_slug(&s));
-        let (_tmp, store) = fresh_corpus();
-        let result = store.create_project(NewProject {
+        let (_tmp, svc) = fresh_service();
+        let result = block_on(svc.create_project(NewProject {
             slug: s,
             title: "T".into(),
             description: String::new(),
             actor: "human:michael".into(),
-        });
+        }));
         prop_assert!(result.is_err());
     }
 
@@ -140,24 +143,25 @@ proptest! {
     #[test]
     fn phase_add_rejects_invalid_slug(s in arbitrary_string_strategy()) {
         prop_assume!(!looks_like_a_slug(&s));
-        let (_tmp, store) = fresh_corpus();
-        // Anchor project with a valid slug so the phase validation is
-        // the only thing being probed.
-        store.create_project(NewProject {
-            slug: "host".into(),
-            title: "T".into(),
-            description: String::new(),
-            actor: "human:michael".into(),
-        }).expect("create_project");
-        let result = store.add_phase(&NewPhase {
+        let (_tmp, svc) = fresh_service();
+        create_project(
+            &svc,
+            NewProject {
+                slug: "host".into(),
+                title: "T".into(),
+                description: String::new(),
+                actor: "human:michael".into(),
+            },
+        );
+        let result = block_on(svc.add_phase(&NewPhase {
             project: "host".into(),
             slug: s,
             title: "P".into(),
             body: String::new(),
             after_phase: None,
             actor: "human:michael".into(),
-                        owner: "human:test".to_owned(),
-        });
+            owner: "human:test".to_owned(),
+        }));
         prop_assert!(result.is_err());
     }
 
@@ -167,14 +171,16 @@ proptest! {
     #[test]
     fn task_create_rejects_invalid_slug(s in arbitrary_string_strategy()) {
         prop_assume!(!looks_like_a_slug(&s));
-        let (tmp, svc) = fresh_service();
-        let store = FsStore::open(tmp.path()).expect("reopen");
-        store.create_project(NewProject {
-            slug: "host".into(),
-            title: "T".into(),
-            description: String::new(),
-            actor: "human:michael".into(),
-        }).expect("create_project");
+        let (_tmp, svc) = fresh_service();
+        create_project(
+            &svc,
+            NewProject {
+                slug: "host".into(),
+                title: "T".into(),
+                description: String::new(),
+                actor: "human:michael".into(),
+            },
+        );
         let result = block_on(svc.create_task(NewTask {
             project: "host".into(),
             phase: None,

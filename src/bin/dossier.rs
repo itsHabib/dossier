@@ -131,17 +131,20 @@ async fn main() -> Result<()> {
             task,
             label,
             actor,
-        } => run_artifact_link(
-            &resolve_corpus(cli.corpus)?,
-            ArtifactLinkRequest {
-                project,
-                kind,
-                reference,
-                task,
-                label,
-                actor,
-            },
-        ),
+        } => {
+            run_artifact_link(
+                &resolve_corpus(cli.corpus)?,
+                ArtifactLinkRequest {
+                    project,
+                    kind,
+                    reference,
+                    task,
+                    label,
+                    actor,
+                },
+            )
+            .await
+        }
         Command::TaskList {
             project,
             phase,
@@ -266,7 +269,7 @@ async fn run_task_update(
     emit_json(&task)
 }
 
-fn run_artifact_link(corpus: &Path, req: ArtifactLinkRequest) -> Result<()> {
+async fn run_artifact_link(corpus: &Path, req: ArtifactLinkRequest) -> Result<()> {
     if matches!(req.task.as_deref(), Some("")) {
         bail!("task is empty");
     }
@@ -283,14 +286,18 @@ fn run_artifact_link(corpus: &Path, req: ArtifactLinkRequest) -> Result<()> {
         emit_json(&existing)?;
         return Ok(());
     }
-    let artifact = store.link_artifact(LinkArtifact {
-        project: req.project,
-        task: req.task,
-        kind: req.kind,
-        reference: req.reference,
-        label,
-        actor: default_actor(req.actor),
-    })?;
+    let svc = MeshService::new(store);
+    let artifact = svc
+        .link_artifact(LinkArtifact {
+            project: req.project,
+            task: req.task,
+            kind: req.kind,
+            reference: req.reference,
+            label,
+            actor: default_actor(req.actor),
+        })
+        .await
+        .map_err(store_error_to_anyhow)?;
     emit_json(&artifact)
 }
 

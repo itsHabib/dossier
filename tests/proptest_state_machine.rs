@@ -40,7 +40,7 @@ use dossier::store::FsStore;
 use proptest::prelude::*;
 
 mod common;
-use common::{block_on, fresh_service};
+use common::{block_on, create_project, fresh_service};
 
 const PROJECT_SLUG: &str = "model-test";
 const TASK_SLUG: &str = "subject";
@@ -263,12 +263,15 @@ proptest! {
     fn state_machine_invariants(ops in proptest::collection::vec(op_strategy(), 0..=8)) {
         let (tmp, svc) = fresh_service();
         let store = FsStore::open(tmp.path()).expect("reopen for reads");
-        store.create_project(NewProject {
-            slug: PROJECT_SLUG.into(),
-            title: "M".into(),
-            description: String::new(),
-            actor: "human:michael".into(),
-        }).expect("create_project");
+        create_project(
+            &svc,
+            NewProject {
+                slug: PROJECT_SLUG.into(),
+                title: "M".into(),
+                description: String::new(),
+                actor: "human:michael".into(),
+            },
+        );
         let task = block_on(svc.create_task(NewTask {
             project: PROJECT_SLUG.into(),
             phase: None,
@@ -352,13 +355,16 @@ proptest! {
     #[test]
     fn claim_is_idempotent_for_same_actor(actor in actor_strategy()) {
         let (tmp, svc) = fresh_service();
-        let store = FsStore::open(tmp.path()).expect("reopen for project create");
-        store.create_project(NewProject {
-            slug: PROJECT_SLUG.into(),
-            title: "M".into(),
-            description: String::new(),
-            actor: "human:michael".into(),
-        }).expect("create_project");
+        let _store = FsStore::open(tmp.path()).expect("reopen for project create");
+        create_project(
+            &svc,
+            NewProject {
+                slug: PROJECT_SLUG.into(),
+                title: "M".into(),
+                description: String::new(),
+                actor: "human:michael".into(),
+            },
+        );
         let task = block_on(svc.create_task(NewTask {
             project: PROJECT_SLUG.into(),
             phase: None,
