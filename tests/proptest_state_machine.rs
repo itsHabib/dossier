@@ -147,10 +147,6 @@ fn apply_pure(task: &mut Task, op: Op, now: &mut DateTime<Utc>) -> Result<(), an
             *task = apply_claim_task(task.clone(), &actor, *now)?;
         }
         Op::UpdateStatus { to, actor: _ } => {
-            if matches!(to, TaskStatus::Claimed | TaskStatus::Done) {
-                validate_task_update_transition(task.status, to)?;
-                return Ok(());
-            }
             *task = apply_task_status_update(task.clone(), to, *now)?;
         }
         Op::Complete { actor: _ } => {

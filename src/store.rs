@@ -10,13 +10,19 @@ use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+// Read-model types + write-verb DTOs — re-exported for callers that reach
+// them through the `store` namespace (backward compat).
 pub use crate::domain::{
+    Artifact, ClaimTask, CompleteTask, LinkArtifact, NewPhase, NewProject, NewTask, Phase,
+    PhaseListFilter, PhaseOrderField, PhaseStatus, Project, ProjectListFilter, ProjectOrderField,
+    ProjectStatus, Task, TaskListFilter, TaskOrderField, TaskStatus, UpdatePhase, UpdateProject,
+    UpdateTask,
+};
+// Pure policy — used internally by the delegating write methods. New code
+// imports these from `domain` directly, not through the mechanism layer.
+use crate::domain::{
     apply_claim_task, apply_complete_task, apply_task_body_update, apply_task_status_update,
     compute_new_phase_order, is_valid_slug, new_id, validate_single_line, validate_task_body,
-    validate_task_update_transition, Artifact, ClaimTask, CompleteTask, LinkArtifact, NewPhase,
-    NewProject, NewTask, Phase, PhaseListFilter, PhaseOrderField, PhaseStatus, Project,
-    ProjectListFilter, ProjectOrderField, ProjectStatus, Task, TaskListFilter, TaskOrderField,
-    TaskStatus, UpdatePhase, UpdateProject, UpdateTask,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
@@ -1138,7 +1144,14 @@ impl FsStore {
     pub fn claim_task(&self, args: &ClaimTask) -> Result<Task> {
         let (project_slug, path) = self.find_task_path(&args.id)?;
         let (task, notes_lines) = load_task_with_notes(&path, &project_slug)?;
+        let prior_updated_at = task.updated_at;
         let task = apply_claim_task(task, &args.actor, now_utc())?;
+        // Same-actor re-claim is a documented no-op: apply_claim_task leaves
+        // updated_at untouched, so skip the rewrite. Re-serializing in place
+        // would bump the file's mtime and storage version for no state change.
+        if task.updated_at == prior_updated_at {
+            return Ok(task);
+        }
         let content = serialize_task_file(&task, &notes_lines)?;
         write_atomic(&path, content.as_bytes())?;
         Ok(task)
@@ -1169,6 +1182,9 @@ impl FsStore {
         if let Some(note) = args.note {
             append_note(&mut task, &mut notes_lines, now, &args.actor, &note)?;
         }
+        // Catch-all for depends_on / note-only updates: the apply_* fns stamp
+        // updated_at when they run, but a bare depends_on or note change does
+        // not go through them.
         task.updated_at = now;
 
         let content = serialize_task_file(&task, &notes_lines)?;
@@ -3186,6 +3202,9 @@ updated_at: 2026-05-10T14:30:00Z
         let task = seed_task(&store, "alpha", "write-protocol");
         let first = claim(&store, &task.id, "ship");
 
+        let (_proj, path) = store.find_task_path(&task.id).unwrap();
+        let mtime_before = fs::metadata(&path).unwrap().modified().unwrap();
+
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         let second = claim(&store, &task.id, "ship");
@@ -3195,6 +3214,12 @@ updated_at: 2026-05-10T14:30:00Z
         );
         assert_eq!(second.claimed_at, first.claimed_at, "claimed_at preserved");
         assert_eq!(second.assignee, "ship");
+
+        let mtime_after = fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(
+            mtime_before, mtime_after,
+            "no-op re-claim must not rewrite the task file"
+        );
     }
 
     #[test]
