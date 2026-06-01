@@ -917,7 +917,7 @@ impl MeshService {
             .map_err(|e| internal(format!("write lock poisoned: {e}")))?;
         let task = self
             .fs
-            .claim_task(ClaimTask {
+            .claim_task(&ClaimTask {
                 id: args.id,
                 actor: args.actor,
             })

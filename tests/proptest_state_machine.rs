@@ -2,11 +2,9 @@
 //!
 //! The model is the enum `Op` mirroring the legal MCP-facing verbs:
 //! `task.claim`, `task.update`, `task.complete`. We generate a short
-//! sequence of `Op`s, execute each against a real `FsStore` (success or
-//! failure), and after every step assert the invariants the state
-//! machine is required to uphold — independent of which sequence got us
-//! here. Shrinking finds the smallest sequence that violates an
-//! invariant when one fails.
+//! sequence of `Op`s and assert invariants after every step — once
+//! against a real `FsStore` and once against the pure `domain` transition
+//! fns (no I/O). Shrinking finds the smallest violating sequence.
 //!
 //! Invariants:
 //!
@@ -25,14 +23,19 @@
 
 #![allow(
     clippy::expect_used,
+    clippy::unwrap_used,
     clippy::missing_panics_doc,
     clippy::missing_errors_doc,
     reason = "test module"
 )]
 
-use chrono::{DateTime, Utc};
-use dossier::domain::{TaskListFilter, TaskStatus};
-use dossier::store::{ClaimTask, CompleteTask, FsStore, NewProject, NewTask, UpdateTask};
+use chrono::{DateTime, TimeDelta, Utc};
+use dossier::domain::{
+    apply_claim_task, apply_complete_task, apply_task_body_update, apply_task_status_update,
+    validate_task_update_transition, ClaimTask, CompleteTask, NewProject, NewTask, Task,
+    TaskListFilter, TaskStatus, UpdateTask,
+};
+use dossier::store::FsStore;
 use proptest::prelude::*;
 
 mod common;
@@ -54,8 +57,6 @@ enum Op {
 }
 
 fn actor_strategy() -> impl Strategy<Value = String> {
-    // Two actors so same-actor re-claim and different-actor claim both
-    // appear with reasonable frequency in any sequence of length >= 2.
     prop_oneof![Just("alice".to_owned()), Just("bob".to_owned())]
 }
 
@@ -84,13 +85,9 @@ fn op_strategy() -> impl Strategy<Value = Op> {
     ]
 }
 
-/// Apply one op against the store. Ignore the Result — we only care
-/// about the *post-state* visible via `list_tasks`. (The Result is
-/// indirectly verified by the invariants: e.g. invariant 3 says that
-/// any successful `update_task` to `Claimed` is a bug.)
-fn apply(store: &FsStore, op: Op, task_id: &str) {
+fn apply_store(store: &FsStore, op: Op, task_id: &str) {
     let _ = match op {
-        Op::Claim { actor } => store.claim_task(ClaimTask {
+        Op::Claim { actor } => store.claim_task(&ClaimTask {
             id: task_id.to_owned(),
             actor,
         }),
@@ -118,9 +115,55 @@ fn apply(store: &FsStore, op: Op, task_id: &str) {
     };
 }
 
-/// Reload the task after each op. Returns the up-to-date state of the
-/// single task we're tracking.
-fn current_state(store: &FsStore) -> dossier::domain::Task {
+fn fresh_task() -> Task {
+    let now = Utc::now();
+    Task {
+        id: "tsk_01TEST000000000000000000".to_owned(),
+        project: "prj_test".to_owned(),
+        project_slug: PROJECT_SLUG.to_owned(),
+        phase: String::new(),
+        slug: TASK_SLUG.to_owned(),
+        title: "subject".to_owned(),
+        body: String::new(),
+        status: TaskStatus::Todo,
+        assignee: String::new(),
+        claimed_at: None,
+        completed_at: None,
+        created_at: now,
+        updated_at: now,
+        notes: Vec::new(),
+        depends_on: Vec::new(),
+    }
+}
+
+fn tick(now: &mut DateTime<Utc>) {
+    *now += TimeDelta::seconds(1);
+}
+
+fn apply_pure(task: &mut Task, op: Op, now: &mut DateTime<Utc>) -> Result<(), anyhow::Error> {
+    tick(now);
+    match op {
+        Op::Claim { actor } => {
+            *task = apply_claim_task(task.clone(), &actor, *now)?;
+        }
+        Op::UpdateStatus { to, actor: _ } => {
+            if matches!(to, TaskStatus::Claimed | TaskStatus::Done) {
+                validate_task_update_transition(task.status, to)?;
+                return Ok(());
+            }
+            *task = apply_task_status_update(task.clone(), to, *now)?;
+        }
+        Op::Complete { actor: _ } => {
+            *task = apply_complete_task(task.clone(), *now)?;
+        }
+        Op::UpdateBody { body, actor: _ } => {
+            *task = apply_task_body_update(task.clone(), body, *now)?;
+        }
+    }
+    Ok(())
+}
+
+fn current_state(store: &FsStore) -> Task {
     let tasks = store
         .list_tasks(&TaskListFilter {
             project: Some(PROJECT_SLUG.to_owned()),
@@ -144,8 +187,6 @@ const fn is_held(s: TaskStatus) -> bool {
     )
 }
 
-/// Invariant 2 in one place so a failing assertion points at the right
-/// rule. `Some(reason)` indicates a violation; `None` means OK.
 fn check_assignee_status_coupling(status: TaskStatus, assignee: &str) -> Option<String> {
     match status {
         TaskStatus::Todo if !assignee.is_empty() => {
@@ -158,14 +199,69 @@ fn check_assignee_status_coupling(status: TaskStatus, assignee: &str) -> Option<
     }
 }
 
+fn assert_invariants_after_step(
+    pre: &Task,
+    post: &Task,
+    op: &Op,
+    once_terminal: &mut Option<TaskStatus>,
+    frozen_completed_at: &mut Option<DateTime<Utc>>,
+    last_updated_at: &mut DateTime<Utc>,
+) -> Result<(), TestCaseError> {
+    if let Op::UpdateStatus { to, .. } = op {
+        if matches!(*to, TaskStatus::Claimed | TaskStatus::Done) {
+            prop_assert_eq!(post.status, pre.status);
+            prop_assert_eq!(&post.assignee, &pre.assignee);
+            prop_assert_eq!(post.updated_at, pre.updated_at);
+            return Ok(());
+        }
+    }
+    if matches!(op, Op::Complete { .. }) && pre.status != TaskStatus::InProgress {
+        prop_assert_eq!(post.status, pre.status);
+        prop_assert_eq!(post.updated_at, pre.updated_at);
+        return Ok(());
+    }
+
+    let was_complete_from_in_progress =
+        matches!(op, Op::Complete { .. }) && pre.status == TaskStatus::InProgress;
+    if was_complete_from_in_progress {
+        prop_assert_eq!(post.status, TaskStatus::Done);
+        prop_assert!(post.completed_at.is_some());
+    }
+
+    if let Some(t) = *once_terminal {
+        prop_assert_eq!(
+            post.status,
+            t,
+            "invariant 1 violated: status changed after entering terminal {:?}",
+            t,
+        );
+        prop_assert_eq!(
+            post.completed_at,
+            *frozen_completed_at,
+            "invariant 1 violated: completed_at changed after terminal",
+        );
+    } else if is_terminal(post.status) {
+        *once_terminal = Some(post.status);
+        *frozen_completed_at = post.completed_at;
+    }
+
+    if let Some(reason) = check_assignee_status_coupling(post.status, &post.assignee) {
+        prop_assert!(false, "invariant 2 violated: {}", reason);
+    }
+
+    prop_assert!(
+        post.updated_at >= *last_updated_at,
+        "invariant 5 violated: updated_at moved backwards ({} -> {})",
+        *last_updated_at,
+        post.updated_at,
+    );
+    *last_updated_at = post.updated_at;
+    Ok(())
+}
+
 proptest! {
-    // 64 cases × up to 8 ops × real-filesystem corpus is ~4s wall-clock;
-    // the default 256 took 16s. Override locally via `PROPTEST_CASES=N`
-    // when you want a thorough check (e.g. before a release).
     #![proptest_config(proptest::test_runner::Config { cases: 64, ..proptest::test_runner::Config::default() })]
 
-    /// Replay an arbitrary sequence of operations against the real
-    /// state machine and assert all five invariants after each step.
     #[test]
     fn state_machine_invariants(ops in proptest::collection::vec(op_strategy(), 0..=8)) {
         let (_tmp, store) = fresh_corpus();
@@ -182,24 +278,18 @@ proptest! {
             title: "subject".into(),
             body: String::new(),
             actor: "human:michael".into(),
-                        depends_on: Vec::new(),
+            depends_on: Vec::new(),
         }).expect("create_task");
         let task_id = task.id.clone();
 
-        // Sanity: a freshly-created task is `Todo`, has no assignee,
-        // has no claimed_at / completed_at, and updated_at is set.
         prop_assert_eq!(task.status, TaskStatus::Todo);
         prop_assert!(task.assignee.is_empty());
-        prop_assert!(task.claimed_at.is_none());
-        prop_assert!(task.completed_at.is_none());
 
-        let mut last_updated_at: DateTime<Utc> = task.updated_at;
+        let mut last_updated_at = task.updated_at;
         let mut once_terminal: Option<TaskStatus> = None;
         let mut frozen_completed_at: Option<DateTime<Utc>> = task.completed_at;
 
-        for op in ops {
-            // Probe invariants 3 and 4 BEFORE applying the op so we can
-            // assert that disallowed verbs error.
+        for op in &ops {
             let pre = current_state(&store);
             if let Op::UpdateStatus { to, actor } = op.clone() {
                 if matches!(to, TaskStatus::Claimed | TaskStatus::Done) {
@@ -211,81 +301,56 @@ proptest! {
                         actor,
                         depends_on: None,
                     });
-                    prop_assert!(
-                        result.is_err(),
-                        "invariant 3 violated: update_task accepted target {:?}",
-                        to,
-                    );
-                    // The post-state from a rejected call must equal pre-state.
+                    prop_assert!(result.is_err(), "invariant 3 violated: update accepted {:?}", to);
                     let post = current_state(&store);
-                    prop_assert_eq!(post.status, pre.status);
-                    prop_assert_eq!(post.assignee, pre.assignee);
-                    prop_assert_eq!(post.updated_at, pre.updated_at);
+                    assert_invariants_after_step(
+                        &pre, &post, op, &mut once_terminal, &mut frozen_completed_at, &mut last_updated_at,
+                    )?;
+                    continue;
+                }
+            }
+            apply_store(&store, op.clone(), &task_id);
+            let post = current_state(&store);
+            assert_invariants_after_step(
+                &pre, &post, op, &mut once_terminal, &mut frozen_completed_at, &mut last_updated_at,
+            )?;
+        }
+    }
+
+    #[test]
+    fn state_machine_invariants_pure(ops in proptest::collection::vec(op_strategy(), 0..=8)) {
+        let mut task = fresh_task();
+        let mut now = task.updated_at;
+        let mut last_updated_at = task.updated_at;
+        let mut once_terminal: Option<TaskStatus> = None;
+        let mut frozen_completed_at: Option<DateTime<Utc>> = task.completed_at;
+
+        for op in ops {
+            let pre = task.clone();
+            if let Op::UpdateStatus { to, .. } = &op {
+                if matches!(*to, TaskStatus::Claimed | TaskStatus::Done) {
+                    prop_assert!(validate_task_update_transition(pre.status, *to).is_err());
+                    prop_assert_eq!(task.status, pre.status);
                     continue;
                 }
             }
             if matches!(op, Op::Complete { .. }) && pre.status != TaskStatus::InProgress {
-                // Invariant 4: complete from any non-InProgress source errors.
-                apply(&store, op.clone(), &task_id);
-                let post = current_state(&store);
-                prop_assert_eq!(post.status, pre.status);
-                prop_assert_eq!(post.updated_at, pre.updated_at);
+                let err = apply_pure(&mut task, op.clone(), &mut now);
+                prop_assert!(err.is_err());
+                prop_assert_eq!(task.status, pre.status);
                 continue;
             }
 
-            // Normal apply path.
-            let was_complete_from_in_progress =
-                matches!(op, Op::Complete { .. }) && pre.status == TaskStatus::InProgress;
-            apply(&store, op, &task_id);
-            let post = current_state(&store);
-
-            // Invariant 4 (success leg): a Complete from InProgress
-            // must actually transition to Done — not just leave state
-            // unchanged or land in some other status.
-            if was_complete_from_in_progress {
-                prop_assert_eq!(post.status, TaskStatus::Done);
-                prop_assert!(post.completed_at.is_some());
+            if apply_pure(&mut task, op.clone(), &mut now).is_err() {
+                prop_assert_eq!(task.status, pre.status);
+                continue;
             }
-
-            // Invariant 1: terminal absorption.
-            if let Some(t) = once_terminal {
-                prop_assert_eq!(
-                    post.status,
-                    t,
-                    "invariant 1 violated: status changed after entering terminal {:?}",
-                    t,
-                );
-                prop_assert_eq!(
-                    post.completed_at, frozen_completed_at,
-                    "invariant 1 violated: completed_at changed after terminal",
-                );
-            } else if is_terminal(post.status) {
-                once_terminal = Some(post.status);
-                frozen_completed_at = post.completed_at;
-            }
-
-            // Invariant 2: assignee/status coupling.
-            if let Some(reason) = check_assignee_status_coupling(post.status, &post.assignee) {
-                prop_assert!(false, "invariant 2 violated: {}", reason);
-            }
-
-            // Invariant 5: updated_at monotonic.
-            prop_assert!(
-                post.updated_at >= last_updated_at,
-                "invariant 5 violated: updated_at moved backwards ({} -> {})",
-                last_updated_at,
-                post.updated_at,
-            );
-            last_updated_at = post.updated_at;
+            assert_invariants_after_step(
+                &pre, &task, &op, &mut once_terminal, &mut frozen_completed_at, &mut last_updated_at,
+            )?;
         }
     }
 
-    /// Explicit check for the same-actor re-claim idempotency
-    /// invariant. Two consecutive `Claim { actor: a }` calls on a
-    /// fresh task must yield identical state — including no
-    /// `updated_at` bump on the second call. (The general sequence
-    /// test exercises this only by chance; this property guarantees
-    /// it on every run.)
     #[test]
     fn claim_is_idempotent_for_same_actor(actor in actor_strategy()) {
         let (_tmp, store) = fresh_corpus();
@@ -302,14 +367,14 @@ proptest! {
             title: "subject".into(),
             body: String::new(),
             actor: "human:michael".into(),
-                        depends_on: Vec::new(),
+            depends_on: Vec::new(),
         }).expect("create_task");
 
-        let first = store.claim_task(ClaimTask {
+        let first = store.claim_task(&ClaimTask {
             id: task.id.clone(),
             actor: actor.clone(),
         }).expect("first claim");
-        let second = store.claim_task(ClaimTask {
+        let second = store.claim_task(&ClaimTask {
             id: task.id,
             actor,
         }).expect("second claim (no-op)");
@@ -317,8 +382,78 @@ proptest! {
         prop_assert_eq!(first.status, second.status);
         prop_assert_eq!(&first.assignee, &second.assignee);
         prop_assert_eq!(first.claimed_at, second.claimed_at);
-        // updated_at must not advance — claim_task's same-actor branch
-        // returns before stamping `now`.
         prop_assert_eq!(first.updated_at, second.updated_at);
     }
+}
+
+// --- Explicit claim matrix (every branch; no blind spots) ---
+
+fn corrupt_held_empty_assignee() -> Task {
+    let mut t = fresh_task();
+    t.status = TaskStatus::Claimed;
+    t
+}
+
+fn corrupt_todo_with_assignee(holder: &str) -> Task {
+    let mut t = fresh_task();
+    holder.clone_into(&mut t.assignee);
+    t
+}
+
+#[test]
+fn claim_matrix_todo_empty_assignee_claims() {
+    let now = Utc::now();
+    let out = apply_claim_task(fresh_task(), "alice", now).expect("claim");
+    assert_eq!(out.status, TaskStatus::Claimed);
+    assert_eq!(out.assignee, "alice");
+    assert_eq!(out.claimed_at, Some(now));
+}
+
+#[test]
+fn claim_matrix_same_actor_noop() {
+    let now = Utc::now();
+    let held = apply_claim_task(fresh_task(), "alice", now).expect("claim");
+    let second =
+        apply_claim_task(held.clone(), "alice", now + TimeDelta::hours(1)).expect("re-claim");
+    assert_eq!(held.status, second.status);
+    assert_eq!(held.assignee, second.assignee);
+    assert_eq!(held.claimed_at, second.claimed_at);
+    assert_eq!(held.updated_at, second.updated_at);
+}
+
+#[test]
+fn claim_matrix_different_actor_rejects() {
+    let now = Utc::now();
+    let held = apply_claim_task(fresh_task(), "alice", now).expect("claim");
+    let err = apply_claim_task(held, "bob", now).unwrap_err();
+    assert!(err.to_string().contains("task already claimed by alice"));
+}
+
+#[test]
+fn claim_matrix_terminal_rejects() {
+    let now = Utc::now();
+    for status in [TaskStatus::Done, TaskStatus::Cancelled] {
+        let mut t = fresh_task();
+        t.status = status;
+        let err = apply_claim_task(t, "alice", now).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("cannot claim task in terminal state"));
+    }
+}
+
+#[test]
+fn claim_matrix_corrupt_todo_with_assignee_rejects() {
+    let now = Utc::now();
+    let err = apply_claim_task(corrupt_todo_with_assignee("alice"), "alice", now).unwrap_err();
+    assert!(err.to_string().contains("corrupt state"));
+    let err = apply_claim_task(corrupt_todo_with_assignee("alice"), "bob", now).unwrap_err();
+    assert!(err.to_string().contains("corrupt state"));
+}
+
+#[test]
+fn claim_matrix_corrupt_held_empty_assignee_rejects() {
+    let now = Utc::now();
+    let err = apply_claim_task(corrupt_held_empty_assignee(), "alice", now).unwrap_err();
+    assert!(err.to_string().contains("corrupt state"));
 }
