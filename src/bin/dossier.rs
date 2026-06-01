@@ -8,7 +8,7 @@ use serde::Serialize;
 
 use dossier::domain::{Task, TaskListFilter, TaskStatus};
 use dossier::server::MeshService;
-use dossier::store::{CompleteTask, FsStore, LinkArtifact, StoreError, UpdateTask};
+use dossier::store::{store_error_to_anyhow, CompleteTask, FsStore, LinkArtifact, UpdateTask};
 
 #[derive(Parser)]
 #[command(
@@ -264,16 +264,6 @@ async fn run_task_update(
         .await
         .map_err(store_error_to_anyhow)?;
     emit_json(&task)
-}
-
-fn store_error_to_anyhow(err: StoreError) -> anyhow::Error {
-    match err {
-        StoreError::NotFound => anyhow::anyhow!("not found"),
-        StoreError::Conflict => anyhow::anyhow!("conflict"),
-        StoreError::Unavailable => anyhow::anyhow!("unavailable"),
-        StoreError::Invalid(msg) => anyhow::anyhow!("{msg}"),
-        StoreError::Io(io) => io.into(),
-    }
 }
 
 fn run_artifact_link(corpus: &Path, req: ArtifactLinkRequest) -> Result<()> {

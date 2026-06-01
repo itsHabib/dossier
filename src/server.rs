@@ -1,8 +1,9 @@
 //! `MCP` server wrapping the `FsStore` as dossier verbs.
 //!
 //! Read side: `project.list` / `project.get` / `phase.list` / `task.list`
-//! / `task.get` / `artifact.list`. Write side: project / phase / task verbs all
-//! routed through the shared `write_lock`. Artifact writes and conflict
+//! / `task.get` / `artifact.list`. Write side: project / phase verbs route
+//! through the shared `write_lock`; task verbs use optimistic CAS loops
+//! (atomic via `FsStore`'s internal `cas_lock`). Artifact writes and conflict
 //! detection are not yet wired.
 
 use std::sync::{Arc, Mutex};
@@ -1281,11 +1282,10 @@ impl MeshService {
                 })
                 .await?;
             if tasks.iter().any(|t| t.value.slug == args.slug) {
-                if attempt + 1 >= CAS_MAX_ATTEMPTS {
-                    return Err(StoreError::Conflict);
-                }
-                cas_backoff(attempt).await;
-                continue;
+                return Err(invalid_msg(format!(
+                    "task slug already exists in project: {}",
+                    args.slug
+                )));
             }
 
             let now = now_utc();
@@ -2815,6 +2815,146 @@ mod tests {
         assert_eq!(f.order_by, Some(TaskOrderField::ClaimedAt));
         assert_eq!(f.desc, Some(true));
         assert_eq!(f.limit, Some(99));
+    }
+
+    #[test]
+    fn create_task_persists_depends_on() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".dossier")).expect("mkdir .dossier");
+        let store = seed_store(tmp.path());
+        seed_project(&store, "alpha");
+        let svc = MeshService::new(FsStore::open(tmp.path()).expect("open service store"));
+
+        let created = block_on(svc.create_task(NewTask {
+            project: "alpha".to_owned(),
+            phase: None,
+            slug: "deps".to_owned(),
+            title: "Deps".to_owned(),
+            body: String::new(),
+            actor: "human:test".to_owned(),
+            depends_on: vec!["tsk_a".into(), "tsk_b".into()],
+        }))
+        .expect("create task with depends_on");
+
+        assert_eq!(
+            created.depends_on,
+            vec!["tsk_a".to_owned(), "tsk_b".to_owned()]
+        );
+
+        let Json(listed) = block_on(svc.task_list(Parameters(TaskListArgs {
+            project: Some("alpha".to_owned()),
+            ..Default::default()
+        })))
+        .expect("list tasks");
+        let listed = listed
+            .tasks
+            .into_iter()
+            .find(|t| t.id == created.id)
+            .expect("created task in list");
+        assert_eq!(
+            listed.depends_on,
+            vec!["tsk_a".to_owned(), "tsk_b".to_owned()]
+        );
+
+        let Json(got) =
+            block_on(svc.task_get(Parameters(TaskGetArgs { id: created.id }))).expect("get task");
+        assert_eq!(got.depends_on, vec!["tsk_a".to_owned(), "tsk_b".to_owned()]);
+    }
+
+    #[test]
+    fn update_task_replaces_depends_on() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".dossier")).expect("mkdir .dossier");
+        let store = seed_store(tmp.path());
+        seed_project(&store, "alpha");
+        let svc = MeshService::new(FsStore::open(tmp.path()).expect("open service store"));
+        let task = block_on(svc.create_task(NewTask {
+            project: "alpha".to_owned(),
+            phase: None,
+            slug: "replace-deps".to_owned(),
+            title: "Replace deps".to_owned(),
+            body: String::new(),
+            actor: "human:test".to_owned(),
+            depends_on: vec!["tsk_a".into(), "tsk_b".into()],
+        }))
+        .expect("create task");
+
+        let updated = block_on(svc.update_task(UpdateTask {
+            id: task.id,
+            body: None,
+            status: None,
+            note: None,
+            actor: "human:test".to_owned(),
+            depends_on: Some(vec!["tsk_c".into()]),
+        }))
+        .expect("update depends_on");
+
+        assert_eq!(updated.depends_on, vec!["tsk_c".to_owned()]);
+    }
+
+    #[test]
+    fn update_task_clears_depends_on_with_empty_list() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".dossier")).expect("mkdir .dossier");
+        let store = seed_store(tmp.path());
+        seed_project(&store, "alpha");
+        let svc = MeshService::new(FsStore::open(tmp.path()).expect("open service store"));
+        let task = block_on(svc.create_task(NewTask {
+            project: "alpha".to_owned(),
+            phase: None,
+            slug: "clear-deps".to_owned(),
+            title: "Clear deps".to_owned(),
+            body: String::new(),
+            actor: "human:test".to_owned(),
+            depends_on: vec!["tsk_a".into()],
+        }))
+        .expect("create task");
+
+        let updated = block_on(svc.update_task(UpdateTask {
+            id: task.id,
+            body: None,
+            status: None,
+            note: None,
+            actor: "human:test".to_owned(),
+            depends_on: Some(vec![]),
+        }))
+        .expect("clear depends_on");
+
+        assert!(updated.depends_on.is_empty());
+    }
+
+    #[test]
+    fn update_task_leaves_depends_on_when_none() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".dossier")).expect("mkdir .dossier");
+        let store = seed_store(tmp.path());
+        seed_project(&store, "alpha");
+        let svc = MeshService::new(FsStore::open(tmp.path()).expect("open service store"));
+        let task = block_on(svc.create_task(NewTask {
+            project: "alpha".to_owned(),
+            phase: None,
+            slug: "keep-deps".to_owned(),
+            title: "Keep deps".to_owned(),
+            body: String::new(),
+            actor: "human:test".to_owned(),
+            depends_on: vec!["tsk_a".into(), "tsk_b".into()],
+        }))
+        .expect("create task");
+
+        let updated = block_on(svc.update_task(UpdateTask {
+            id: task.id,
+            body: None,
+            status: None,
+            note: Some("progress note".to_owned()),
+            actor: "human:test".to_owned(),
+            depends_on: None,
+        }))
+        .expect("update note only");
+
+        assert_eq!(
+            updated.depends_on,
+            vec!["tsk_a".to_owned(), "tsk_b".to_owned()]
+        );
     }
 
     #[test]

@@ -9,6 +9,7 @@ use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 // Read-model types + write-verb DTOs — re-exported for callers that reach
 // them through the `store` namespace (backward compat).
@@ -122,7 +123,7 @@ fn store_invalid(err: anyhow::Error) -> StoreError {
     StoreError::Invalid(err.to_string())
 }
 
-fn store_error_to_anyhow(err: StoreError) -> anyhow::Error {
+pub fn store_error_to_anyhow(err: StoreError) -> anyhow::Error {
     match err {
         StoreError::NotFound => anyhow!("not found"),
         StoreError::Conflict => anyhow!("conflict"),
@@ -192,39 +193,6 @@ pub(crate) fn notes_lines_for_task(task: &Task) -> Vec<String> {
         .iter()
         .map(|n| format_note_line(n.posted_at, &n.actor, &n.body))
         .collect()
-}
-
-/// Compare-and-swap write: verifies `expected` against the file's current version,
-/// then writes atomically. `None` = create-only (fail if the file already exists);
-/// `Some(v)` = update only if the current version matches `v`.
-///
-/// The version check and the write are not atomic with respect to other writers, so this
-/// assumes single-writer-per-corpus — the same invariant the inherent write verbs uphold
-/// by serializing through `MeshService.write_lock`. A caller invoking this via
-/// `Arc<dyn Store>` must serialize its own read-modify-write the same way.
-fn cas_write(
-    path: &Path,
-    content: &[u8],
-    expected: Option<Version>,
-) -> Result<Version, StoreError> {
-    match expected {
-        None => {
-            if path.exists() {
-                return Err(StoreError::Conflict);
-            }
-        }
-        Some(expected_v) => {
-            if !path.exists() {
-                return Err(StoreError::NotFound);
-            }
-            let current = file_version(path)?;
-            if current != expected_v {
-                return Err(StoreError::Conflict);
-            }
-        }
-    }
-    write_atomic(path, content).map_err(store_io)?;
-    file_version(path)
 }
 
 fn project_slug_for_id(store: &FsStore, project_id: &str) -> Result<String, StoreError> {
@@ -339,7 +307,7 @@ impl Store for FsStore {
             fs::create_dir_all(&dir).map_err(StoreError::Io)?;
         }
         let content = serialize_project_file(project).map_err(store_invalid)?;
-        cas_write(&path, content.as_bytes(), expected)
+        self.cas_write(&path, content.as_bytes(), expected)
     }
 
     async fn put_phase(
@@ -367,7 +335,7 @@ impl Store for FsStore {
                     }
                 })?
         };
-        cas_write(&path, content.as_bytes(), expected)
+        self.cas_write(&path, content.as_bytes(), expected)
     }
 
     async fn put_task(
@@ -391,7 +359,7 @@ impl Store for FsStore {
         // load the full task (notes included) before mutating to avoid dropping history.
         let notes_lines = notes_lines_for_task(task);
         let content = serialize_task_file(task, &notes_lines).map_err(store_invalid)?;
-        cas_write(&path, content.as_bytes(), expected)
+        self.cas_write(&path, content.as_bytes(), expected)
     }
 
     async fn put_artifact(&self, artifact: &Artifact) -> Result<(), StoreError> {
@@ -413,11 +381,13 @@ impl Store for FsStore {
 
 /// Filesystem-backed access to the on-disk dossier corpus at `root`.
 ///
-/// Open via [`Self::open`]. Reads are lock-free; callers must serialize
-/// writes (the mesh uses a process-local `Mutex` for that).
+/// Open via [`Self::open`]. Reads are lock-free; CAS writes serialize
+/// through an internal [`Self::cas_lock`] so the version check and atomic
+/// rename are indivisible against concurrent in-process writers.
 #[derive(Debug)]
 pub struct FsStore {
     root: PathBuf,
+    cas_lock: Mutex<()>,
 }
 
 impl FsStore {
@@ -434,12 +404,52 @@ impl FsStore {
                 canonical.display()
             );
         }
-        Ok(Self { root: canonical })
+        Ok(Self {
+            root: canonical,
+            cas_lock: Mutex::new(()),
+        })
     }
 
     /// Absolute canonical corpus root directory (as resolved by [`Self::open`]).
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Compare-and-swap write: verifies `expected` against the file's current version,
+    /// then writes atomically. `None` = create-only (fail if the file already exists);
+    /// `Some(v)` = update only if the current version matches `v`.
+    ///
+    /// The version check and the write run under [`Self::cas_lock`], so concurrent
+    /// in-process CAS callers observe a stale version as `Conflict` rather than a
+    /// silent clobber. Optimistic retry loops read lock-free and re-attempt here.
+    fn cas_write(
+        &self,
+        path: &Path,
+        content: &[u8],
+        expected: Option<Version>,
+    ) -> Result<Version, StoreError> {
+        let _guard = self
+            .cas_lock
+            .lock()
+            .map_err(|_| StoreError::Invalid("cas lock poisoned".to_owned()))?;
+        match expected {
+            None => {
+                if path.exists() {
+                    return Err(StoreError::Conflict);
+                }
+            }
+            Some(expected_v) => {
+                if !path.exists() {
+                    return Err(StoreError::NotFound);
+                }
+                let current = file_version(path)?;
+                if current != expected_v {
+                    return Err(StoreError::Conflict);
+                }
+            }
+        }
+        write_atomic(path, content).map_err(store_io)?;
+        file_version(path)
     }
 
     fn project_dir(&self, slug: &str) -> Result<PathBuf> {
@@ -933,7 +943,7 @@ impl FsStore {
         project_gate.updated_at = now_utc();
         let project_path = project_dir.join("project.md");
         let project_content = serialize_project_file(&project_gate).map_err(store_invalid)?;
-        cas_write(
+        self.cas_write(
             &project_path,
             project_content.as_bytes(),
             Some(project_version),
