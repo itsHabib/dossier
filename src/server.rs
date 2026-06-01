@@ -19,13 +19,15 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::domain::{
-    Artifact, Phase, PhaseListFilter, PhaseOrderField, PhaseStatus, Project, ProjectListFilter,
-    ProjectOrderField, ProjectStatus, SearchArgs, SearchHit, SearchKind, Task, TaskGetArgs,
-    TaskListFilter, TaskOrderField, TaskStatus,
+    append_task_note, apply_claim_task, apply_complete_task, apply_task_body_update,
+    apply_task_status_update, is_valid_slug, new_id, validate_task_body, Artifact, Phase,
+    PhaseListFilter, PhaseOrderField, PhaseStatus, Project, ProjectListFilter, ProjectOrderField,
+    ProjectStatus, SearchArgs, SearchHit, SearchKind, Task, TaskGetArgs, TaskListFilter,
+    TaskOrderField, TaskStatus,
 };
 use crate::store::{
-    ArtifactListFilter, ClaimTask, CompleteTask, FsStore, LinkArtifact, NewPhase, NewProject,
-    NewTask, Store, StoreError, UpdatePhase, UpdateProject, UpdateTask,
+    now_utc, ArtifactListFilter, ClaimTask, CompleteTask, FsStore, LinkArtifact, NewPhase,
+    NewProject, NewTask, Store, StoreError, UpdatePhase, UpdateProject, UpdateTask, Versioned,
 };
 
 /// Implementation version of the dossier mesh. Distinct from the
@@ -884,22 +886,16 @@ impl MeshService {
         &self,
         Parameters(args): Parameters<TaskCreateArgs>,
     ) -> Result<Json<Task>, ErrorData> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .map_err(|e| internal(format!("write lock poisoned: {e}")))?;
-        let task = self
-            .fs
-            .create_task(NewTask {
-                project: args.project,
-                phase: args.phase,
-                slug: args.slug,
-                title: args.title,
-                body: args.body,
-                actor: args.actor,
-                depends_on: args.depends_on,
-            })
-            .map_err(internal_or_invalid)?;
+        let task = block_on(self.create_task(NewTask {
+            project: args.project,
+            phase: args.phase,
+            slug: args.slug,
+            title: args.title,
+            body: args.body,
+            actor: args.actor,
+            depends_on: args.depends_on,
+        }))
+        .map_err(store_err_to_invalid)?;
         Ok(Json(task))
     }
 
@@ -911,17 +907,11 @@ impl MeshService {
         &self,
         Parameters(args): Parameters<TaskClaimArgs>,
     ) -> Result<Json<Task>, ErrorData> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .map_err(|e| internal(format!("write lock poisoned: {e}")))?;
-        let task = self
-            .fs
-            .claim_task(&ClaimTask {
-                id: args.id,
-                actor: args.actor,
-            })
-            .map_err(internal_or_invalid)?;
+        let task = block_on(self.claim_task(&ClaimTask {
+            id: args.id,
+            actor: args.actor,
+        }))
+        .map_err(store_err_to_invalid)?;
         Ok(Json(task))
     }
 
@@ -933,21 +923,15 @@ impl MeshService {
         &self,
         Parameters(args): Parameters<TaskUpdateArgs>,
     ) -> Result<Json<Task>, ErrorData> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .map_err(|e| internal(format!("write lock poisoned: {e}")))?;
-        let task = self
-            .fs
-            .update_task(UpdateTask {
-                id: args.id,
-                body: args.body,
-                status: args.status,
-                note: args.note,
-                actor: args.actor,
-                depends_on: args.depends_on,
-            })
-            .map_err(internal_or_invalid)?;
+        let task = block_on(self.update_task(UpdateTask {
+            id: args.id,
+            body: args.body,
+            status: args.status,
+            note: args.note,
+            actor: args.actor,
+            depends_on: args.depends_on,
+        }))
+        .map_err(store_err_to_invalid)?;
         Ok(Json(task))
     }
 
@@ -959,18 +943,12 @@ impl MeshService {
         &self,
         Parameters(args): Parameters<TaskCompleteArgs>,
     ) -> Result<Json<Task>, ErrorData> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .map_err(|e| internal(format!("write lock poisoned: {e}")))?;
-        let task = self
-            .fs
-            .complete_task(CompleteTask {
-                id: args.id,
-                note: args.note,
-                actor: args.actor,
-            })
-            .map_err(internal_or_invalid)?;
+        let task = block_on(self.complete_task(CompleteTask {
+            id: args.id,
+            note: args.note,
+            actor: args.actor,
+        }))
+        .map_err(store_err_to_invalid)?;
         Ok(Json(task))
     }
 
@@ -1110,6 +1088,348 @@ impl MeshService {
         }
         let hits = self.search_corpus(&args).await?;
         Ok(Json(SearchResult { hits }))
+    }
+}
+
+// CAS retry budget — cloud spec §8 (single budget for every lifted CAS loop).
+const CAS_RETRY_BASE_MS: u64 = 25;
+const CAS_RETRY_CAP_MS: u64 = 2000;
+const CAS_MAX_ATTEMPTS: u32 = 5;
+
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    #[allow(
+        clippy::expect_used,
+        reason = "tokio runtime bootstrap in sync MCP handlers"
+    )]
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(future)
+}
+
+async fn cas_backoff(attempt: u32) {
+    let exponent = attempt.min(6);
+    let max_ms = CAS_RETRY_BASE_MS
+        .saturating_mul(1_u64 << exponent)
+        .min(CAS_RETRY_CAP_MS);
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::from(d.subsec_nanos()) % (max_ms + 1));
+    if jitter > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(jitter)).await;
+    }
+}
+
+fn invalid_msg(msg: impl std::fmt::Display) -> StoreError {
+    StoreError::Invalid(msg.to_string())
+}
+
+fn domain_err(err: &AnyhowError) -> StoreError {
+    StoreError::Invalid(err.to_string())
+}
+
+fn task_logical_eq(a: &Task, b: &Task) -> bool {
+    a.id == b.id
+        && a.project == b.project
+        && a.project_slug == b.project_slug
+        && a.phase == b.phase
+        && a.slug == b.slug
+        && a.title == b.title
+        && a.body == b.body
+        && a.status == b.status
+        && a.assignee == b.assignee
+        && a.claimed_at == b.claimed_at
+        && a.completed_at == b.completed_at
+        && a.notes == b.notes
+        && a.depends_on == b.depends_on
+}
+
+fn store_err_to_invalid(err: StoreError) -> ErrorData {
+    match err {
+        StoreError::NotFound => ErrorData::invalid_params("not found", None),
+        StoreError::Conflict => ErrorData::invalid_request("conflict", None),
+        StoreError::Unavailable => ErrorData::internal_error("unavailable", None),
+        StoreError::Invalid(msg) => {
+            let lower = msg.to_lowercase();
+            if is_user_domain_error(&lower) {
+                ErrorData::invalid_params(msg, None)
+            } else {
+                ErrorData::internal_error(msg, None)
+            }
+        }
+        StoreError::Io(e) => internal(e),
+    }
+}
+
+impl MeshService {
+    /// Service-layer `task.create` — project-scoped slug uniqueness via `project.md` CAS gate.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "project-CAS gate + create-only put share one retry loop"
+    )]
+    pub async fn create_task(&self, args: NewTask) -> Result<Task, StoreError> {
+        if args.actor.is_empty() {
+            return Err(invalid_msg("actor is required to create a task"));
+        }
+        if args.project.is_empty() {
+            return Err(invalid_msg("project is required"));
+        }
+        if args.slug.is_empty() {
+            return Err(invalid_msg("slug is required"));
+        }
+        if let Some(phase) = &args.phase {
+            if phase.is_empty() {
+                return Err(invalid_msg(
+                    "phase is required (omit the field entirely for a project-wide task)",
+                ));
+            }
+            if !is_valid_slug(phase) {
+                return Err(invalid_msg(format!(
+                    "phase slug must be lowercase ascii (a-z, 0-9, -, _): {phase}"
+                )));
+            }
+        }
+        if !is_valid_slug(&args.slug) {
+            return Err(invalid_msg(format!(
+                "slug must be lowercase ascii (a-z, 0-9, -, _): {}",
+                args.slug
+            )));
+        }
+        validate_task_body(&args.body).map_err(|e| domain_err(&e))?;
+
+        for attempt in 0..CAS_MAX_ATTEMPTS {
+            let Versioned {
+                value: project,
+                version: project_version,
+            } = match self.store.get_project(&args.project).await {
+                Ok(v) => v,
+                Err(StoreError::NotFound) => {
+                    return Err(invalid_msg(format!("project not found: {}", args.project)));
+                }
+                Err(e) => return Err(e),
+            };
+
+            let phase_id = match &args.phase {
+                Some(phase_slug) => {
+                    let phases = self
+                        .store
+                        .list_phases(PhaseListFilter {
+                            project: Some(args.project.clone()),
+                            ..Default::default()
+                        })
+                        .await?;
+                    let phase = phases
+                        .iter()
+                        .find(|p| p.value.slug == *phase_slug)
+                        .ok_or_else(|| invalid_msg(format!("phase not found: {phase_slug}")))?;
+                    phase.value.id.clone()
+                }
+                None => String::new(),
+            };
+
+            let tasks = self
+                .store
+                .list_tasks(TaskListFilter {
+                    project: Some(args.project.clone()),
+                    ..Default::default()
+                })
+                .await?;
+            if tasks.iter().any(|t| t.value.slug == args.slug) {
+                return Err(invalid_msg(format!(
+                    "task slug already exists in project: {}",
+                    args.slug
+                )));
+            }
+
+            let mut project_gate = project.clone();
+            project_gate.updated_at = now_utc();
+            match self
+                .store
+                .put_project(&project_gate, Some(project_version))
+                .await
+            {
+                Ok(_) => {}
+                Err(StoreError::Conflict) => {
+                    let tasks = self
+                        .store
+                        .list_tasks(TaskListFilter {
+                            project: Some(args.project.clone()),
+                            ..Default::default()
+                        })
+                        .await?;
+                    if tasks.iter().any(|t| t.value.slug == args.slug) {
+                        return Err(invalid_msg(format!(
+                            "task slug already exists in project: {}",
+                            args.slug
+                        )));
+                    }
+                    if attempt + 1 >= CAS_MAX_ATTEMPTS {
+                        return Err(StoreError::Conflict);
+                    }
+                    cas_backoff(attempt).await;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+
+            let tasks = self
+                .store
+                .list_tasks(TaskListFilter {
+                    project: Some(args.project.clone()),
+                    ..Default::default()
+                })
+                .await?;
+            if tasks.iter().any(|t| t.value.slug == args.slug) {
+                if attempt + 1 >= CAS_MAX_ATTEMPTS {
+                    return Err(StoreError::Conflict);
+                }
+                cas_backoff(attempt).await;
+                continue;
+            }
+
+            let now = now_utc();
+            let id = new_id("tsk");
+            let task = Task {
+                id: id.clone(),
+                project: project.id,
+                project_slug: args.project.clone(),
+                phase: phase_id,
+                slug: args.slug.clone(),
+                title: args.title.clone(),
+                body: args.body.clone(),
+                status: TaskStatus::Todo,
+                assignee: String::new(),
+                claimed_at: None,
+                completed_at: None,
+                created_at: now,
+                updated_at: now,
+                notes: Vec::new(),
+                depends_on: args.depends_on.clone(),
+            };
+            match self.store.put_task(&task, None).await {
+                Ok(_) => return Ok(task),
+                Err(StoreError::Conflict) if attempt + 1 >= CAS_MAX_ATTEMPTS => {
+                    return Err(StoreError::Conflict);
+                }
+                Err(StoreError::Conflict) => {
+                    cas_backoff(attempt).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(StoreError::Conflict)
+    }
+
+    /// Service-layer `task.claim` — self-CAS on the task object.
+    pub async fn claim_task(&self, args: &ClaimTask) -> Result<Task, StoreError> {
+        self.cas_mutate_task(&args.id, |task| {
+            apply_claim_task(task, &args.actor, now_utc())
+        })
+        .await
+    }
+
+    /// Service-layer `task.update` — self-CAS on the task object.
+    pub async fn update_task(&self, args: UpdateTask) -> Result<Task, StoreError> {
+        if args.actor.is_empty() {
+            return Err(invalid_msg("actor is required to update a task"));
+        }
+        let UpdateTask {
+            id,
+            body,
+            status,
+            note,
+            actor,
+            depends_on,
+        } = args;
+        let body = body.clone();
+        let note = note.clone();
+        let depends_on = depends_on.clone();
+        let actor = actor.clone();
+        self.cas_mutate_task(&id, move |mut task| {
+            let now = now_utc();
+            if let Some(target) = status {
+                task = apply_task_status_update(task, target, now)?;
+            }
+            if let Some(body) = body.clone() {
+                task = apply_task_body_update(task, body, now)?;
+            }
+            if let Some(depends_on) = depends_on.clone() {
+                task.depends_on = depends_on;
+            }
+            if let Some(note) = note.clone() {
+                append_task_note(&mut task, now, &actor, &note)?;
+            }
+            task.updated_at = now;
+            Ok(task)
+        })
+        .await
+    }
+
+    /// Service-layer `task.complete` — self-CAS on the task object.
+    pub async fn complete_task(&self, args: CompleteTask) -> Result<Task, StoreError> {
+        if args.actor.is_empty() {
+            return Err(invalid_msg("actor is required to complete a task"));
+        }
+        let CompleteTask { id, note, actor } = args;
+        let note = note.clone();
+        let actor = actor.clone();
+        self.cas_mutate_task(&id, move |mut task| {
+            let now = now_utc();
+            task = apply_complete_task(task, now)?;
+            if let Some(note) = note.clone() {
+                append_task_note(&mut task, now, &actor, &note)?;
+            }
+            Ok(task)
+        })
+        .await
+    }
+
+    async fn cas_mutate_task<F>(&self, id: &str, mut apply: F) -> Result<Task, StoreError>
+    where
+        F: FnMut(Task) -> Result<Task, AnyhowError>,
+    {
+        for attempt in 0..CAS_MAX_ATTEMPTS {
+            let Versioned {
+                value: current,
+                version,
+            } = self.store.get_task(id).await?;
+            match apply(current.clone()) {
+                Err(e) => return Err(domain_err(&e)),
+                Ok(updated)
+                    if updated.updated_at == current.updated_at
+                        && task_logical_eq(&updated, &current) =>
+                {
+                    return Ok(updated);
+                }
+                Ok(updated) => match self.store.put_task(&updated, Some(version)).await {
+                    Ok(_) => return Ok(updated),
+                    Err(StoreError::Conflict) => {
+                        let Versioned {
+                            value: reread,
+                            version: _,
+                        } = self.store.get_task(id).await?;
+                        match apply(reread.clone()) {
+                            Err(e) => return Err(domain_err(&e)),
+                            Ok(desired)
+                                if desired.updated_at == reread.updated_at
+                                    && task_logical_eq(&desired, &reread) =>
+                            {
+                                return Ok(desired);
+                            }
+                            Ok(_) => {
+                                if attempt + 1 >= CAS_MAX_ATTEMPTS {
+                                    return Err(StoreError::Conflict);
+                                }
+                                cas_backoff(attempt).await;
+                            }
+                        }
+                    }
+                    Err(e) => return Err(e),
+                },
+            }
+        }
+        Err(StoreError::Conflict)
     }
 }
 
@@ -1260,18 +1580,17 @@ mod tests {
             .expect("seed project")
     }
 
-    fn seed_task(store: &FsStore, project: &str, slug: &str) -> Task {
-        store
-            .create_task(NewTask {
-                project: project.to_owned(),
-                phase: None,
-                slug: slug.to_owned(),
-                title: slug.to_owned(),
-                body: String::new(),
-                actor: "human:test".to_owned(),
-                depends_on: Vec::new(),
-            })
-            .expect("seed task")
+    fn seed_task(svc: &MeshService, project: &str, slug: &str) -> Task {
+        block_on(svc.create_task(NewTask {
+            project: project.to_owned(),
+            phase: None,
+            slug: slug.to_owned(),
+            title: slug.to_owned(),
+            body: String::new(),
+            actor: "human:test".to_owned(),
+            depends_on: Vec::new(),
+        }))
+        .expect("seed task")
     }
 
     fn task_file_path(corpus: &Path, task: &Task) -> PathBuf {
@@ -1762,28 +2081,26 @@ mod tests {
                 owner: "human:test".to_owned(),
             })
             .unwrap();
-        store
-            .create_task(NewTask {
-                project: "alpha".to_owned(),
-                phase: None,
-                slug: "ta".to_owned(),
-                title: "task has needle".to_owned(),
-                body: String::new(),
-                actor: "t".to_owned(),
-                depends_on: Vec::new(),
-            })
-            .unwrap();
-        store
-            .create_task(NewTask {
-                project: "beta".to_owned(),
-                phase: None,
-                slug: "tb".to_owned(),
-                title: "task has needle".to_owned(),
-                body: String::new(),
-                actor: "t".to_owned(),
-                depends_on: Vec::new(),
-            })
-            .unwrap();
+        block_on(svc.create_task(NewTask {
+            project: "alpha".to_owned(),
+            phase: None,
+            slug: "ta".to_owned(),
+            title: "task has needle".to_owned(),
+            body: String::new(),
+            actor: "t".to_owned(),
+            depends_on: Vec::new(),
+        }))
+        .expect("seed alpha task");
+        block_on(svc.create_task(NewTask {
+            project: "beta".to_owned(),
+            phase: None,
+            slug: "tb".to_owned(),
+            title: "task has needle".to_owned(),
+            body: String::new(),
+            actor: "t".to_owned(),
+            depends_on: Vec::new(),
+        }))
+        .expect("seed beta task");
 
         let all = search_hits(
             &svc,
@@ -1859,17 +2176,16 @@ mod tests {
                 owner: "human:test".to_owned(),
             })
             .unwrap();
-        store
-            .create_task(NewTask {
-                project: "p1".to_owned(),
-                phase: Some("ph1".to_owned()),
-                slug: "tsk".to_owned(),
-                title: "TITLEKEY-delta task".to_owned(),
-                body: "BODYKEY-epsilon in spec".to_owned(),
-                actor: "t".to_owned(),
-                depends_on: Vec::new(),
-            })
-            .unwrap();
+        block_on(svc.create_task(NewTask {
+            project: "p1".to_owned(),
+            phase: Some("ph1".to_owned()),
+            slug: "tsk".to_owned(),
+            title: "TITLEKEY-delta task".to_owned(),
+            body: "BODYKEY-epsilon in spec".to_owned(),
+            actor: "t".to_owned(),
+            depends_on: Vec::new(),
+        }))
+        .expect("seed task");
 
         let t_alpha = search_hits(
             &svc,
@@ -1939,8 +2255,8 @@ mod tests {
         let store = seed_store(tmp.path());
         let svc = MeshService::new(FsStore::open(tmp.path()).expect("open service store"));
         seed_project(&store, "alpha");
-        let a = seed_task(&store, "alpha", "one-match");
-        let b = seed_task(&store, "alpha", "triple");
+        let a = seed_task(&svc, "alpha", "one-match");
+        let b = seed_task(&svc, "alpha", "triple");
         set_task_body(tmp.path(), &a, "needleonce");
         set_task_body(tmp.path(), &b, "needleneedleneedle");
         let hits = search_hits(
@@ -1965,8 +2281,8 @@ mod tests {
         let store = seed_store(tmp.path());
         let svc = MeshService::new(FsStore::open(tmp.path()).expect("open service store"));
         seed_project(&store, "alpha");
-        let a = seed_task(&store, "alpha", "oldhit");
-        let b = seed_task(&store, "alpha", "newhit");
+        let a = seed_task(&svc, "alpha", "oldhit");
+        let b = seed_task(&svc, "alpha", "newhit");
         set_task_body(tmp.path(), &a, "sameneedle");
         set_task_body(tmp.path(), &b, "sameneedle");
         set_task_field(tmp.path(), &a, "updated_at", "2026-01-01T00:00:00Z");
@@ -1994,7 +2310,7 @@ mod tests {
         seed_project(&store, "alpha");
         for i in 0..5 {
             let slug = format!("t{i}");
-            let task = seed_task(&store, "alpha", &slug);
+            let task = seed_task(&svc, "alpha", &slug);
             set_task_body(tmp.path(), &task, &format!("{} needle", "x".repeat(i + 1)));
             set_task_field(
                 tmp.path(),
@@ -2024,18 +2340,17 @@ mod tests {
         let store = seed_store(tmp.path());
         let svc = MeshService::new(FsStore::open(tmp.path()).expect("open service store"));
         seed_project(&store, "alpha");
-        let task = seed_task(&store, "alpha", "n");
+        let task = seed_task(&svc, "alpha", "n");
         set_task_body(tmp.path(), &task, "spec has no secret");
-        store
-            .update_task(UpdateTask {
-                id: task.id,
-                body: None,
-                status: None,
-                note: Some("note about zzzuniquezzz term".to_owned()),
-                actor: "t".to_owned(),
-                depends_on: None,
-            })
-            .unwrap();
+        block_on(svc.update_task(UpdateTask {
+            id: task.id,
+            body: None,
+            status: None,
+            note: Some("note about zzzuniquezzz term".to_owned()),
+            actor: "t".to_owned(),
+            depends_on: None,
+        }))
+        .expect("append note");
         let hits = search_hits(
             &svc,
             SearchArgs {
@@ -2500,5 +2815,83 @@ mod tests {
         assert_eq!(f.order_by, Some(TaskOrderField::ClaimedAt));
         assert_eq!(f.desc, Some(true));
         assert_eq!(f.limit, Some(99));
+    }
+
+    #[test]
+    fn claim_cas_one_winner_one_terminal() {
+        use crate::store::{ClaimTask, StoreError};
+
+        for _ in 0..8 {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(tmp.path().join(".dossier")).expect("mkdir .dossier");
+            let store = seed_store(tmp.path());
+            seed_project(&store, "race");
+            let svc = MeshService::new(FsStore::open(tmp.path()).expect("open race corpus"));
+            let task = seed_task(&svc, "race", "target");
+
+            block_on(svc.claim_task(&ClaimTask {
+                id: task.id.clone(),
+                actor: "alice".to_owned(),
+            }))
+            .expect("first claim wins");
+
+            let err = block_on(svc.claim_task(&ClaimTask {
+                id: task.id,
+                actor: "bob".to_owned(),
+            }))
+            .expect_err("second claim must terminal-reject");
+            let StoreError::Invalid(msg) = err else {
+                panic!("expected terminal invalid error, got {err:?}");
+            };
+            assert!(
+                msg.contains("already claimed"),
+                "unexpected terminal message: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn create_task_cas_slug_one_winner_one_terminal() {
+        use crate::domain::TaskListFilter;
+        use crate::store::StoreError;
+
+        for _ in 0..8 {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(tmp.path().join(".dossier")).expect("mkdir .dossier");
+            let store = seed_store(tmp.path());
+            seed_project(&store, "race");
+            let svc = MeshService::new(FsStore::open(tmp.path()).expect("open race corpus"));
+            let args = NewTask {
+                project: "race".to_owned(),
+                phase: None,
+                slug: "dupe".to_owned(),
+                title: "Dupe".to_owned(),
+                body: String::new(),
+                actor: "human:test".to_owned(),
+                depends_on: Vec::new(),
+            };
+            block_on(svc.create_task(args.clone())).expect("first create wins");
+            let err =
+                block_on(svc.create_task(args)).expect_err("duplicate slug must terminal-reject");
+            let StoreError::Invalid(msg) = err else {
+                panic!("expected terminal invalid error, got {err:?}");
+            };
+            assert!(
+                msg.contains("task slug already exists in project"),
+                "unexpected terminal message: {msg}"
+            );
+
+            let listed = store
+                .list_tasks(&TaskListFilter {
+                    project: Some("race".to_owned()),
+                    ..Default::default()
+                })
+                .expect("list tasks");
+            assert_eq!(
+                listed.iter().filter(|t| t.slug == "dupe").count(),
+                1,
+                "project must hold exactly one task with slug dupe"
+            );
+        }
     }
 }

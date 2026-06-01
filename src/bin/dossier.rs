@@ -8,7 +8,7 @@ use serde::Serialize;
 
 use dossier::domain::{Task, TaskListFilter, TaskStatus};
 use dossier::server::MeshService;
-use dossier::store::{CompleteTask, FsStore, LinkArtifact, UpdateTask};
+use dossier::store::{CompleteTask, FsStore, LinkArtifact, StoreError, UpdateTask};
 
 #[derive(Parser)]
 #[command(
@@ -119,10 +119,10 @@ async fn main() -> Result<()> {
             run_serve(&corpus).await
         }
         Command::TaskComplete { id, note, actor } => {
-            run_task_complete(&resolve_corpus(cli.corpus)?, id, note, actor)
+            run_task_complete(&resolve_corpus(cli.corpus)?, id, note, actor).await
         }
         Command::TaskUpdate { id, note, actor } => {
-            run_task_update(&resolve_corpus(cli.corpus)?, id, note, actor)
+            run_task_update(&resolve_corpus(cli.corpus)?, id, note, actor).await
         }
         Command::ArtifactLink {
             project,
@@ -219,7 +219,7 @@ fn parse_task_status(raw: &str) -> Result<TaskStatus> {
     }
 }
 
-fn run_task_complete(
+async fn run_task_complete(
     corpus: &Path,
     id: String,
     note: Option<String>,
@@ -233,25 +233,47 @@ fn run_task_complete(
             return Ok(());
         }
     }
-    let task = store.complete_task(CompleteTask {
-        id,
-        note,
-        actor: default_actor(actor),
-    })?;
+    let svc = MeshService::new(store);
+    let task = svc
+        .complete_task(CompleteTask {
+            id,
+            note,
+            actor: default_actor(actor),
+        })
+        .await
+        .map_err(store_error_to_anyhow)?;
     emit_json(&task)
 }
 
-fn run_task_update(corpus: &Path, id: String, note: String, actor: Option<String>) -> Result<()> {
-    let store = FsStore::open(corpus)?;
-    let task = store.update_task(UpdateTask {
-        id,
-        body: None,
-        status: None,
-        note: Some(note),
-        actor: default_actor(actor),
-        depends_on: None,
-    })?;
+async fn run_task_update(
+    corpus: &Path,
+    id: String,
+    note: String,
+    actor: Option<String>,
+) -> Result<()> {
+    let svc = MeshService::new(FsStore::open(corpus)?);
+    let task = svc
+        .update_task(UpdateTask {
+            id,
+            body: None,
+            status: None,
+            note: Some(note),
+            actor: default_actor(actor),
+            depends_on: None,
+        })
+        .await
+        .map_err(store_error_to_anyhow)?;
     emit_json(&task)
+}
+
+fn store_error_to_anyhow(err: StoreError) -> anyhow::Error {
+    match err {
+        StoreError::NotFound => anyhow::anyhow!("not found"),
+        StoreError::Conflict => anyhow::anyhow!("conflict"),
+        StoreError::Unavailable => anyhow::anyhow!("unavailable"),
+        StoreError::Invalid(msg) => anyhow::anyhow!("{msg}"),
+        StoreError::Io(io) => io.into(),
+    }
 }
 
 fn run_artifact_link(corpus: &Path, req: ArtifactLinkRequest) -> Result<()> {

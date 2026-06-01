@@ -18,7 +18,8 @@
 
 use std::fs;
 
-use dossier::store::FsStore;
+use dossier::server::MeshService;
+use dossier::store::{FsStore, StoreError};
 use tempfile::TempDir;
 
 /// A fresh, isolated corpus rooted in a `TempDir`. The `TempDir` is held
@@ -29,4 +30,20 @@ pub fn fresh_corpus() -> (TempDir, FsStore) {
     fs::create_dir_all(tmp.path().join(".dossier")).expect("mkdir .dossier");
     let store = FsStore::open(tmp.path()).expect("open fresh corpus");
     (tmp, store)
+}
+
+/// Fresh corpus wrapped in a [`MeshService`] for task-verb tests.
+pub fn fresh_service() -> (TempDir, MeshService) {
+    let (tmp, store) = fresh_corpus();
+    (tmp, MeshService::new(store))
+}
+
+pub fn block_on<F: std::future::Future<Output = Result<T, StoreError>>, T>(
+    future: F,
+) -> Result<T, StoreError> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(future)
 }

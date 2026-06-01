@@ -3,7 +3,7 @@
 //! The model is the enum `Op` mirroring the legal MCP-facing verbs:
 //! `task.claim`, `task.update`, `task.complete`. We generate a short
 //! sequence of `Op`s and assert invariants after every step — once
-//! against a real `FsStore` and once against the pure `domain` transition
+//! against a real `MeshService` and once against the pure `domain` transition
 //! fns (no I/O). Shrinking finds the smallest violating sequence.
 //!
 //! Invariants:
@@ -35,11 +35,12 @@ use dossier::domain::{
     validate_task_update_transition, ClaimTask, CompleteTask, NewProject, NewTask, Task,
     TaskListFilter, TaskStatus, UpdateTask,
 };
+use dossier::server::MeshService;
 use dossier::store::FsStore;
 use proptest::prelude::*;
 
 mod common;
-use common::fresh_corpus;
+use common::{block_on, fresh_service};
 
 const PROJECT_SLUG: &str = "model-test";
 const TASK_SLUG: &str = "subject";
@@ -85,33 +86,33 @@ fn op_strategy() -> impl Strategy<Value = Op> {
     ]
 }
 
-fn apply_store(store: &FsStore, op: Op, task_id: &str) {
+fn apply_service(svc: &MeshService, op: Op, task_id: &str) {
     let _ = match op {
-        Op::Claim { actor } => store.claim_task(&ClaimTask {
+        Op::Claim { actor } => block_on(svc.claim_task(&ClaimTask {
             id: task_id.to_owned(),
             actor,
-        }),
-        Op::UpdateStatus { to, actor } => store.update_task(UpdateTask {
+        })),
+        Op::UpdateStatus { to, actor } => block_on(svc.update_task(UpdateTask {
             id: task_id.to_owned(),
             body: None,
             status: Some(to),
             note: None,
             actor,
             depends_on: None,
-        }),
-        Op::Complete { actor } => store.complete_task(CompleteTask {
+        })),
+        Op::Complete { actor } => block_on(svc.complete_task(CompleteTask {
             id: task_id.to_owned(),
             note: None,
             actor,
-        }),
-        Op::UpdateBody { body, actor } => store.update_task(UpdateTask {
+        })),
+        Op::UpdateBody { body, actor } => block_on(svc.update_task(UpdateTask {
             id: task_id.to_owned(),
             body: Some(body),
             status: None,
             note: None,
             actor,
             depends_on: None,
-        }),
+        })),
     };
 }
 
@@ -260,14 +261,15 @@ proptest! {
 
     #[test]
     fn state_machine_invariants(ops in proptest::collection::vec(op_strategy(), 0..=8)) {
-        let (_tmp, store) = fresh_corpus();
+        let (tmp, svc) = fresh_service();
+        let store = FsStore::open(tmp.path()).expect("reopen for reads");
         store.create_project(NewProject {
             slug: PROJECT_SLUG.into(),
             title: "M".into(),
             description: String::new(),
             actor: "human:michael".into(),
         }).expect("create_project");
-        let task = store.create_task(NewTask {
+        let task = block_on(svc.create_task(NewTask {
             project: PROJECT_SLUG.into(),
             phase: None,
             slug: TASK_SLUG.into(),
@@ -275,7 +277,7 @@ proptest! {
             body: String::new(),
             actor: "human:michael".into(),
             depends_on: Vec::new(),
-        }).expect("create_task");
+        })).expect("create_task");
         let task_id = task.id.clone();
 
         prop_assert_eq!(task.status, TaskStatus::Todo);
@@ -289,14 +291,14 @@ proptest! {
             let pre = current_state(&store);
             if let Op::UpdateStatus { to, actor } = op.clone() {
                 if matches!(to, TaskStatus::Claimed | TaskStatus::Done) {
-                    let result = store.update_task(UpdateTask {
+                    let result = block_on(svc.update_task(UpdateTask {
                         id: task_id.clone(),
                         body: None,
                         status: Some(to),
                         note: None,
                         actor,
                         depends_on: None,
-                    });
+                    }));
                     prop_assert!(result.is_err(), "invariant 3 violated: update accepted {:?}", to);
                     let post = current_state(&store);
                     assert_invariants_after_step(
@@ -305,7 +307,7 @@ proptest! {
                     continue;
                 }
             }
-            apply_store(&store, op.clone(), &task_id);
+            apply_service(&svc, op.clone(), &task_id);
             let post = current_state(&store);
             assert_invariants_after_step(
                 &pre, &post, op, &mut once_terminal, &mut frozen_completed_at, &mut last_updated_at,
@@ -349,14 +351,15 @@ proptest! {
 
     #[test]
     fn claim_is_idempotent_for_same_actor(actor in actor_strategy()) {
-        let (_tmp, store) = fresh_corpus();
+        let (tmp, svc) = fresh_service();
+        let store = FsStore::open(tmp.path()).expect("reopen for project create");
         store.create_project(NewProject {
             slug: PROJECT_SLUG.into(),
             title: "M".into(),
             description: String::new(),
             actor: "human:michael".into(),
         }).expect("create_project");
-        let task = store.create_task(NewTask {
+        let task = block_on(svc.create_task(NewTask {
             project: PROJECT_SLUG.into(),
             phase: None,
             slug: TASK_SLUG.into(),
@@ -364,16 +367,16 @@ proptest! {
             body: String::new(),
             actor: "human:michael".into(),
             depends_on: Vec::new(),
-        }).expect("create_task");
+        })).expect("create_task");
 
-        let first = store.claim_task(&ClaimTask {
+        let first = block_on(svc.claim_task(&ClaimTask {
             id: task.id.clone(),
             actor: actor.clone(),
-        }).expect("first claim");
-        let second = store.claim_task(&ClaimTask {
+        })).expect("first claim");
+        let second = block_on(svc.claim_task(&ClaimTask {
             id: task.id,
             actor,
-        }).expect("second claim (no-op)");
+        })).expect("second claim (no-op)");
 
         prop_assert_eq!(first.status, second.status);
         prop_assert_eq!(&first.assignee, &second.assignee);

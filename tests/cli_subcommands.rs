@@ -11,10 +11,13 @@
 
 mod common;
 
+use common::{block_on, fresh_service};
+
 use std::process::Command;
 
-use dossier::domain::{Task, TaskListFilter, TaskStatus};
-use dossier::store::{ClaimTask, CompleteTask, FsStore, NewProject, NewTask, UpdateTask};
+use dossier::domain::{ClaimTask, Task, TaskListFilter, TaskStatus, UpdateTask};
+use dossier::server::MeshService;
+use dossier::store::{CompleteTask, FsStore, NewProject, NewTask};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
@@ -50,43 +53,41 @@ fn seed_project(store: &FsStore, slug: &str) {
         .expect("create project");
 }
 
-fn seed_task(store: &FsStore, project: &str, slug: &str) -> Task {
-    store
-        .create_task(NewTask {
-            project: project.to_owned(),
-            phase: None,
-            slug: slug.to_owned(),
-            title: format!("Task {slug}"),
-            body: "spec body".to_owned(),
-            actor: "human:test".to_owned(),
-            depends_on: Vec::new(),
-        })
-        .expect("create task")
+fn seed_task(svc: &MeshService, project: &str, slug: &str) -> Task {
+    block_on(svc.create_task(NewTask {
+        project: project.to_owned(),
+        phase: None,
+        slug: slug.to_owned(),
+        title: format!("Task {slug}"),
+        body: "spec body".to_owned(),
+        actor: "human:test".to_owned(),
+        depends_on: Vec::new(),
+    }))
+    .expect("create task")
 }
 
-fn advance_to_in_progress(store: &FsStore, id: &str) {
-    store
-        .claim_task(&ClaimTask {
-            id: id.to_owned(),
-            actor: "human:test".to_owned(),
-        })
-        .expect("claim");
-    store
-        .update_task(UpdateTask {
-            id: id.to_owned(),
-            status: Some(TaskStatus::InProgress),
-            actor: "human:test".to_owned(),
-            ..Default::default()
-        })
-        .expect("advance");
+fn advance_to_in_progress(svc: &MeshService, id: &str) {
+    block_on(svc.claim_task(&ClaimTask {
+        id: id.to_owned(),
+        actor: "human:test".to_owned(),
+    }))
+    .expect("claim");
+    block_on(svc.update_task(UpdateTask {
+        id: id.to_owned(),
+        status: Some(TaskStatus::InProgress),
+        actor: "human:test".to_owned(),
+        ..Default::default()
+    }))
+    .expect("advance");
 }
 
 #[test]
 fn cli_task_complete_transitions_in_progress_task_to_done() {
-    let (tmp, store) = common::fresh_corpus();
+    let (tmp, svc) = fresh_service();
+    let store = FsStore::open(tmp.path()).expect("reopen for reads");
     seed_project(&store, "alpha");
-    let task = seed_task(&store, "alpha", "ship-it");
-    advance_to_in_progress(&store, &task.id);
+    let task = seed_task(&svc, "alpha", "ship-it");
+    advance_to_in_progress(&svc, &task.id);
 
     let (code, stdout, stderr) = run_cli(
         tmp.path(),
@@ -110,17 +111,17 @@ fn cli_task_complete_transitions_in_progress_task_to_done() {
 
 #[test]
 fn cli_task_complete_is_idempotent_when_already_done() {
-    let (tmp, store) = common::fresh_corpus();
+    let (tmp, svc) = fresh_service();
+    let store = FsStore::open(tmp.path()).expect("reopen for reads");
     seed_project(&store, "alpha");
-    let task = seed_task(&store, "alpha", "already-done");
-    advance_to_in_progress(&store, &task.id);
-    store
-        .complete_task(CompleteTask {
-            id: task.id.clone(),
-            note: None,
-            actor: "human:test".to_owned(),
-        })
-        .expect("complete");
+    let task = seed_task(&svc, "alpha", "already-done");
+    advance_to_in_progress(&svc, &task.id);
+    block_on(svc.complete_task(CompleteTask {
+        id: task.id.clone(),
+        note: None,
+        actor: "human:test".to_owned(),
+    }))
+    .expect("complete");
 
     let (code, stdout, stderr) = run_cli(
         tmp.path(),
@@ -135,9 +136,10 @@ fn cli_task_complete_is_idempotent_when_already_done() {
 
 #[test]
 fn cli_task_update_appends_duplicate_notes() {
-    let (tmp, store) = common::fresh_corpus();
+    let (tmp, svc) = fresh_service();
+    let store = FsStore::open(tmp.path()).expect("reopen for reads");
     seed_project(&store, "alpha");
-    let task = seed_task(&store, "alpha", "note-me");
+    let task = seed_task(&svc, "alpha", "note-me");
 
     for note in ["first", "first"] {
         let (code, stdout, stderr) = run_cli(
@@ -292,11 +294,12 @@ fn cli_artifact_link_rejects_explicit_empty_task() {
 
 #[test]
 fn cli_task_list_filters_match_store() {
-    let (tmp, store) = common::fresh_corpus();
+    let (tmp, svc) = fresh_service();
+    let store = FsStore::open(tmp.path()).expect("reopen for reads");
     seed_project(&store, "alpha");
-    let todo = seed_task(&store, "alpha", "todo-one");
-    let active = seed_task(&store, "alpha", "active-one");
-    advance_to_in_progress(&store, &active.id);
+    let todo = seed_task(&svc, "alpha", "todo-one");
+    let active = seed_task(&svc, "alpha", "active-one");
+    advance_to_in_progress(&svc, &active.id);
 
     let filter = TaskListFilter {
         project: Some("alpha".to_owned()),
@@ -330,10 +333,11 @@ fn cli_task_list_filters_match_store() {
 
 #[test]
 fn cli_json_matches_store_for_write_verbs() {
-    let (tmp, store) = common::fresh_corpus();
+    let (tmp, svc) = fresh_service();
+    let store = FsStore::open(tmp.path()).expect("reopen for reads");
     seed_project(&store, "alpha");
-    let task = seed_task(&store, "alpha", "parity");
-    advance_to_in_progress(&store, &task.id);
+    let task = seed_task(&svc, "alpha", "parity");
+    advance_to_in_progress(&svc, &task.id);
     let corpus = tmp.path();
 
     let (code, stdout, stderr) = run_cli(
