@@ -46,12 +46,17 @@ pub struct MeshService {
 }
 
 impl MeshService {
-    /// Wrap an opened [`FsStore`] with shared handles and a process-local write lock.
-    pub fn new(store: FsStore) -> Self {
+    /// Wrap a shared [`Store`] backend with a process-local write lock.
+    pub fn from_store(store: Arc<dyn Store>) -> Self {
         Self {
-            store: Arc::new(store),
+            store,
             write_lock: Arc::new(Mutex::new(())),
         }
+    }
+
+    /// Wrap an opened [`FsStore`] with shared handles and a process-local write lock.
+    pub fn new(store: FsStore) -> Self {
+        Self::from_store(Arc::new(store))
     }
 }
 

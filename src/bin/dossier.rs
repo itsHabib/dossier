@@ -1,5 +1,6 @@
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -8,7 +9,10 @@ use serde::Serialize;
 
 use dossier::domain::{Task, TaskListFilter, TaskStatus};
 use dossier::server::MeshService;
-use dossier::store::{store_error_to_anyhow, CompleteTask, FsStore, LinkArtifact, UpdateTask};
+use dossier::store::{
+    store_error_to_anyhow, CompleteTask, FsStore, LinkArtifact, Store, UpdateTask,
+};
+use dossier::{S3Config, S3Store};
 
 #[derive(Parser)]
 #[command(
@@ -162,9 +166,85 @@ async fn main() -> Result<()> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServeBackend {
+    Fs,
+    S3,
+}
+
+fn parse_serve_backend(raw: Option<&str>) -> Result<ServeBackend> {
+    match raw
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("fs")
+    {
+        "fs" => Ok(ServeBackend::Fs),
+        "s3" => Ok(ServeBackend::S3),
+        other => bail!("unknown DOSSIER_BACKEND: {other} (expected fs or s3)"),
+    }
+}
+
+/// Reads an env var, treating an unset var and a blank value alike as absent —
+/// a defined-but-empty `DOSSIER_S3_*` var falls through to the next fallback
+/// instead of sticking as an empty string.
+fn non_empty_env(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|value| !value.is_empty())
+}
+
+fn s3_config_from_env() -> Result<S3Config> {
+    let bucket = std::env::var("DOSSIER_S3_BUCKET")
+        .context("DOSSIER_S3_BUCKET is required when DOSSIER_BACKEND=s3")?;
+    let prefix = std::env::var("DOSSIER_S3_PREFIX").unwrap_or_default();
+    let endpoint_url = non_empty_env("DOSSIER_S3_ENDPOINT");
+    let region = non_empty_env("DOSSIER_S3_REGION")
+        .or_else(|| non_empty_env("AWS_REGION"))
+        .or_else(|| non_empty_env("AWS_DEFAULT_REGION"))
+        .unwrap_or_else(|| "us-east-1".to_owned());
+    let access_key_id = std::env::var("AWS_ACCESS_KEY_ID")
+        .context("AWS_ACCESS_KEY_ID is required when DOSSIER_BACKEND=s3")?;
+    let secret_access_key = std::env::var("AWS_SECRET_ACCESS_KEY")
+        .context("AWS_SECRET_ACCESS_KEY is required when DOSSIER_BACKEND=s3")?;
+    let force_path_style = match std::env::var("DOSSIER_S3_FORCE_PATH_STYLE") {
+        Ok(raw) => parse_env_bool(&raw)
+            .with_context(|| format!("invalid DOSSIER_S3_FORCE_PATH_STYLE: {raw}"))?,
+        Err(_) => endpoint_url.is_some(),
+    };
+    Ok(S3Config {
+        bucket,
+        prefix,
+        endpoint_url,
+        region,
+        access_key_id,
+        secret_access_key,
+        force_path_style,
+    })
+}
+
+fn parse_env_bool(raw: &str) -> Result<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" => Ok(true),
+        "0" | "false" | "no" => Ok(false),
+        other => bail!("expected true/false, got {other}"),
+    }
+}
+
+async fn open_serve_store(backend: ServeBackend, corpus: &Path) -> Result<Arc<dyn Store>> {
+    match backend {
+        ServeBackend::Fs => Ok(Arc::new(FsStore::open(corpus)?)),
+        ServeBackend::S3 => {
+            // `corpus` is an FsStore concept; the S3 backend is configured
+            // entirely from the environment, so the path is intentionally unused.
+            let store = S3Store::new(s3_config_from_env()?)
+                .await
+                .map_err(store_error_to_anyhow)?;
+            Ok(Arc::new(store))
+        }
+    }
+}
+
 async fn run_serve(corpus: &Path) -> Result<()> {
-    let store = FsStore::open(corpus)?;
-    let service = MeshService::new(store);
+    let backend = parse_serve_backend(std::env::var("DOSSIER_BACKEND").ok().as_deref())?;
+    let service = MeshService::from_store(open_serve_store(backend, corpus).await?);
     let server = service.serve(stdio()).await?;
     server.waiting().await?;
     Ok(())
@@ -336,4 +416,98 @@ fn run_task_list(
     let store = FsStore::open(corpus)?;
     let tasks: Vec<Task> = store.list_tasks(&filter)?;
     emit_json(&tasks)
+}
+
+#[cfg(test)]
+mod backend_tests {
+    #![allow(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        reason = "unit tests"
+    )]
+
+    use super::*;
+    use std::fs;
+
+    use dossier::store::ProjectListFilter;
+
+    fn temp_corpus() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(dir.path().join(".dossier")).expect("mkdir .dossier");
+        dir
+    }
+
+    #[test]
+    fn parse_serve_backend_defaults_to_fs() {
+        assert_eq!(
+            parse_serve_backend(None).expect("fs default"),
+            ServeBackend::Fs
+        );
+        assert_eq!(
+            parse_serve_backend(Some("fs")).expect("fs explicit"),
+            ServeBackend::Fs
+        );
+        assert_eq!(
+            parse_serve_backend(Some("")).expect("empty -> fs"),
+            ServeBackend::Fs
+        );
+        assert_eq!(
+            parse_serve_backend(Some("  ")).expect("blank -> fs"),
+            ServeBackend::Fs
+        );
+    }
+
+    #[test]
+    fn parse_serve_backend_selects_s3() {
+        assert_eq!(
+            parse_serve_backend(Some("s3")).expect("s3"),
+            ServeBackend::S3
+        );
+    }
+
+    #[test]
+    fn parse_serve_backend_rejects_unknown() {
+        let err = parse_serve_backend(Some("git")).expect_err("unknown backend");
+        assert!(err
+            .to_string()
+            .contains("unknown DOSSIER_BACKEND: git (expected fs or s3)"));
+    }
+
+    #[tokio::test]
+    async fn open_serve_store_fs_opens_local_corpus() {
+        let corpus = temp_corpus();
+        let store = open_serve_store(ServeBackend::Fs, corpus.path())
+            .await
+            .expect("fs store");
+        let projects = store
+            .list_projects(ProjectListFilter::default())
+            .await
+            .expect("list projects");
+        assert!(projects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn open_serve_store_s3_from_env_when_minio_configured() {
+        let endpoint = match std::env::var("DOSSIER_S3_TEST_ENDPOINT") {
+            Ok(value) if !value.is_empty() => value,
+            _ => return,
+        };
+        let access_key =
+            std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_else(|_| "minioadmin".to_owned());
+        let secret_key =
+            std::env::var("AWS_SECRET_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".to_owned());
+        std::env::set_var("DOSSIER_S3_BUCKET", "dossier-it");
+        std::env::set_var(
+            "DOSSIER_S3_PREFIX",
+            format!("it/serve-{}", ulid::Ulid::new()),
+        );
+        std::env::set_var("DOSSIER_S3_ENDPOINT", &endpoint);
+        std::env::set_var("AWS_ACCESS_KEY_ID", &access_key);
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", &secret_key);
+        let corpus = temp_corpus();
+        open_serve_store(ServeBackend::S3, corpus.path())
+            .await
+            .expect("s3 store");
+    }
 }
