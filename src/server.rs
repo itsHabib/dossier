@@ -1428,6 +1428,12 @@ impl MeshService {
         if args.slug.is_empty() {
             return Err(invalid_msg("slug is required"));
         }
+        if !is_valid_slug(&args.slug) {
+            return Err(invalid_msg(format!(
+                "slug must be lowercase ascii (a-z, 0-9, -, _): {}",
+                args.slug
+            )));
+        }
         match self.store.get_project(&args.slug).await {
             Ok(_) => {
                 return Err(invalid_msg(format!(
@@ -1459,6 +1465,12 @@ impl MeshService {
         if args.slug.is_empty() {
             return Err(invalid_msg("slug is required"));
         }
+        if !is_valid_slug(&args.slug) {
+            return Err(invalid_msg(format!(
+                "slug must be lowercase ascii (a-z, 0-9, -, _): {}",
+                args.slug
+            )));
+        }
         let Versioned {
             value: mut project,
             version,
@@ -1487,6 +1499,12 @@ impl MeshService {
     pub async fn add_phase(&self, args: &NewPhase) -> Result<Phase, StoreError> {
         if args.project.is_empty() {
             return Err(invalid_msg("project is required"));
+        }
+        if !is_valid_slug(&args.project) {
+            return Err(invalid_msg(format!(
+                "slug must be lowercase ascii (a-z, 0-9, -, _): {}",
+                args.project
+            )));
         }
         if args.actor.is_empty() {
             return Err(invalid_msg("actor is required to add a phase"));
@@ -1576,6 +1594,12 @@ impl MeshService {
         if args.project.is_empty() || args.slug.is_empty() {
             return Err(invalid_msg("project and slug are required"));
         }
+        if !is_valid_slug(&args.project) {
+            return Err(invalid_msg(format!(
+                "slug must be lowercase ascii (a-z, 0-9, -, _): {}",
+                args.project
+            )));
+        }
         let Versioned {
             value: mut phase,
             version,
@@ -1616,6 +1640,12 @@ impl MeshService {
         }
         if args.project.is_empty() {
             return Err(invalid_msg("project is required"));
+        }
+        if !is_valid_slug(&args.project) {
+            return Err(invalid_msg(format!(
+                "slug must be lowercase ascii (a-z, 0-9, -, _): {}",
+                args.project
+            )));
         }
         if args.kind.is_empty() {
             return Err(invalid_msg("kind is required"));
@@ -1810,7 +1840,7 @@ mod tests {
 
     use super::*;
     use crate::domain::{SearchArgs, SearchKind, TaskGetArgs};
-    use crate::store::{NewPhase, NewProject, NewTask, UpdateTask};
+    use crate::store::{NewPhase, NewProject, NewTask, StoreError, UpdateTask};
     use rmcp::model::ErrorCode;
     use std::path::{Path, PathBuf};
 
@@ -3418,5 +3448,85 @@ mod tests {
             .await
             .expect("add b");
         assert_ne!(phase_a.order, phase_b.order);
+    }
+
+    const INVALID_PROJECT_SLUG: &str = "Bad-Slug";
+
+    fn assert_rejects_invalid_project_slug(err: StoreError, slug: &str) {
+        let StoreError::Invalid(msg) = err else {
+            panic!("expected invalid error, got {err:?}");
+        };
+        assert!(
+            msg.contains("slug must be lowercase ascii"),
+            "unexpected message: {msg}"
+        );
+        assert!(msg.contains(slug), "message should include slug: {msg}");
+    }
+
+    #[test]
+    fn create_project_rejects_invalid_project_slug() {
+        let (_tmp, svc) = fresh_service();
+        let err = block_on(svc.create_project(NewProject {
+            slug: INVALID_PROJECT_SLUG.to_owned(),
+            title: "Bad".to_owned(),
+            description: String::new(),
+            actor: "human:test".to_owned(),
+        }))
+        .expect_err("invalid project slug must reject");
+        assert_rejects_invalid_project_slug(err, INVALID_PROJECT_SLUG);
+    }
+
+    #[test]
+    fn update_project_rejects_invalid_project_slug() {
+        let (_tmp, svc) = fresh_service();
+        let err = block_on(svc.update_project(UpdateProject {
+            slug: INVALID_PROJECT_SLUG.to_owned(),
+            ..Default::default()
+        }))
+        .expect_err("invalid project slug must reject");
+        assert_rejects_invalid_project_slug(err, INVALID_PROJECT_SLUG);
+    }
+
+    #[test]
+    fn add_phase_rejects_invalid_project_slug() {
+        let (_tmp, svc) = fresh_service();
+        let err = block_on(svc.add_phase(&NewPhase {
+            project: INVALID_PROJECT_SLUG.to_owned(),
+            slug: "valid-phase".to_owned(),
+            title: "Phase".to_owned(),
+            body: String::new(),
+            after_phase: None,
+            actor: "human:test".to_owned(),
+            owner: "human:test".to_owned(),
+        }))
+        .expect_err("invalid project slug must reject");
+        assert_rejects_invalid_project_slug(err, INVALID_PROJECT_SLUG);
+    }
+
+    #[test]
+    fn update_phase_rejects_invalid_project_slug() {
+        let (_tmp, svc) = fresh_service();
+        let err = block_on(svc.update_phase(UpdatePhase {
+            project: INVALID_PROJECT_SLUG.to_owned(),
+            slug: "spec".to_owned(),
+            ..Default::default()
+        }))
+        .expect_err("invalid project slug must reject");
+        assert_rejects_invalid_project_slug(err, INVALID_PROJECT_SLUG);
+    }
+
+    #[test]
+    fn link_artifact_rejects_invalid_project_slug() {
+        let (_tmp, svc) = fresh_service();
+        let err = block_on(svc.link_artifact(LinkArtifact {
+            project: INVALID_PROJECT_SLUG.to_owned(),
+            task: None,
+            kind: "pr".to_owned(),
+            reference: "https://example.com/pr/1".to_owned(),
+            label: "PR".to_owned(),
+            actor: "human:test".to_owned(),
+        }))
+        .expect_err("invalid project slug must reject");
+        assert_rejects_invalid_project_slug(err, INVALID_PROJECT_SLUG);
     }
 }
