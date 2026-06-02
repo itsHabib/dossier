@@ -14,7 +14,7 @@ batches:
   - id: 1
     label: S3 cutover — ready now
     depends_on: []
-    status: pending
+    status: done
     streams:
       - task_id: tsk_01KT1WPR0ND4RYCB5MTC5VYANZ
         task_slug: wire-s3-backend-bin-config
@@ -22,19 +22,25 @@ batches:
         branch_name: s3-cutover/wire-s3-backend-bin-config
         runtime: local
         touches: [src/server.rs, src/bin/dossier.rs]
-        status: pending
+        status: done
+        pr_number: 72
+        merge_commit: 6cac884efd34a8731357ad5a388fa1d98cf10edf
+        merged_at: 2026-06-02T05:14:10Z
       - task_id: tsk_01KT1WQ1NWPVBH5PMEDNJ2N596
         task_slug: s3-shift-phases-idempotency-perf
         spec_path: docs/features/s3-cutover/s3-shift-phases-idempotency-perf.md
         branch_name: s3-cutover/s3-shift-phases-idempotency-perf
         runtime: local
         touches: [src/s3store.rs]
-        status: pending
+        status: done
+        pr_number: 73
+        merge_commit: 703f5fe38c295bdc6d574d74a5781cde08956078
+        merged_at: 2026-06-02T05:12:17Z
 
   - id: 2
     label: review hygiene — after batch 1
     depends_on: [1]
-    status: pending
+    status: done
     streams:
       - task_id: tsk_01KT1WPV5S2619WMFKEMHB5SDZ
         task_slug: service-slug-validation
@@ -42,14 +48,20 @@ batches:
         branch_name: s3-cutover/service-slug-validation
         runtime: local
         touches: [src/server.rs]
-        status: pending
+        status: done
+        pr_number: 74
+        merge_commit: d5968d32fb1429828ac6f1c6f940d18c3c31ae9a
+        merged_at: 2026-06-02T05:40:28Z
       - task_id: tsk_01KT1WQ3M3V9TMCN101YF7RQ8G
         task_slug: cli-artifact-double-read
         spec_path: docs/features/s3-cutover/cli-artifact-double-read.md
         branch_name: s3-cutover/cli-artifact-double-read
         runtime: local
         touches: [src/bin/dossier.rs]
-        status: pending
+        status: done
+        pr_number: 75
+        merge_commit: 88b27015c271dafe16c107d9e9c92be93277fe84
+        merged_at: 2026-06-02T05:49:11Z
 
 conflict_notes:
   - kind: file_overlap
