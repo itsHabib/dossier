@@ -354,22 +354,11 @@ async fn run_artifact_link(corpus: &Path, req: ArtifactLinkRequest) -> Result<()
     if matches!(req.task.as_deref(), Some("")) {
         bail!("task is empty");
     }
-    let store = FsStore::open(corpus)?;
-    let task_key = req.task.clone().unwrap_or_default();
     let label = req.label.unwrap_or_else(|| req.reference.clone());
-    if let Some(existing) =
-        find_linked_artifact(&store, &req.project, &task_key, &req.kind, &req.reference)?
-    {
-        eprintln!(
-            "artifact already linked for project {} kind {} ref {} (no-op)",
-            req.project, req.kind, req.reference
-        );
-        emit_json(&existing)?;
-        return Ok(());
-    }
-    let svc = MeshService::new(store);
-    let artifact = svc
-        .link_artifact(LinkArtifact {
+    let project_slug = req.project.clone();
+    let svc = MeshService::new(FsStore::open(corpus)?);
+    let (artifact, already_linked) = svc
+        .link_artifact_outcome(LinkArtifact {
             project: req.project,
             task: req.task,
             kind: req.kind,
@@ -379,20 +368,13 @@ async fn run_artifact_link(corpus: &Path, req: ArtifactLinkRequest) -> Result<()
         })
         .await
         .map_err(store_error_to_anyhow)?;
+    if already_linked {
+        eprintln!(
+            "artifact already linked for project {} kind {} ref {} (no-op)",
+            project_slug, artifact.kind, artifact.reference
+        );
+    }
     emit_json(&artifact)
-}
-
-fn find_linked_artifact(
-    store: &FsStore,
-    project: &str,
-    task: &str,
-    kind: &str,
-    reference: &str,
-) -> Result<Option<dossier::domain::Artifact>> {
-    Ok(store
-        .list_artifacts(project)?
-        .into_iter()
-        .find(|a| a.task == task && a.kind == kind && a.reference == reference))
 }
 
 fn run_task_list(

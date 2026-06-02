@@ -1635,6 +1635,17 @@ impl MeshService {
 
     /// Service-layer `artifact.link` — validates inputs, idempotent on (task, kind, ref).
     pub async fn link_artifact(&self, args: LinkArtifact) -> Result<Artifact, StoreError> {
+        self.link_artifact_outcome(args)
+            .await
+            .map(|(artifact, _existed)| artifact)
+    }
+
+    /// Like [`link_artifact`](Self::link_artifact), but also reports whether an
+    /// existing row matched (`true`) versus a new row appended (`false`).
+    pub async fn link_artifact_outcome(
+        &self,
+        args: LinkArtifact,
+    ) -> Result<(Artifact, bool), StoreError> {
         if args.actor.is_empty() {
             return Err(invalid_msg("actor is required to link an artifact"));
         }
@@ -1705,10 +1716,10 @@ impl MeshService {
             })
             .await?;
         if let Some(artifact) = existing
-            .iter()
+            .into_iter()
             .find(|a| a.task == task_id && a.kind == args.kind && a.reference == args.reference)
         {
-            return Ok(artifact.clone());
+            return Ok((artifact, true));
         }
 
         let now = now_utc();
@@ -1723,7 +1734,7 @@ impl MeshService {
             actor: args.actor,
         };
         self.store.put_artifact(&artifact).await?;
-        Ok(artifact)
+        Ok((artifact, false))
     }
 }
 
