@@ -358,7 +358,7 @@ async fn run_artifact_link(corpus: &Path, req: ArtifactLinkRequest) -> Result<()
     let project_slug = req.project.clone();
     let svc = MeshService::new(FsStore::open(corpus)?);
     let (artifact, already_linked) = svc
-        .link_artifact(LinkArtifact {
+        .link_artifact_outcome(LinkArtifact {
             project: req.project,
             task: req.task,
             kind: req.kind,

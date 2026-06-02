@@ -981,7 +981,7 @@ impl MeshService {
             .write_lock
             .lock()
             .map_err(|e| internal(format!("write lock poisoned: {e}")))?;
-        let (artifact, _) = block_on(self.link_artifact(LinkArtifact {
+        let artifact = block_on(self.link_artifact(LinkArtifact {
             project: args.project,
             task: args.task,
             kind: args.kind,
@@ -1634,8 +1634,18 @@ impl MeshService {
     }
 
     /// Service-layer `artifact.link` — validates inputs, idempotent on (task, kind, ref).
-    /// The bool is `true` when an existing row matched and was returned without append.
-    pub async fn link_artifact(&self, args: LinkArtifact) -> Result<(Artifact, bool), StoreError> {
+    pub async fn link_artifact(&self, args: LinkArtifact) -> Result<Artifact, StoreError> {
+        self.link_artifact_outcome(args)
+            .await
+            .map(|(artifact, _existed)| artifact)
+    }
+
+    /// Like [`link_artifact`](Self::link_artifact), but also reports whether an
+    /// existing row matched (`true`) versus a new row appended (`false`).
+    pub async fn link_artifact_outcome(
+        &self,
+        args: LinkArtifact,
+    ) -> Result<(Artifact, bool), StoreError> {
         if args.actor.is_empty() {
             return Err(invalid_msg("actor is required to link an artifact"));
         }
@@ -1706,10 +1716,10 @@ impl MeshService {
             })
             .await?;
         if let Some(artifact) = existing
-            .iter()
+            .into_iter()
             .find(|a| a.task == task_id && a.kind == args.kind && a.reference == args.reference)
         {
-            return Ok((artifact.clone(), true));
+            return Ok((artifact, true));
         }
 
         let now = now_utc();
