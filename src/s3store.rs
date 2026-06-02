@@ -1,5 +1,9 @@
 //! S3-backed [`Store`] using conditional PUTs for compare-and-swap writes.
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
@@ -44,6 +48,9 @@ pub struct S3Config {
     pub secret_access_key: String,
     /// Set `true` for `MinIO` path-style URLs.
     pub force_path_style: bool,
+    /// When set, each `list_objects_v2` call increments the counter (integration tests).
+    #[doc(hidden)]
+    pub test_list_call_counter: Option<Arc<AtomicUsize>>,
 }
 
 /// Object store backend mirroring the on-disk corpus layout under an optional prefix.
@@ -52,6 +59,7 @@ pub struct S3Store {
     client: Client,
     bucket: String,
     prefix: String,
+    test_list_call_counter: Option<Arc<AtomicUsize>>,
 }
 
 struct ObjectBody {
@@ -84,6 +92,7 @@ impl S3Store {
             client,
             bucket: cfg.bucket,
             prefix: Self::normalize_prefix(&cfg.prefix)?,
+            test_list_call_counter: cfg.test_list_call_counter,
         })
     }
 
@@ -115,6 +124,9 @@ impl S3Store {
     }
 
     async fn list_object_keys(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
+        if let Some(counter) = &self.test_list_call_counter {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
         let mut keys = Vec::new();
         let mut token: Option<String> = None;
         loop {
@@ -231,6 +243,18 @@ impl S3Store {
             .delete_object()
             .bucket(&self.bucket)
             .key(key)
+            .send()
+            .await
+            .map_err(map_sdk_err)?;
+        Ok(())
+    }
+
+    async fn put_object(&self, key: &str, content: &[u8]) -> Result<(), StoreError> {
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .body(ByteStream::from(content.to_vec()))
             .send()
             .await
             .map_err(map_sdk_err)?;
@@ -627,26 +651,67 @@ impl Store for S3Store {
 
     async fn shift_phases(&self, project: &str, from_order: i32) -> Result<(), StoreError> {
         Self::validate_slug(project)?;
-        let mut phases = self.load_phases_for(project).await?;
-        phases.sort_by_key(|p| std::cmp::Reverse(p.order));
-        for phase in &mut phases {
-            if phase.order < from_order {
+        let prefix = format!("{}/", self.join_key(&["projects", project, "phases"]));
+        let keys = self.list_object_keys(&prefix).await?;
+        let mut entries_by_slug: HashMap<String, Vec<(i32, String)>> = HashMap::new();
+        for key in keys {
+            let Some((order, slug)) = phase_order_and_slug_from_key(&key) else {
+                continue;
+            };
+            entries_by_slug.entry(slug).or_default().push((order, key));
+        }
+        let mut slugs_by_order: Vec<(String, i32)> = entries_by_slug
+            .iter()
+            .filter_map(|(slug, entries)| {
+                let order = entries.iter().map(|(o, _)| *o).max()?;
+                Some((slug.clone(), order))
+            })
+            .collect();
+        slugs_by_order.sort_by_key(|(_, order)| std::cmp::Reverse(*order));
+        for (slug, order) in slugs_by_order {
+            if order < from_order {
                 continue;
             }
-            let old_key = self.find_phase_key(project, &phase.slug).await?;
+            let Some(entries) = entries_by_slug.get(&slug) else {
+                continue;
+            };
+            let Some(min_entry) = entries.iter().min_by_key(|(o, _)| o) else {
+                continue;
+            };
+            let Some(max_entry) = entries.iter().max_by_key(|(o, _)| o) else {
+                continue;
+            };
+            if entries.len() > 1 {
+                self.delete_object(&min_entry.1).await?;
+                continue;
+            }
+            let old_key = &max_entry.1;
+            let obj = self.get_object_body(old_key).await?;
+            let mut phase = parse_phase(&obj.raw).map_err(invalid_err)?;
             phase.order += 1;
-            let content = serialize_phase_file(phase).map_err(invalid_err)?;
+            let content = serialize_phase_file(&phase).map_err(invalid_err)?;
             let new_key = self.join_key(&[
                 "projects",
                 project,
                 "phases",
-                &phase_filename(phase.order, &phase.slug),
+                &phase_filename(phase.order, &slug),
             ]);
-            self.cas_put(&new_key, content.as_bytes(), None).await?;
-            self.delete_object(&old_key).await?;
+            self.put_object(&new_key, content.as_bytes()).await?;
+            self.delete_object(old_key).await?;
         }
         Ok(())
     }
+}
+
+fn phase_order_and_slug_from_key(key: &str) -> Option<(i32, String)> {
+    let name = key.rsplit('/').next()?;
+    if !key_is_markdown(name) {
+        return None;
+    }
+    let stem = name.strip_suffix(".md")?;
+    let (order_str, slug) = stem.split_once('-')?;
+    let order = order_str.parse().ok()?;
+    Some((order, slug.to_owned()))
 }
 
 fn project_slug_from_prefix(common_prefix: &str, list_prefix: &str) -> Option<String> {
