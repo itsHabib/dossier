@@ -10,13 +10,14 @@
     reason = "integration tests"
 )]
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::Client;
 use chrono::Utc;
-use dossier::domain::{Artifact, Project, ProjectStatus};
+use dossier::domain::{Artifact, Phase, PhaseStatus, Project, ProjectStatus};
 use dossier::store::{Store, StoreError, Version};
 use dossier::{S3Config, S3Store};
 use ulid::Ulid;
@@ -26,6 +27,12 @@ fn endpoint_configured() -> Option<String> {
 }
 
 async fn test_store() -> Option<(S3Store, S3Config)> {
+    test_store_with_list_counter(None).await
+}
+
+async fn test_store_with_list_counter(
+    list_counter: Option<Arc<AtomicUsize>>,
+) -> Option<(S3Store, S3Config)> {
     let endpoint = endpoint_configured()?;
     let access_key = std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_else(|_| "minioadmin".to_owned());
     let secret_key =
@@ -38,6 +45,7 @@ async fn test_store() -> Option<(S3Store, S3Config)> {
         access_key_id: access_key,
         secret_access_key: secret_key,
         force_path_style: true,
+        test_list_call_counter: list_counter,
     };
     ensure_bucket(&cfg).await.ok()?;
     let store = S3Store::new(cfg.clone()).await.ok()?;
@@ -88,6 +96,71 @@ fn sample_project(slug: &str) -> Project {
         updated_at: now,
         created_by: "human:test".to_owned(),
     }
+}
+
+async fn seed_phase(store: &S3Store, project: &Project, slug: &str, order: i32) -> Phase {
+    let now = Utc::now();
+    let phase = Phase {
+        id: format!("phs_{}", Ulid::new()),
+        project: project.id.clone(),
+        slug: slug.to_owned(),
+        title: slug.to_owned(),
+        body: String::new(),
+        order,
+        status: PhaseStatus::Pending,
+        created_at: now,
+        updated_at: now,
+        created_by: "human:test".to_owned(),
+        owner: "human:test".to_owned(),
+    };
+    store.put_phase(&phase, None).await.expect("seed phase");
+    phase
+}
+
+fn phase_key_prefix(cfg: &S3Config, project: &str) -> String {
+    let mut prefix = String::new();
+    if !cfg.prefix.is_empty() {
+        prefix.push_str(&cfg.prefix);
+        prefix.push('/');
+    }
+    prefix.push_str("projects/");
+    prefix.push_str(project);
+    prefix.push_str("/phases/");
+    prefix
+}
+
+async fn list_phase_object_keys(cfg: &S3Config, project: &str) -> Vec<String> {
+    let creds = Credentials::new(
+        cfg.access_key_id.clone(),
+        cfg.secret_access_key.clone(),
+        None,
+        None,
+        "dossier-s3-it",
+    );
+    let shared = aws_config::defaults(BehaviorVersion::latest())
+        .region(aws_config::Region::new(cfg.region.clone()))
+        .credentials_provider(creds)
+        .load()
+        .await;
+    let mut s3_builder = aws_sdk_s3::config::Builder::from(&shared);
+    if let Some(url) = &cfg.endpoint_url {
+        s3_builder = s3_builder.endpoint_url(url);
+    }
+    s3_builder = s3_builder.force_path_style(cfg.force_path_style);
+    let client = Client::from_conf(s3_builder.build());
+    let prefix = phase_key_prefix(cfg, project);
+    let resp = client
+        .list_objects_v2()
+        .bucket(&cfg.bucket)
+        .prefix(&prefix)
+        .send()
+        .await
+        .expect("list phase keys");
+    resp.contents()
+        .iter()
+        .filter_map(|obj| obj.key().map(str::to_owned))
+        .map(|key| key.strip_prefix(&prefix).unwrap_or(&key).to_owned())
+        .collect()
 }
 
 #[tokio::test]
@@ -210,4 +283,66 @@ async fn artifact_roundtrip() {
         .await
         .expect("list artifacts");
     assert!(listed.iter().any(|a| a.id == artifact.id));
+}
+
+#[tokio::test]
+async fn shift_phases_partial_failure_recovers_on_retry() {
+    let Some((store, cfg)) = test_store().await else {
+        return;
+    };
+    let project = sample_project("shift-retry");
+    store
+        .put_project(&project, None)
+        .await
+        .expect("create project");
+    seed_phase(&store, &project, "alpha", 1).await;
+    seed_phase(&store, &project, "beta", 2).await;
+
+    let alpha = store
+        .get_phase(&project.slug, "alpha")
+        .await
+        .expect("get alpha")
+        .value;
+    let mut shifted_alpha = alpha.clone();
+    shifted_alpha.order = 2;
+    store
+        .put_phase(&shifted_alpha, None)
+        .await
+        .expect("simulate partial shift put for alpha");
+
+    store
+        .shift_phases(&project.slug, 1)
+        .await
+        .expect("retry shift completes");
+
+    let mut keys = list_phase_object_keys(&cfg, &project.slug).await;
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec!["02-alpha.md".to_owned(), "03-beta.md".to_owned()]
+    );
+}
+
+#[tokio::test]
+async fn shift_phases_uses_single_list_call() {
+    let list_counter = Arc::new(AtomicUsize::new(0));
+    let Some((store, _cfg)) = test_store_with_list_counter(Some(Arc::clone(&list_counter))).await
+    else {
+        return;
+    };
+    let project = sample_project("shift-list-count");
+    store
+        .put_project(&project, None)
+        .await
+        .expect("create project");
+    seed_phase(&store, &project, "one", 1).await;
+    seed_phase(&store, &project, "two", 2).await;
+    seed_phase(&store, &project, "three", 3).await;
+
+    store
+        .shift_phases(&project.slug, 1)
+        .await
+        .expect("shift phases");
+
+    assert_eq!(list_counter.load(Ordering::SeqCst), 1);
 }
