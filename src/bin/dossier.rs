@@ -173,24 +173,33 @@ enum ServeBackend {
 }
 
 fn parse_serve_backend(raw: Option<&str>) -> Result<ServeBackend> {
-    match raw.unwrap_or("fs").trim() {
+    match raw
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("fs")
+    {
         "fs" => Ok(ServeBackend::Fs),
         "s3" => Ok(ServeBackend::S3),
         other => bail!("unknown DOSSIER_BACKEND: {other} (expected fs or s3)"),
     }
 }
 
+/// Reads an env var, treating an unset var and a blank value alike as absent —
+/// a defined-but-empty `DOSSIER_S3_*` var falls through to the next fallback
+/// instead of sticking as an empty string.
+fn non_empty_env(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|value| !value.is_empty())
+}
+
 fn s3_config_from_env() -> Result<S3Config> {
     let bucket = std::env::var("DOSSIER_S3_BUCKET")
         .context("DOSSIER_S3_BUCKET is required when DOSSIER_BACKEND=s3")?;
     let prefix = std::env::var("DOSSIER_S3_PREFIX").unwrap_or_default();
-    let endpoint_url = std::env::var("DOSSIER_S3_ENDPOINT")
-        .ok()
-        .filter(|value| !value.is_empty());
-    let region = std::env::var("DOSSIER_S3_REGION")
-        .or_else(|_| std::env::var("AWS_REGION"))
-        .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
-        .unwrap_or_else(|_| "us-east-1".to_owned());
+    let endpoint_url = non_empty_env("DOSSIER_S3_ENDPOINT");
+    let region = non_empty_env("DOSSIER_S3_REGION")
+        .or_else(|| non_empty_env("AWS_REGION"))
+        .or_else(|| non_empty_env("AWS_DEFAULT_REGION"))
+        .unwrap_or_else(|| "us-east-1".to_owned());
     let access_key_id = std::env::var("AWS_ACCESS_KEY_ID")
         .context("AWS_ACCESS_KEY_ID is required when DOSSIER_BACKEND=s3")?;
     let secret_access_key = std::env::var("AWS_SECRET_ACCESS_KEY")
@@ -223,6 +232,8 @@ async fn open_serve_store(backend: ServeBackend, corpus: &Path) -> Result<Arc<dy
     match backend {
         ServeBackend::Fs => Ok(Arc::new(FsStore::open(corpus)?)),
         ServeBackend::S3 => {
+            // `corpus` is an FsStore concept; the S3 backend is configured
+            // entirely from the environment, so the path is intentionally unused.
             let store = S3Store::new(s3_config_from_env()?)
                 .await
                 .map_err(store_error_to_anyhow)?;
@@ -418,19 +429,12 @@ mod backend_tests {
 
     use super::*;
     use std::fs;
-    use std::path::PathBuf;
 
     use dossier::store::ProjectListFilter;
 
-    fn temp_corpus() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "dossier-serve-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        fs::create_dir_all(dir.join(".dossier")).expect("mkdir .dossier");
+    fn temp_corpus() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(dir.path().join(".dossier")).expect("mkdir .dossier");
         dir
     }
 
@@ -442,6 +446,14 @@ mod backend_tests {
         );
         assert_eq!(
             parse_serve_backend(Some("fs")).expect("fs explicit"),
+            ServeBackend::Fs
+        );
+        assert_eq!(
+            parse_serve_backend(Some("")).expect("empty -> fs"),
+            ServeBackend::Fs
+        );
+        assert_eq!(
+            parse_serve_backend(Some("  ")).expect("blank -> fs"),
             ServeBackend::Fs
         );
     }
@@ -465,7 +477,7 @@ mod backend_tests {
     #[tokio::test]
     async fn open_serve_store_fs_opens_local_corpus() {
         let corpus = temp_corpus();
-        let store = open_serve_store(ServeBackend::Fs, &corpus)
+        let store = open_serve_store(ServeBackend::Fs, corpus.path())
             .await
             .expect("fs store");
         let projects = store
@@ -473,7 +485,6 @@ mod backend_tests {
             .await
             .expect("list projects");
         assert!(projects.is_empty());
-        let _ = fs::remove_dir_all(&corpus);
     }
 
     #[tokio::test]
@@ -495,9 +506,8 @@ mod backend_tests {
         std::env::set_var("AWS_ACCESS_KEY_ID", &access_key);
         std::env::set_var("AWS_SECRET_ACCESS_KEY", &secret_key);
         let corpus = temp_corpus();
-        open_serve_store(ServeBackend::S3, &corpus)
+        open_serve_store(ServeBackend::S3, corpus.path())
             .await
             .expect("s3 store");
-        let _ = fs::remove_dir_all(&corpus);
     }
 }
