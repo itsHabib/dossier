@@ -981,7 +981,7 @@ impl MeshService {
             .write_lock
             .lock()
             .map_err(|e| internal(format!("write lock poisoned: {e}")))?;
-        let artifact = block_on(self.link_artifact(LinkArtifact {
+        let (artifact, _) = block_on(self.link_artifact(LinkArtifact {
             project: args.project,
             task: args.task,
             kind: args.kind,
@@ -1634,7 +1634,8 @@ impl MeshService {
     }
 
     /// Service-layer `artifact.link` — validates inputs, idempotent on (task, kind, ref).
-    pub async fn link_artifact(&self, args: LinkArtifact) -> Result<Artifact, StoreError> {
+    /// The bool is `true` when an existing row matched and was returned without append.
+    pub async fn link_artifact(&self, args: LinkArtifact) -> Result<(Artifact, bool), StoreError> {
         if args.actor.is_empty() {
             return Err(invalid_msg("actor is required to link an artifact"));
         }
@@ -1708,7 +1709,7 @@ impl MeshService {
             .iter()
             .find(|a| a.task == task_id && a.kind == args.kind && a.reference == args.reference)
         {
-            return Ok(artifact.clone());
+            return Ok((artifact.clone(), true));
         }
 
         let now = now_utc();
@@ -1723,7 +1724,7 @@ impl MeshService {
             actor: args.actor,
         };
         self.store.put_artifact(&artifact).await?;
-        Ok(artifact)
+        Ok((artifact, false))
     }
 }
 
