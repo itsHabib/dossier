@@ -13,7 +13,7 @@
 |---|---|---|---|
 | Production | none — gate exercises shipped CAS as-is. **One exception (see §Negative control):** an env-gated `DOSSIER_S3_DISABLE_CAS` branch inside `S3Store::cas_put` IF option (a) is chosen; option (b) keeps production at 0 | 0–8 | 0–8 |
 | Tests | `tests/s3_cas_gate.rs` (two gate tests + conformance precheck + negative control), `tests/common/mod.rs` (lifted MinIO harness + seed helpers) | ~380 | ~190 |
-| Docs | this doc | ~0 | 0 |
+| Docs | this doc | ~350 | 0 |
 | **Total** | | | **~190–198** |
 
 Band: **amazing** (< 500 weighted). Runtime: **local** (MinIO-gated; self-skips without `DOSSIER_S3_TEST_ENDPOINT`, so default CI is unaffected and `make check` stays green with or without the endpoint).

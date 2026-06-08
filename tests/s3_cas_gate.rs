@@ -254,7 +254,9 @@ async fn gate_scenario_11_4_mixed_workload() {
         let ty = seed_task(&svc, &project, "ty").await;
         let trace = seed_task(&svc, &project, "trace").await;
 
-        let barrier = Arc::new(Barrier::new(5));
+        // 4 task-actors (a, b, racer-1, racer-2) + K concurrent link actors, all
+        // released together so the K links contend on the shared artifacts.jsonl CAS.
+        let barrier = Arc::new(Barrier::new(4 + K_LINKS));
 
         let h_a = {
             let (svc, id, bar) = (Arc::clone(&svc), tx.clone(), Arc::clone(&barrier));
@@ -278,29 +280,23 @@ async fn gate_scenario_11_4_mixed_workload() {
                 .await
             })
         };
-        let h_link = {
+        let mut h_links = Vec::with_capacity(K_LINKS);
+        for k in 0..K_LINKS {
             let (svc, proj, bar) = (Arc::clone(&svc), project.clone(), Arc::clone(&barrier));
-            tokio::spawn(async move {
+            h_links.push(tokio::spawn(async move {
                 bar.wait().await;
-                let mut oks = 0usize;
-                for k in 0..K_LINKS {
-                    let res = svc
-                        .link_artifact(LinkArtifact {
-                            project: proj.clone(),
-                            task: None,
-                            kind: "commit".to_owned(),
-                            reference: format!("artref-{run}-{k}"),
-                            label: format!("artref-{run}-{k}"),
-                            actor: "linker".to_owned(),
-                        })
-                        .await;
-                    if res.is_ok() {
-                        oks += 1;
-                    }
-                }
-                oks
-            })
-        };
+                svc.link_artifact(LinkArtifact {
+                    project: proj,
+                    task: None,
+                    kind: "commit".to_owned(),
+                    reference: format!("artref-{run}-{k}"),
+                    label: format!("artref-{run}-{k}"),
+                    actor: "linker".to_owned(),
+                })
+                .await
+                .is_ok()
+            }));
+        }
         let h_r1 = {
             let (svc, id, bar) = (Arc::clone(&svc), trace.clone(), Arc::clone(&barrier));
             tokio::spawn(async move {
@@ -326,7 +322,12 @@ async fn gate_scenario_11_4_mixed_workload() {
 
         let r_a = h_a.await.expect("join a");
         let r_b = h_b.await.expect("join b");
-        let link_oks = h_link.await.expect("join link");
+        let mut link_oks = 0usize;
+        for h in h_links {
+            if h.await.expect("join link") {
+                link_oks += 1;
+            }
+        }
         let r1 = h_r1.await.expect("join r1");
         let r2 = h_r2.await.expect("join r2");
 
