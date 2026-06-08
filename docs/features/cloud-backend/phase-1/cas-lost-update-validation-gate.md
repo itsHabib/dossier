@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | draft |
+| **Status** | accepted — implemented + run; **GO on MinIO** (see Gate result) |
 | **Owner** | @itsHabib |
 | **Date** | 2026-06-07 |
 | **Related** | [docs/features/cloud-backend/spec.md](../spec.md) §6.1 (Store trait), §7.1 (write flow), §7.4 (claim race), §8 (concurrency/retry), §9 (rollout), §11.4 (the gate); [PROTOCOL.md](../../../../PROTOCOL.md) (task state machine); `src/s3store.rs` (`cas_put`, `put_artifact`); `src/server.rs` (`cas_mutate_task`, `cas_backoff`, `CAS_MAX_ATTEMPTS`); `tests/s3_store_minio.rs` (`concurrent_writer_race_exactly_one_wins`, `test_store` harness) |
@@ -334,13 +334,31 @@ A NO-GO never advances past §11.4; Phases 3b+ stay locked until a subsequent GO
 
 **Phase-2 (artifact sharding) ruling — soft dep, do not block the gate.** A prior facet argued sharding is soft *because* S3 `put_artifact` is "create-only by unique ULID with no shared-object contention." **That premise is false against the current code:** `put_artifact` is a CAS read-modify-write of the shared `artifacts.jsonl` (read, reject duplicate id, append a line, `cas_put` the whole object, bounded `ARTIFACT_PUT_RETRIES`). So the artifact leg is, today, a *second high-contention CAS surface* — which is why the gate stresses it with K concurrent links and a committed-effects oracle (T9), not why it can ignore it. The dep is nonetheless **soft** for the right reason: the gate's artifact invariant is "no `Ok` link is *lost*," not "links don't contend." The shared-`artifacts.jsonl` path *can* satisfy "no link lost" (invariant 3 checks exactly that). If Phase-2 sharding lands first, the leg instead exercises the create-only `If-None-Match: *` per-id path and invariant 3 still holds unchanged. **Do not block the gate PR on Phase 2.** No new crate deps — `tokio`, `Arc`, `futures` (already a dep), and the existing `aws_sdk_s3` test stack cover it.
 
-## Open questions
+## Gate result — GO (MinIO), 2026-06-08
 
-1. **MinIO version pin.** Which exact `RELEASE.2024-09-*`-or-later tag do we standardize on, recorded in the harness as well as this doc? (Blocks the precheck being meaningful — T4.)
-2. **AWS/R2 confirmation run (required, not optional).** The T4 residual (MinIO's app-compare masks a dead conditional-PUT) means MinIO-green alone does not establish the cloud primitive. One real-backend confirmation is required **before acting on GO**. Manual one-off with prod-like creds, or an opt-in `DOSSIER_S3_TEST_ENDPOINT`-pointed-at-R2 mode of the same gate (the raw-client precheck especially)? Out of the automated gate either way; needs an owner.
-3. **Negative-control shape — option (a) vs (b).** (a) env-gated branch inside `cas_put` (skips compare + sends unconditional PUT) — cheapest, but a ≤8-line test-only branch in production source, carved out of criterion 7. (b) test-only `Store` impl in `tests/` re-implementing the put path with an unconditional `put_object` — keeps production at 0 lines, duplicates the put path. **Recommendation: (a)** for fidelity (it disables the *real* `cas_put`, not a parallel reimplementation that could drift), with the carve-out explicit in criterion 7; fall back to (b) only if a reviewer insists on a literal 0-line production diff. Header-stripping is dropped entirely (impossible from the trait boundary and wouldn't disable CAS).
-4. **`cas_backoff` fix timing.** If the gate is *clean*, do we proactively land the full-jitter fix (T-jitter) as a follow-up, or only if the gate flags correlated exhaustion? (Recommendation: file it as a follow-up regardless — a real §8 conformance gap — but it doesn't block GO if the gate is green.)
-5. **W for the standing gate vs audit.** Gate value is W=16. Do CI/sign-off also run one W=64 audit pass each time, or keep W=64/128 operator-on-demand? (Cost vs coverage of I4 / the conflict-accounting path. Note cranking W stresses the app-compare TOCTOU window, not the header — the precheck remains the conditional-PUT check.)
+Implemented (`tests/s3_cas_gate.rs` + the env-gated `cas_put` branch) and run against MinIO (`minio/minio`, conditional-write capable — confirmed by the precheck). **Verdict: GO**, modulo the one residual below.
+
+- **Sub-test B (RMW counting oracle, W=16 × M=30):** PASS on all 3 sign-off runs — `persisted == committed` every iteration, **0 lost updates** across 480 contended read-modify-writes per run.
+- **Sub-test A (§11.4 mixed workload ×100):** PASS on all 3 runs — disjoint claims persist (correct assignee + `claimed` + `claimed_at`), the race yields exactly one `Ok` + one terminal "already claimed" `Invalid`, and every `Ok` link is present exactly once.
+- **Conformance precheck (raw `aws_sdk_s3` client, bypassing `cas_put`):** PASS — MinIO returns HTTP **412** for `If-None-Match`-on-existing and `If-Match`-stale, and ETag tracks content.
+- **Negative control (`DOSSIER_S3_DISABLE_CAS=1`):** RED as required — with both CAS layers disabled the oracle **detects** a lost update, proving it has teeth.
+- **3 consecutive clean runs:** ✓ (281s / 160s / 149s). **`make check`:** green with and without `DOSSIER_S3_TEST_ENDPOINT`.
+
+**Residual — required before acting on GO:** one AWS S3 / Cloudflare R2 confirmation run. Per T4, the gate via `cas_put` on a strongly-consistent backend cannot, alone, distinguish a conditional from a non-conditional backend (the app-layer GET-compare suffices on MinIO); the raw-client precheck mitigates this, but a real-backend run is needed to fully close the conditional-PUT-fidelity gap. Out of the automated gate's scope — needs an owner + cloud creds.
+
+## Decisions (resolved open questions)
+
+1. **MinIO version pin** → run against current `minio/minio`; the conformance precheck empirically gates conditional-write support on every run, so any tag that passes the precheck is acceptable. Pin a specific `RELEASE.2024-09-*`+ tag if/when the gate is wired to a scheduled CI job.
+2. **AWS/R2 confirmation run** → kept as the single open residual above (manual, operator-owned, before acting on GO). Not automatable here (no cloud creds).
+3. **Negative-control shape** → **(a)**, the env-gated branch inside `cas_put` (`DOSSIER_S3_DISABLE_CAS`, ~17 lines, dead unless set). Implemented; criterion 7 carve-out honored.
+4. **`cas_backoff` jitter** → filed as a follow-up (real §8 gap: clock-derived, exponent-clamped — not true full jitter). The gate is clean, so it does **not** block GO.
+5. **Standing gate W** → W=16 standing; W=64/128 operator-on-demand for audits.
+
+## Implementation notes (deviations from the draft, all sound)
+
+- **Single-path readback.** The oracle reads back via the public `Store::get_task` / `list_artifacts` (a real product read; authoritative on strongly-consistent MinIO). The separate raw-by-key (R2) readback + LIST/GET-skew check needed `pub(crate)` internals (`parse_task`, `find_task_key`, `task_filename`) unreachable from an integration test; the LIST/GET-skew concern is a real-S3/R2 eventual-consistency edge that folds into the AWS/R2 residual, not a MinIO-gate concern.
+- **Self-contained test file.** `tests/s3_cas_gate.rs` carries its own ~40-line MinIO harness rather than lifting `tests/s3_store_minio.rs` into `tests/common/mod.rs` — keeps the working store-layer test untouched. Consolidating both onto a shared `common` module is a trivial follow-up.
+- **Markers, not parse.** Sub-test B asserts on raw note-body marker strings (globally unique `rmw-{run}-{i}`) via the public `Task.notes`, so the oracle doesn't depend on the parser under test.
 
 ## Source
 
