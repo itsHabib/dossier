@@ -215,6 +215,22 @@ impl S3Store {
         content: &[u8],
         expected: Option<&Version>,
     ) -> Result<Version, StoreError> {
+        // Test-only negative control: when DOSSIER_S3_DISABLE_CAS is set, skip BOTH
+        // compare layers (the pre-flight GET-compare and the conditional header) and
+        // write unconditionally, so a test can prove its oracle detects lost updates.
+        // Dead in normal operation.
+        if std::env::var_os("DOSSIER_S3_DISABLE_CAS").is_some() {
+            let resp = self
+                .client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .body(ByteStream::from(content.to_vec()))
+                .send()
+                .await
+                .map_err(map_sdk_err)?;
+            return etag_from_output(resp.e_tag());
+        }
         if let Some(expected_v) = expected {
             match self.get_object_body_optional(key).await? {
                 None => return Err(StoreError::NotFound),
