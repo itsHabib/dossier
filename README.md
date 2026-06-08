@@ -110,6 +110,45 @@ Full format in [LAYOUT.md](LAYOUT.md). The corpus is the source of truth
 — humans grep and edit the markdown directly, and the mesh re-reads it
 on every call.
 
+## Storage backend
+
+dossier serves from a swappable storage backend, chosen by `DOSSIER_BACKEND`
+(default `fs`):
+
+- **`fs`** (default) — the local markdown-on-disk corpus described above. Pass
+  `--corpus <path>`; nothing else needed.
+- **`s3`** — an S3-compatible object store (AWS S3, Cloudflare R2, MinIO). The
+  same corpus layout is mirrored under a key prefix, and concurrent writes are
+  safe via per-object compare-and-swap (`If-Match` / `If-None-Match` ETags).
+
+```sh
+DOSSIER_BACKEND=s3 \
+DOSSIER_S3_BUCKET=my-bucket \
+AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… \
+dossier serve --corpus /tmp/ignored      # see the --corpus note below
+```
+
+S3 config is read from the environment:
+
+| Variable | Required | Notes |
+| --- | --- | --- |
+| `DOSSIER_S3_BUCKET` | yes | |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | yes | static keys |
+| `DOSSIER_S3_ENDPOINT` | no | for MinIO / R2 / other S3-compatible endpoints |
+| `DOSSIER_S3_REGION` | no | falls back to `AWS_REGION` / `AWS_DEFAULT_REGION`, then `us-east-1` |
+| `DOSSIER_S3_PREFIX` | no | key prefix within the bucket; defaults to the root |
+| `DOSSIER_S3_FORCE_PATH_STYLE` | no | defaults to `true` when an endpoint is set (MinIO) |
+
+> **Note:** `serve` currently still requires a `--corpus <path>` argument even
+> for `s3` — the path is ignored when the backend is `s3` (a follow-up will let
+> the S3 server boot from env alone).
+
+The S3 backend is wired end-to-end; its no-lost-update guarantee under
+concurrent writers is validated by a CAS stress gate (GO against MinIO — see
+[the gate spec](docs/features/cloud-backend/phase-1/cas-lost-update-validation-gate.md)).
+The hosted multi-writer tier built on it is in progress — see
+[the cloud-backend design](docs/features/cloud-backend/spec.md).
+
 ## Verbs
 
 | Read | Write |
