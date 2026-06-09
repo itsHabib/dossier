@@ -32,12 +32,18 @@ async fn connect_mcp(corpus: &Path) -> rmcp::service::RunningService<rmcp::RoleC
                 .arg("--corpus")
                 .arg(corpus)
                 .env_remove("DOSSIER_CORPUS")
-                .env_remove("DOSSIER_BACKEND");
+                .env_remove("DOSSIER_BACKEND")
+                .kill_on_drop(true);
         },
     ))
     .expect("spawn dossier serve");
 
-    ().serve(transport).await.expect("mcp initialize handshake")
+    // Bound the handshake: a server that starts but never answers `initialize`
+    // should fail the test, not hang the whole `cargo test` job indefinitely.
+    tokio::time::timeout(std::time::Duration::from_secs(30), ().serve(transport))
+        .await
+        .expect("initialize handshake timed out after 30s")
+        .expect("mcp initialize handshake")
 }
 
 fn tool_result_value(result: rmcp::model::CallToolResult) -> Value {

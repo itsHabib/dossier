@@ -32,6 +32,10 @@ sha2 = "0.10"
 tempfile = "3"
 proptest = "1"
 rmcp = { version = "1", features = ["client", "transport-child-process"] }
+# E2E tests spawn `dossier serve` as a child and bound the handshake with a
+# timeout; enable these tokio features explicitly rather than relying on
+# transitive activation via rmcp.
+tokio = { version = "1", features = ["process", "time"] }
 
 [lints.rust]
 # Cheney-flavored Rust: forbid unsafe, refuse stale qualifications and
