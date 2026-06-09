@@ -14,7 +14,8 @@ batches:
   - id: 1
     label: ready now
     depends_on: []
-    status: pending
+    status: done
+    completed_at: 2026-06-09T20:22:21Z
     streams:
       - task_id: tsk_01KTJSHNQES9PTD0G69D5F2NVP
         task_slug: ci-cargo-audit
@@ -22,21 +23,30 @@ batches:
         branch_name: polish-ci-cargo-audit
         runtime: local
         touches: [.github/workflows/audit.yml, .github/workflows/ci.yml]
-        status: pending
+        status: done
+        pr_number: 79
+        merge_commit: 6f518290d6415a929fd9ceaff1ce5adecff6567c
+        merged_at: 2026-06-09T20:16:22Z
       - task_id: tsk_01KTJSJGP58B2BZ6Q2A9TSP9HH
         task_slug: doc-comment-s3store-public-surface
         spec_path: docs/features/dossier-polish-2026-06-07/doc-comment-s3store-public-surface.md
         branch_name: polish-doc-s3store
         runtime: local
         touches: [src/s3store.rs]
-        status: pending
+        status: done
+        pr_number: 80
+        merge_commit: 20c64541a92f1d8457da04d652a417912bbf2b52
+        merged_at: 2026-06-09T20:13:50Z
       - task_id: tsk_01KTJSJSXCMTF3T5N7BNBQDCFP
         task_slug: mcp-stdio-transport-e2e
         spec_path: docs/features/dossier-polish-2026-06-07/mcp-stdio-transport-e2e.md
         branch_name: polish-mcp-stdio-e2e
         runtime: local
         touches: [tests/mcp_stdio_e2e.rs, Cargo.toml]
-        status: pending
+        status: done
+        pr_number: 81
+        merge_commit: b4719499615e9588fca534ffe5359200ad0750c1
+        merged_at: 2026-06-09T20:22:21Z
 
 conflict_notes:
   - kind: none
