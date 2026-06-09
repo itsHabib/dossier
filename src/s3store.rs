@@ -37,6 +37,7 @@ fn key_is_markdown(key: &str) -> bool {
 /// Connection settings for [`S3Store`]. Does not create the bucket.
 #[derive(Debug, Clone)]
 pub struct S3Config {
+    /// Target bucket name; the store does not create the bucket.
     pub bucket: String,
     /// Tenant segment; empty means bucket root. No leading or trailing `/`.
     pub prefix: String,
@@ -44,7 +45,9 @@ pub struct S3Config {
     pub endpoint_url: Option<String>,
     /// `MinIO` ignores this; the SDK requires a region. Default `us-east-1`.
     pub region: String,
+    /// Access key ID for static SDK credentials.
     pub access_key_id: String,
+    /// Secret access key paired with [`Self::access_key_id`].
     pub secret_access_key: String,
     /// Set `true` for `MinIO` path-style URLs.
     pub force_path_style: bool,
@@ -69,6 +72,8 @@ struct ObjectBody {
 
 impl S3Store {
     /// Build an S3 client from `cfg`. Does not create the bucket.
+    ///
+    /// Returns [`StoreError::Invalid`] when `cfg.prefix` has a leading or trailing `/`.
     pub async fn new(cfg: S3Config) -> Result<Self, StoreError> {
         let creds = Credentials::new(
             cfg.access_key_id,
