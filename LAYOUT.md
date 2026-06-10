@@ -46,6 +46,10 @@ in corpus, phase slug unique in project, task slug unique in project).
 
 YAML frontmatter, markdown body. The body **is** the project's design doc.
 
+Frontmatter is YAML 1.2 core. The 1.1 boolean words (`yes`, `no`, `on`,
+`off`) are plain strings and may appear unquoted — parse the corpus with a
+1.2-core resolver, not a YAML 1.1 one.
+
 ```markdown
 ---
 id: prj_01HFG3J7K8N9P0Q1R2S3T4V5W6

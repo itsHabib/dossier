@@ -1520,6 +1520,59 @@ mod tests {
     }
 
     #[test]
+    fn frontmatter_golden_byte_shape() {
+        // Pins the exact emitted frontmatter bytes so a serializer swap or
+        // version bump can't silently shift the on-disk shape. The corpus is
+        // the source of truth; byte drift here is a breaking change.
+        use chrono::TimeZone as _;
+        let t = Utc.with_ymd_and_hms(2026, 6, 8, 4, 58, 37).unwrap();
+        let project = Project {
+            id: "prj_01KRSZ90005B5290ZC9QH79QS4".into(),
+            slug: "demo".into(),
+            title: "Demo: a title with punctuation!".into(),
+            description: String::new(),
+            status: ProjectStatus::Planning,
+            created_at: t,
+            updated_at: t,
+            created_by: "human:michael".into(),
+        };
+        let got = serde_norway::to_string(&ProjectFrontmatter::from(&project)).unwrap();
+        let want = "\
+id: prj_01KRSZ90005B5290ZC9QH79QS4
+slug: demo
+title: 'Demo: a title with punctuation!'
+status: planning
+created_at: 2026-06-08T04:58:37Z
+updated_at: 2026-06-08T04:58:37Z
+created_by: human:michael
+";
+        assert_eq!(got, want, "frontmatter byte shape drifted");
+    }
+
+    #[test]
+    fn frontmatter_dialect_is_yaml_12_core() {
+        // The emitter resolves scalars per YAML 1.2 core: the 1.1 boolean
+        // words (yes/no/on/off) are plain strings and stay unquoted, while
+        // true/false are quoted when they appear as string values. Both
+        // directions must agree so a bare `yes` reads back as the string it
+        // was. Consumers parsing the corpus must use a 1.2-core resolver.
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Probe {
+            a: String,
+            b: String,
+        }
+        let out = serde_norway::to_string(&Probe {
+            a: "yes".into(),
+            b: "true".into(),
+        })
+        .unwrap();
+        assert_eq!(out, "a: yes\nb: 'true'\n", "scalar quoting drifted");
+        let back: Probe = serde_norway::from_str(&out).unwrap();
+        assert_eq!(back.a, "yes", "bare yes must parse as a string");
+        assert_eq!(back.b, "true");
+    }
+
+    #[test]
     fn append_jsonl_creates_and_appends() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("artifacts.jsonl");
