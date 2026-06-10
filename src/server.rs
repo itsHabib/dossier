@@ -37,10 +37,12 @@ pub const VERSION: &str = "0.1.0";
 /// Service holding a shared [`Store`] backend and a process-local write lock.
 ///
 /// The `Arc<dyn Store>` lets `rmcp` clone the service cheaply across
-/// handler invocations. The async `tokio::sync::Mutex<()>` serializes writes
-/// inside this process so concurrent tool calls don't race each other. It is
-/// held across the awaited store op, so the handlers stay `async` — no nested
-/// runtime (a sync `block_on` here panics under the real stdio transport).
+/// handler invocations. The async `tokio::sync::Mutex<()>` serializes the
+/// check-then-write verbs that have no store-level CAS guard (project
+/// create/update, phase add/update, artifact.link); the task verbs skip it
+/// and rely on the store's CAS loops instead. The guard is held across the
+/// awaited store op, so the handlers stay `async` — no nested runtime (a
+/// sync `block_on` here panics under the real stdio transport).
 #[derive(Clone)]
 pub struct MeshService {
     store: Arc<dyn Store>,
@@ -748,10 +750,10 @@ impl MeshService {
         &self,
         Parameters(args): Parameters<ProjectUpdateArgs>,
     ) -> Result<Json<Project>, ErrorData> {
-        let _guard = self.write_lock.lock().await;
         if matches!(args.actor.as_deref(), Some("")) {
             return Err(ErrorData::invalid_params("actor must not be empty", None));
         }
+        let _guard = self.write_lock.lock().await;
         let project = self
             .update_project(UpdateProject {
                 slug: args.slug,
