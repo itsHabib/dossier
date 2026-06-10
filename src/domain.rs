@@ -607,7 +607,7 @@ pub fn apply_task_complete(mut task: Task, actor: &str, now: DateTime<Utc>) -> R
     match task.status {
         TaskStatus::Done | TaskStatus::Cancelled => {
             bail!(
-                "cannot complete task in terminal state: {}",
+                "task is in a terminal state ({}); cannot complete",
                 task_status_str(task.status)
             );
         }
