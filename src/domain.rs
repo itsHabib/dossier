@@ -390,7 +390,8 @@ pub struct UpdateTask {
     pub depends_on: Option<Vec<String>>,
 }
 
-/// Arguments for `task.complete`. Errors unless the task is in `InProgress`.
+/// Arguments for `task.complete`. Completes from `in_progress`, or walks
+/// `todo` / `claimed` (same actor) through claim → `in_progress` → done.
 #[derive(Debug, Clone)]
 pub struct CompleteTask {
     pub id: String,
@@ -581,8 +582,8 @@ pub fn append_task_note(task: &mut Task, at: DateTime<Utc>, actor: &str, body: &
     Ok(())
 }
 
-/// Pure `task.complete` transition (status + timestamps only; notes stay
-/// with the mechanism layer).
+/// Pure `task.complete` transition from `in_progress` (status + timestamps
+/// only; notes stay with the mechanism layer).
 pub fn apply_complete_task(mut task: Task, now: DateTime<Utc>) -> Result<Task> {
     if !matches!(task.status, TaskStatus::InProgress) {
         bail!(
@@ -594,4 +595,40 @@ pub fn apply_complete_task(mut task: Task, now: DateTime<Utc>) -> Result<Task> {
     task.completed_at = Some(now);
     task.updated_at = now;
     Ok(task)
+}
+
+/// Pure `task.complete` entry point. From `todo` or `claimed` (same actor),
+/// walks claim → `in_progress` → done in one stamp. Cross-actor `claimed`
+/// and terminal sources reject.
+pub fn apply_task_complete(mut task: Task, actor: &str, now: DateTime<Utc>) -> Result<Task> {
+    if actor.is_empty() {
+        bail!("actor is required to complete a task");
+    }
+    match task.status {
+        TaskStatus::Done | TaskStatus::Cancelled => {
+            bail!(
+                "task is in a terminal state ({}); cannot complete",
+                task_status_str(task.status)
+            );
+        }
+        TaskStatus::InProgress => apply_complete_task(task, now),
+        TaskStatus::Blocked => {
+            bail!(
+                "task must be in_progress to complete (got {})",
+                task_status_str(task.status)
+            );
+        }
+        TaskStatus::Todo => {
+            task = apply_claim_task(task, actor, now)?;
+            task = apply_task_status_update(task, TaskStatus::InProgress, now)?;
+            apply_complete_task(task, now)
+        }
+        TaskStatus::Claimed => {
+            if task.assignee != actor {
+                bail!("task already claimed by {}", task.assignee);
+            }
+            task = apply_task_status_update(task, TaskStatus::InProgress, now)?;
+            apply_complete_task(task, now)
+        }
+    }
 }

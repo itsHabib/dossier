@@ -17,7 +17,9 @@
 //!  3. **`update_task` may not reach `Claimed` or `Done`.** Those targets
 //!     belong to `claim_task` and `complete_task`; `update_task` with
 //!     either target must error.
-//!  4. **`complete_task` requires `InProgress`.** Any other source errors.
+//!  4. **`complete_task` succeeds from `Todo`, `Claimed` (same actor), or
+//!     `InProgress`.** Cross-actor `Claimed`, `Blocked`, and terminal
+//!     sources error without mutation.
 //!  5. **Timestamp monotonicity.** `updated_at` never moves backwards
 //!     across successful operations.
 
@@ -31,9 +33,9 @@
 
 use chrono::{DateTime, TimeDelta, Utc};
 use dossier::domain::{
-    apply_claim_task, apply_complete_task, apply_task_body_update, apply_task_status_update,
-    validate_task_update_transition, ClaimTask, CompleteTask, NewProject, NewTask, Task,
-    TaskListFilter, TaskStatus, UpdateTask,
+    apply_claim_task, apply_complete_task, apply_task_body_update, apply_task_complete,
+    apply_task_status_update, validate_task_update_transition, ClaimTask, CompleteTask, NewProject,
+    NewTask, Task, TaskListFilter, TaskStatus, UpdateTask,
 };
 use dossier::server::MeshService;
 use dossier::store::FsStore;
@@ -150,8 +152,8 @@ fn apply_pure(task: &mut Task, op: Op, now: &mut DateTime<Utc>) -> Result<(), an
         Op::UpdateStatus { to, actor: _ } => {
             *task = apply_task_status_update(task.clone(), to, *now)?;
         }
-        Op::Complete { actor: _ } => {
-            *task = apply_complete_task(task.clone(), *now)?;
+        Op::Complete { actor } => {
+            *task = apply_task_complete(task.clone(), &actor, *now)?;
         }
         Op::UpdateBody { body, actor: _ } => {
             *task = apply_task_body_update(task.clone(), body, *now)?;
@@ -196,6 +198,25 @@ fn check_assignee_status_coupling(status: TaskStatus, assignee: &str) -> Option<
     }
 }
 
+fn explicit_three_call_complete(mut task: Task, actor: &str, now: DateTime<Utc>) -> Task {
+    if task.status == TaskStatus::Todo {
+        task = apply_claim_task(task, actor, now).expect("claim");
+    }
+    if task.status == TaskStatus::Claimed {
+        task = apply_task_status_update(task, TaskStatus::InProgress, now).expect("in_progress");
+    }
+    apply_complete_task(task, now).expect("complete")
+}
+
+fn complete_should_succeed(pre: &Task, actor: &str) -> bool {
+    match pre.status {
+        TaskStatus::InProgress => true,
+        TaskStatus::Todo => pre.assignee.is_empty(),
+        TaskStatus::Claimed => pre.assignee == actor,
+        TaskStatus::Done | TaskStatus::Cancelled | TaskStatus::Blocked => false,
+    }
+}
+
 fn assert_invariants_after_step(
     pre: &Task,
     post: &Task,
@@ -212,17 +233,20 @@ fn assert_invariants_after_step(
             return Ok(());
         }
     }
-    if matches!(op, Op::Complete { .. }) && pre.status != TaskStatus::InProgress {
-        prop_assert_eq!(post.status, pre.status);
-        prop_assert_eq!(post.updated_at, pre.updated_at);
-        return Ok(());
+    if let Op::Complete { actor } = op {
+        if !complete_should_succeed(pre, actor) {
+            prop_assert_eq!(post.status, pre.status);
+            prop_assert_eq!(post.updated_at, pre.updated_at);
+            return Ok(());
+        }
     }
 
-    let was_complete_from_in_progress =
-        matches!(op, Op::Complete { .. }) && pre.status == TaskStatus::InProgress;
-    if was_complete_from_in_progress {
+    let was_complete_success =
+        matches!(op, Op::Complete { actor } if complete_should_succeed(pre, actor));
+    if was_complete_success {
         prop_assert_eq!(post.status, TaskStatus::Done);
         prop_assert!(post.completed_at.is_some());
+        prop_assert!(!post.assignee.is_empty());
     }
 
     if let Some(t) = *once_terminal {
@@ -310,6 +334,22 @@ proptest! {
                     continue;
                 }
             }
+            if let Op::Complete { actor } = op.clone() {
+                if !complete_should_succeed(&pre, &actor) {
+                    let result = block_on(svc.complete_task(CompleteTask {
+                        id: task_id.clone(),
+                        note: None,
+                        actor,
+                    }));
+                    prop_assert!(result.is_err());
+                    let post = current_state(&store);
+                    assert_invariants_after_step(
+                        &pre, &post, op, &mut once_terminal, &mut frozen_completed_at,
+                        &mut last_updated_at,
+                    )?;
+                    continue;
+                }
+            }
             apply_service(&svc, op.clone(), &task_id);
             let post = current_state(&store);
             assert_invariants_after_step(
@@ -335,11 +375,13 @@ proptest! {
                     continue;
                 }
             }
-            if matches!(op, Op::Complete { .. }) && pre.status != TaskStatus::InProgress {
-                let err = apply_pure(&mut task, op.clone(), &mut now);
-                prop_assert!(err.is_err());
-                prop_assert_eq!(task.status, pre.status);
-                continue;
+            if let Op::Complete { actor } = &op {
+                if !complete_should_succeed(&pre, actor) {
+                    let err = apply_pure(&mut task, op.clone(), &mut now);
+                    prop_assert!(err.is_err());
+                    prop_assert_eq!(task.status, pre.status);
+                    continue;
+                }
             }
 
             if apply_pure(&mut task, op.clone(), &mut now).is_err() {
@@ -350,6 +392,29 @@ proptest! {
                 &pre, &task, &op, &mut once_terminal, &mut frozen_completed_at, &mut last_updated_at,
             )?;
         }
+    }
+
+    #[test]
+    fn complete_compound_matches_explicit_path(
+        actor in actor_strategy(),
+        start in prop_oneof![Just(TaskStatus::Todo), Just(TaskStatus::Claimed)],
+    ) {
+        let now = Utc::now();
+        let mut start_task = fresh_task();
+        start_task.status = start;
+        if start == TaskStatus::Claimed {
+            actor.clone_into(&mut start_task.assignee);
+            start_task.claimed_at = Some(now - TimeDelta::hours(1));
+        }
+
+        let explicit = explicit_three_call_complete(start_task.clone(), &actor, now);
+        let compound = apply_task_complete(start_task, &actor, now).expect("compound path");
+
+        prop_assert_eq!(compound.status, explicit.status);
+        prop_assert_eq!(&compound.assignee, &explicit.assignee);
+        prop_assert_eq!(compound.claimed_at, explicit.claimed_at);
+        prop_assert_eq!(compound.completed_at, explicit.completed_at);
+        prop_assert_eq!(compound.notes, explicit.notes);
     }
 
     #[test]

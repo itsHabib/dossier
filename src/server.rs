@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::domain::{
-    append_task_note, apply_claim_task, apply_complete_task, apply_task_body_update,
+    append_task_note, apply_claim_task, apply_task_body_update, apply_task_complete,
     apply_task_status_update, compute_new_phase_order, is_valid_slug, new_id, validate_single_line,
     validate_task_body, Artifact, Phase, PhaseListFilter, PhaseOrderField, PhaseStatus, Project,
     ProjectListFilter, ProjectOrderField, ProjectStatus, SearchArgs, SearchHit, SearchKind, Task,
@@ -461,7 +461,8 @@ pub struct TaskUpdateArgs {
     pub actor: String,
 }
 
-/// Arguments for `task.complete`. Task must be `in_progress`.
+/// Arguments for `task.complete`. Completes from `in_progress`, or walks
+/// `todo` / `claimed` (same actor) through claim → `in_progress` → done.
 #[derive(Deserialize, JsonSchema)]
 pub struct TaskCompleteArgs {
     /// task id
@@ -935,7 +936,7 @@ impl MeshService {
 
     #[tool(
         name = "task.complete",
-        description = "Mark a task done. Sole entry into 'done' status. Task must be in 'in_progress'; stamps completed_at and bumps updated_at. Optionally appends a closing note."
+        description = "Mark a task done. Sole entry into 'done' status. From 'in_progress' completes directly; from 'todo' or 'claimed' (same actor) implicitly claims and advances through in_progress first. Cross-actor 'claimed' rejects. Stamps completed_at and bumps updated_at. Optionally appends a closing note."
     )]
     async fn task_complete(
         &self,
@@ -1362,7 +1363,7 @@ impl MeshService {
         let actor = actor.clone();
         self.cas_mutate_task(&id, move |mut task| {
             let now = now_utc();
-            task = apply_complete_task(task, now)?;
+            task = apply_task_complete(task, &actor, now)?;
             if let Some(note) = note.clone() {
                 append_task_note(&mut task, now, &actor, &note)?;
             }
@@ -2012,7 +2013,7 @@ mod tests {
     }
 
     #[test]
-    fn task_complete_on_todo_returns_invalid_params() {
+    fn task_complete_on_todo_transitions_to_done() {
         let (_tmp, svc) = fresh_service();
         block_on(svc.project_create(Parameters(ProjectCreateArgs {
             slug: "alpha".to_owned(),
@@ -2031,20 +2032,57 @@ mod tests {
             depends_on: Vec::new(),
         })))
         .expect("task.create");
-        match block_on(svc.task_complete(Parameters(TaskCompleteArgs {
+        let Json(done) = block_on(svc.task_complete(Parameters(TaskCompleteArgs {
             id: task.id,
             note: None,
             actor: "human:test".to_owned(),
+        })))
+        .expect("task.complete from todo");
+        assert_eq!(done.status, TaskStatus::Done);
+        assert_eq!(done.assignee, "human:test");
+        assert!(done.claimed_at.is_some());
+        assert!(done.completed_at.is_some());
+    }
+
+    #[test]
+    fn task_complete_on_claimed_by_other_actor_returns_invalid_params() {
+        let (_tmp, svc) = fresh_service();
+        block_on(svc.project_create(Parameters(ProjectCreateArgs {
+            slug: "alpha".to_owned(),
+            title: "Alpha".to_owned(),
+            description: String::new(),
+            actor: "human:test".to_owned(),
+        })))
+        .expect("project.create");
+        let Json(task) = block_on(svc.task_create(Parameters(TaskCreateArgs {
+            project: "alpha".to_owned(),
+            phase: None,
+            slug: "t1".to_owned(),
+            title: "T".to_owned(),
+            body: String::new(),
+            actor: "human:test".to_owned(),
+            depends_on: Vec::new(),
+        })))
+        .expect("task.create");
+        block_on(svc.claim_task(&ClaimTask {
+            id: task.id.clone(),
+            actor: "human:alice".to_owned(),
+        }))
+        .expect("claim");
+        match block_on(svc.task_complete(Parameters(TaskCompleteArgs {
+            id: task.id,
+            note: None,
+            actor: "human:bob".to_owned(),
         }))) {
             Err(err) => {
                 assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
                 assert!(
-                    err.message.contains("in_progress"),
+                    err.message.contains("task already claimed by"),
                     "unexpected message: {}",
                     err.message
                 );
             }
-            Ok(_) => panic!("todo cannot complete"),
+            Ok(_) => panic!("cross-actor complete must be rejected"),
         }
     }
 
