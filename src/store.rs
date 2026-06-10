@@ -799,7 +799,7 @@ fn split_frontmatter(raw: &str) -> Result<(String, String)> {
 /// Parse a project markdown blob (YAML frontmatter + optional description body).
 pub(crate) fn parse_project(raw: &str, with_body: bool) -> Result<Project> {
     let (front, body) = split_frontmatter(raw)?;
-    let mut p: Project = serde_yml::from_str(&front).context("parse project frontmatter")?;
+    let mut p: Project = serde_norway::from_str(&front).context("parse project frontmatter")?;
     if with_body {
         body.trim().clone_into(&mut p.description);
     }
@@ -809,7 +809,7 @@ pub(crate) fn parse_project(raw: &str, with_body: bool) -> Result<Project> {
 /// Parse a phase markdown blob (YAML frontmatter + optional body).
 pub(crate) fn parse_phase(raw: &str) -> Result<Phase> {
     let (front, body) = split_frontmatter(raw)?;
-    let mut p: Phase = serde_yml::from_str(&front).context("parse phase frontmatter")?;
+    let mut p: Phase = serde_norway::from_str(&front).context("parse phase frontmatter")?;
     body.trim().clone_into(&mut p.body);
     Ok(p)
 }
@@ -817,7 +817,7 @@ pub(crate) fn parse_phase(raw: &str) -> Result<Phase> {
 /// Parse a task markdown blob into a domain task and raw note lines.
 pub(crate) fn parse_task(raw: &str, project_slug: &str) -> Result<(Task, Vec<String>)> {
     let (front, body) = split_frontmatter(raw)?;
-    let mut t: Task = serde_yml::from_str(&front).context("parse task frontmatter")?;
+    let mut t: Task = serde_norway::from_str(&front).context("parse task frontmatter")?;
     let (spec, notes_lines) = split_task_body(&body);
     t.body = spec;
     project_slug.clone_into(&mut t.project_slug);
@@ -1032,7 +1032,7 @@ impl<'a> From<&'a Project> for ProjectFrontmatter<'a> {
 /// blank line, description body, trailing newline. Body absent when
 /// description is empty so the file stays tidy.
 pub(crate) fn serialize_project_file(project: &Project) -> Result<String> {
-    let frontmatter = serde_yml::to_string(&ProjectFrontmatter::from(project))
+    let frontmatter = serde_norway::to_string(&ProjectFrontmatter::from(project))
         .context("serialize frontmatter")?;
     let body = project.description.trim();
     Ok(if body.is_empty() {
@@ -1076,7 +1076,7 @@ impl<'a> From<&'a Phase> for PhaseFrontmatter<'a> {
 }
 
 pub(crate) fn serialize_phase_file(phase: &Phase) -> Result<String> {
-    let frontmatter = serde_yml::to_string(&PhaseFrontmatter::from(phase))
+    let frontmatter = serde_norway::to_string(&PhaseFrontmatter::from(phase))
         .context("serialize phase frontmatter")?;
     let body = phase.body.trim();
     Ok(if body.is_empty() {
@@ -1131,8 +1131,8 @@ impl<'a> From<&'a Task> for TaskFrontmatter<'a> {
 /// `notes_lines`. Each note line is emitted verbatim with one trailing
 /// newline.
 pub(crate) fn serialize_task_file(task: &Task, notes_lines: &[String]) -> Result<String> {
-    let frontmatter =
-        serde_yml::to_string(&TaskFrontmatter::from(task)).context("serialize task frontmatter")?;
+    let frontmatter = serde_norway::to_string(&TaskFrontmatter::from(task))
+        .context("serialize task frontmatter")?;
     let spec = task.body.trim();
     let mut out = format!("---\n{frontmatter}---\n");
     if !spec.is_empty() {
@@ -1517,6 +1517,59 @@ mod tests {
         // tmp sibling must not linger.
         let tmp = dir.path().join("hello.txt.tmp");
         assert!(!tmp.exists(), "tmp sibling lingered");
+    }
+
+    #[test]
+    fn frontmatter_golden_byte_shape() {
+        // Pins the exact emitted frontmatter bytes so a serializer swap or
+        // version bump can't silently shift the on-disk shape. The corpus is
+        // the source of truth; byte drift here is a breaking change.
+        use chrono::TimeZone as _;
+        let t = Utc.with_ymd_and_hms(2026, 6, 8, 4, 58, 37).unwrap();
+        let project = Project {
+            id: "prj_01KRSZ90005B5290ZC9QH79QS4".into(),
+            slug: "demo".into(),
+            title: "Demo: a title with punctuation!".into(),
+            description: String::new(),
+            status: ProjectStatus::Planning,
+            created_at: t,
+            updated_at: t,
+            created_by: "human:michael".into(),
+        };
+        let got = serde_norway::to_string(&ProjectFrontmatter::from(&project)).unwrap();
+        let want = "\
+id: prj_01KRSZ90005B5290ZC9QH79QS4
+slug: demo
+title: 'Demo: a title with punctuation!'
+status: planning
+created_at: 2026-06-08T04:58:37Z
+updated_at: 2026-06-08T04:58:37Z
+created_by: human:michael
+";
+        assert_eq!(got, want, "frontmatter byte shape drifted");
+    }
+
+    #[test]
+    fn frontmatter_dialect_is_yaml_12_core() {
+        // The emitter resolves scalars per YAML 1.2 core: the 1.1 boolean
+        // words (yes/no/on/off) are plain strings and stay unquoted, while
+        // true/false are quoted when they appear as string values. Both
+        // directions must agree so a bare `yes` reads back as the string it
+        // was. Consumers parsing the corpus must use a 1.2-core resolver.
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Probe {
+            a: String,
+            b: String,
+        }
+        let out = serde_norway::to_string(&Probe {
+            a: "yes".into(),
+            b: "true".into(),
+        })
+        .unwrap();
+        assert_eq!(out, "a: yes\nb: 'true'\n", "scalar quoting drifted");
+        let back: Probe = serde_norway::from_str(&out).unwrap();
+        assert_eq!(back.a, "yes", "bare yes must parse as a string");
+        assert_eq!(back.b, "true");
     }
 
     #[test]

@@ -17,9 +17,7 @@ jobs:
       # Advisory ignores — each entry needs a one-line justification (mirrors
       # the repo's #[allow]-needs-a-reason posture). All three are transitive
       # via aws-sdk-s3 -> rustls-webpki 0.101.7 with no non-breaking bump yet;
-      # remediation (bump the rustls stack) is tracked separately. The 2 unsound
-      # warnings (libyml / serde_yml) are intentionally NOT ignored so they stay
-      # visible until the serde_yml migration lands.
+      # remediation (bump the rustls stack) is tracked separately.
       #   RUSTSEC-2026-0104  rustls-webpki CRL-parse panic (DoS); dossier's S3 TLS hits a trusted endpoint and parses no CRLs
       #   RUSTSEC-2026-0099  rustls-webpki wildcard name-constraint; misissuance-gated, reachable only after signature verification
       #   RUSTSEC-2026-0098  rustls-webpki URI name-constraint; misissuance-gated, and dossier asserts no URI names
