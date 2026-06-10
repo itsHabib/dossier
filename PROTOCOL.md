@@ -129,7 +129,7 @@ writes are idempotent on `(actor, request_id)` if `request_id` is supplied.
 - `task.create` — `{ project, phase?, title, body }` → Task (status=`todo`)
 - `task.claim` — `{ id, actor }` → Task (status=`claimed`, assignee=actor). Fails if already claimed by another actor.
 - `task.update` — `{ id, body?, status?, note? }` → Task. `note` appends to log.
-- `task.complete` — `{ id, note? }` → Task (status=`done`, completed_at=now)
+- `task.complete` — `{ id, actor, note? }` → Task (status=`done`, completed_at=now). From `in_progress`, completes directly. From `todo` or `claimed` (same actor), performs claim → in_progress → done as one compound transition (assignee=`actor`, `claimed_at` and `completed_at` stamped). Cross-actor `claimed` rejects.
 - `task.get` — `{ id }` → Task. Walks every project; no project slug required. Malformed id → `invalid_params("invalid id format")`; well-formed but absent → `invalid_params("task not found: ")` followed by the queried ULID.
 - `task.list` — `{ project?, phase?, status?, assignee?, body_contains?, created_after?, created_before?, updated_after?, updated_before?, completed_after?, completed_before?, claimed_after?, claimed_before?, order_by?, desc?, limit? }` → list of Task. `project` is optional (omit / `null` = cross-corpus); `phase` is a slug and requires `project`. `status` is a list (OR-of-statuses). `body_contains` is a case-insensitive literal substring. Date params are RFC 3339; `_after` is inclusive, `_before` is exclusive. `order_by` on a nullable field (`completed_at`, `claimed_at`) drops rows where that field is null.
 
@@ -150,13 +150,14 @@ todo ──claim──▶ claimed ──update(in_progress)──▶ in_progress
   │                ▼                                  ▼
   │             cancelled                          blocked ──update(in_progress)──▶ in_progress
   │                                                   │
-  └──────────────────────────────────────────────────▶ done (via complete)
+  └──────── task.complete (compound) ────────────────┴── task.complete ──▶ done
 ```
 
 - `cancelled` is terminal.
 - `done` is terminal.
 - Any non-terminal state may transition to `cancelled` via `task.update`.
 - `blocked` may carry a note explaining the block.
+- `task.complete` is the sole entry into `done`. It may walk intermediate states: from `todo`, claim (by `actor`) → `in_progress` → `done`; from `claimed` (same actor), `in_progress` → `done`. The underlying transitions are unchanged — the verb executes them atomically in one write.
 
 ## Identity & provenance
 
