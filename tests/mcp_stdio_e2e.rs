@@ -84,14 +84,7 @@ async fn mcp_stdio_tools_list_registers_core_verbs() {
     client.cancel().await.expect("shutdown dossier serve");
 }
 
-// Ignored: this round-trip exercises a write verb, and the write-side MCP
-// handlers are sync `fn`s that call `block_on()` inside the server's
-// multi-thread tokio runtime — which panics ("Cannot start a runtime from
-// within a runtime") over the real stdio transport. The handshake and
-// tools/list tests above already guard registration and dispatch; un-ignore
-// this once the write handlers are converted to async.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "write-side handlers panic over stdio transport: sync block_on inside the multi-thread runtime"]
 async fn mcp_stdio_project_create_then_get_round_trips() {
     let (tmp, _store) = fresh_corpus();
     let client = connect_mcp(tmp.path()).await;

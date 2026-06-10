@@ -5,7 +5,7 @@
 //! [`MeshService`] policy over `Arc<dyn Store>`; task verbs use optimistic
 //! CAS loops on the store primitives.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::Error as AnyhowError;
 use chrono::{DateTime, Utc};
@@ -37,12 +37,14 @@ pub const VERSION: &str = "0.1.0";
 /// Service holding a shared [`Store`] backend and a process-local write lock.
 ///
 /// The `Arc<dyn Store>` lets `rmcp` clone the service cheaply across
-/// handler invocations. The `Mutex<()>` serializes writes inside this
-/// process so concurrent tool calls don't race each other.
+/// handler invocations. The async `tokio::sync::Mutex<()>` serializes writes
+/// inside this process so concurrent tool calls don't race each other. It is
+/// held across the awaited store op, so the handlers stay `async` — no nested
+/// runtime (a sync `block_on` here panics under the real stdio transport).
 #[derive(Clone)]
 pub struct MeshService {
     store: Arc<dyn Store>,
-    write_lock: Arc<Mutex<()>>,
+    write_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl MeshService {
@@ -50,7 +52,7 @@ impl MeshService {
     pub fn from_store(store: Arc<dyn Store>) -> Self {
         Self {
             store,
-            write_lock: Arc::new(Mutex::new(())),
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -721,21 +723,20 @@ impl MeshService {
         name = "project.create",
         description = "Create a new project. Slug must be unique within the corpus and lowercase ASCII. Server stamps id, created_at, updated_at, and an initial 'planning' status."
     )]
-    fn project_create(
+    async fn project_create(
         &self,
         Parameters(args): Parameters<ProjectCreateArgs>,
     ) -> Result<Json<Project>, ErrorData> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .map_err(|e| internal(format!("write lock poisoned: {e}")))?;
-        let project = block_on(self.create_project(NewProject {
-            slug: args.slug,
-            title: args.title,
-            description: args.description,
-            actor: args.actor,
-        }))
-        .map_err(store_err_to_invalid)?;
+        let _guard = self.write_lock.lock().await;
+        let project = self
+            .create_project(NewProject {
+                slug: args.slug,
+                title: args.title,
+                description: args.description,
+                actor: args.actor,
+            })
+            .await
+            .map_err(store_err_to_invalid)?;
         Ok(Json(project))
     }
 
@@ -743,24 +744,23 @@ impl MeshService {
         name = "project.update",
         description = "Update mutable fields of a project (title, description, status). Slug is the addressing key and is immutable. Preserves id and created_at; bumps updated_at."
     )]
-    fn project_update(
+    async fn project_update(
         &self,
         Parameters(args): Parameters<ProjectUpdateArgs>,
     ) -> Result<Json<Project>, ErrorData> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .map_err(|e| internal(format!("write lock poisoned: {e}")))?;
+        let _guard = self.write_lock.lock().await;
         if matches!(args.actor.as_deref(), Some("")) {
             return Err(ErrorData::invalid_params("actor must not be empty", None));
         }
-        let project = block_on(self.update_project(UpdateProject {
-            slug: args.slug,
-            title: args.title,
-            description: args.description,
-            status: args.status,
-        }))
-        .map_err(store_err_to_invalid)?;
+        let project = self
+            .update_project(UpdateProject {
+                slug: args.slug,
+                title: args.title,
+                description: args.description,
+                status: args.status,
+            })
+            .await
+            .map_err(store_err_to_invalid)?;
         Ok(Json(project))
     }
 
@@ -825,24 +825,23 @@ impl MeshService {
         name = "phase.add",
         description = "Add a new phase to a project. Phase slug must be unique within the project. `owner` is required (current responsible party, actor-string shape — `human:<name>` / `team:<slug>` / `agent:<name>`; distinct from `created_by`, which records the origin actor immutably). `after_phase` (a phase slug) inserts in order; default appends to the end."
     )]
-    fn phase_add(
+    async fn phase_add(
         &self,
         Parameters(args): Parameters<PhaseAddArgs>,
     ) -> Result<Json<Phase>, ErrorData> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .map_err(|e| internal(format!("write lock poisoned: {e}")))?;
-        let phase = block_on(self.add_phase(&NewPhase {
-            project: args.project,
-            slug: args.slug,
-            title: args.title,
-            body: args.body,
-            after_phase: args.after_phase,
-            actor: args.actor,
-            owner: args.owner,
-        }))
-        .map_err(store_err_to_invalid)?;
+        let _guard = self.write_lock.lock().await;
+        let phase = self
+            .add_phase(&NewPhase {
+                project: args.project,
+                slug: args.slug,
+                title: args.title,
+                body: args.body,
+                after_phase: args.after_phase,
+                actor: args.actor,
+                owner: args.owner,
+            })
+            .await
+            .map_err(store_err_to_invalid)?;
         Ok(Json(phase))
     }
 
@@ -850,23 +849,22 @@ impl MeshService {
         name = "phase.update",
         description = "Update mutable fields of a phase (title, body, status, owner). (project, slug) is the addressing key. `owner` replaces the current value when `Some` (rejects an empty string); omit to leave unchanged. Preserves id, order, and created_at; bumps updated_at."
     )]
-    fn phase_update(
+    async fn phase_update(
         &self,
         Parameters(args): Parameters<PhaseUpdateArgs>,
     ) -> Result<Json<Phase>, ErrorData> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .map_err(|e| internal(format!("write lock poisoned: {e}")))?;
-        let phase = block_on(self.update_phase(UpdatePhase {
-            project: args.project,
-            slug: args.slug,
-            title: args.title,
-            body: args.body,
-            status: args.status,
-            owner: args.owner,
-        }))
-        .map_err(store_err_to_invalid)?;
+        let _guard = self.write_lock.lock().await;
+        let phase = self
+            .update_phase(UpdatePhase {
+                project: args.project,
+                slug: args.slug,
+                title: args.title,
+                body: args.body,
+                status: args.status,
+                owner: args.owner,
+            })
+            .await
+            .map_err(store_err_to_invalid)?;
         Ok(Json(phase))
     }
 
@@ -874,20 +872,22 @@ impl MeshService {
         name = "task.create",
         description = "Create a new task in a project. Slug must be unique within the project and lowercase ASCII. Optionally anchor to a phase by slug. Server stamps id, timestamps, and 'todo' status."
     )]
-    fn task_create(
+    async fn task_create(
         &self,
         Parameters(args): Parameters<TaskCreateArgs>,
     ) -> Result<Json<Task>, ErrorData> {
-        let task = block_on(self.create_task(NewTask {
-            project: args.project,
-            phase: args.phase,
-            slug: args.slug,
-            title: args.title,
-            body: args.body,
-            actor: args.actor,
-            depends_on: args.depends_on,
-        }))
-        .map_err(store_err_to_invalid)?;
+        let task = self
+            .create_task(NewTask {
+                project: args.project,
+                phase: args.phase,
+                slug: args.slug,
+                title: args.title,
+                body: args.body,
+                actor: args.actor,
+                depends_on: args.depends_on,
+            })
+            .await
+            .map_err(store_err_to_invalid)?;
         Ok(Json(task))
     }
 
@@ -895,15 +895,17 @@ impl MeshService {
         name = "task.claim",
         description = "Claim a task for an actor. Sole entry into 'claimed' status. Same-actor re-claim on a non-terminal task is a no-op (no updated_at bump). Errors on terminal tasks or tasks held by a different actor."
     )]
-    fn task_claim(
+    async fn task_claim(
         &self,
         Parameters(args): Parameters<TaskClaimArgs>,
     ) -> Result<Json<Task>, ErrorData> {
-        let task = block_on(self.claim_task(&ClaimTask {
-            id: args.id,
-            actor: args.actor,
-        }))
-        .map_err(store_err_to_invalid)?;
+        let task = self
+            .claim_task(&ClaimTask {
+                id: args.id,
+                actor: args.actor,
+            })
+            .await
+            .map_err(store_err_to_invalid)?;
         Ok(Json(task))
     }
 
@@ -911,19 +913,21 @@ impl MeshService {
         name = "task.update",
         description = "Update a task's body, status, and/or append a note to its progress log. Rejects status=claimed and status=done — use task.claim / task.complete instead. Terminal states reject all transitions."
     )]
-    fn task_update(
+    async fn task_update(
         &self,
         Parameters(args): Parameters<TaskUpdateArgs>,
     ) -> Result<Json<Task>, ErrorData> {
-        let task = block_on(self.update_task(UpdateTask {
-            id: args.id,
-            body: args.body,
-            status: args.status,
-            note: args.note,
-            actor: args.actor,
-            depends_on: args.depends_on,
-        }))
-        .map_err(store_err_to_invalid)?;
+        let task = self
+            .update_task(UpdateTask {
+                id: args.id,
+                body: args.body,
+                status: args.status,
+                note: args.note,
+                actor: args.actor,
+                depends_on: args.depends_on,
+            })
+            .await
+            .map_err(store_err_to_invalid)?;
         Ok(Json(task))
     }
 
@@ -931,16 +935,18 @@ impl MeshService {
         name = "task.complete",
         description = "Mark a task done. Sole entry into 'done' status. Task must be in 'in_progress'; stamps completed_at and bumps updated_at. Optionally appends a closing note."
     )]
-    fn task_complete(
+    async fn task_complete(
         &self,
         Parameters(args): Parameters<TaskCompleteArgs>,
     ) -> Result<Json<Task>, ErrorData> {
-        let task = block_on(self.complete_task(CompleteTask {
-            id: args.id,
-            note: args.note,
-            actor: args.actor,
-        }))
-        .map_err(store_err_to_invalid)?;
+        let task = self
+            .complete_task(CompleteTask {
+                id: args.id,
+                note: args.note,
+                actor: args.actor,
+            })
+            .await
+            .map_err(store_err_to_invalid)?;
         Ok(Json(task))
     }
 
@@ -973,23 +979,22 @@ impl MeshService {
         name = "artifact.link",
         description = "Link an artifact (commit, PR, file, URL, run, doc, …) to a project, optionally anchored to a specific task. Append-only — entries are never rewritten. `ref` is the pointer (SHA, URL, path, run id); `label` is a short human-readable hint."
     )]
-    fn artifact_link(
+    async fn artifact_link(
         &self,
         Parameters(args): Parameters<ArtifactLinkArgs>,
     ) -> Result<Json<Artifact>, ErrorData> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .map_err(|e| internal(format!("write lock poisoned: {e}")))?;
-        let artifact = block_on(self.link_artifact(LinkArtifact {
-            project: args.project,
-            task: args.task,
-            kind: args.kind,
-            reference: args.reference,
-            label: args.label,
-            actor: args.actor,
-        }))
-        .map_err(store_err_to_invalid)?;
+        let _guard = self.write_lock.lock().await;
+        let artifact = self
+            .link_artifact(LinkArtifact {
+                project: args.project,
+                task: args.task,
+                kind: args.kind,
+                reference: args.reference,
+                label: args.label,
+                actor: args.actor,
+            })
+            .await
+            .map_err(store_err_to_invalid)?;
         Ok(Json(artifact))
     }
 
@@ -1087,18 +1092,6 @@ const CAS_RETRY_CAP_MS: u64 = 2000;
 const CAS_MAX_ATTEMPTS: u32 = 5;
 /// Bounded retry budget for concurrent `phase.add` writers racing on one project.
 const PHASE_ADD_MAX_RETRIES: u32 = 8;
-
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
-    #[allow(
-        clippy::expect_used,
-        reason = "tokio runtime bootstrap in sync MCP handlers"
-    )]
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime")
-        .block_on(future)
-}
 
 async fn cas_backoff(attempt: u32) {
     let exponent = attempt.min(6);
@@ -1963,14 +1956,14 @@ mod tests {
     #[test]
     fn task_update_unknown_id_returns_invalid_params() {
         let (_tmp, svc) = fresh_service();
-        match svc.task_update(Parameters(TaskUpdateArgs {
+        match block_on(svc.task_update(Parameters(TaskUpdateArgs {
             id: "tsk_01KRSZG60JG3S0JF294AA3459V".to_owned(),
             body: None,
             status: None,
             note: None,
             actor: "human:test".to_owned(),
             depends_on: None,
-        })) {
+        }))) {
             Err(err) => {
                 assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
                 assert!(
@@ -2019,29 +2012,28 @@ mod tests {
     #[test]
     fn task_complete_on_todo_returns_invalid_params() {
         let (_tmp, svc) = fresh_service();
-        svc.project_create(Parameters(ProjectCreateArgs {
+        block_on(svc.project_create(Parameters(ProjectCreateArgs {
             slug: "alpha".to_owned(),
             title: "Alpha".to_owned(),
             description: String::new(),
             actor: "human:test".to_owned(),
-        }))
+        })))
         .expect("project.create");
-        let Json(task) = svc
-            .task_create(Parameters(TaskCreateArgs {
-                project: "alpha".to_owned(),
-                phase: None,
-                slug: "t1".to_owned(),
-                title: "T".to_owned(),
-                body: String::new(),
-                actor: "human:test".to_owned(),
-                depends_on: Vec::new(),
-            }))
-            .expect("task.create");
-        match svc.task_complete(Parameters(TaskCompleteArgs {
+        let Json(task) = block_on(svc.task_create(Parameters(TaskCreateArgs {
+            project: "alpha".to_owned(),
+            phase: None,
+            slug: "t1".to_owned(),
+            title: "T".to_owned(),
+            body: String::new(),
+            actor: "human:test".to_owned(),
+            depends_on: Vec::new(),
+        })))
+        .expect("task.create");
+        match block_on(svc.task_complete(Parameters(TaskCompleteArgs {
             id: task.id,
             note: None,
             actor: "human:test".to_owned(),
-        })) {
+        }))) {
             Err(err) => {
                 assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
                 assert!(
@@ -2057,20 +2049,20 @@ mod tests {
     #[test]
     fn project_update_explicit_empty_actor_returns_invalid_params() {
         let (_tmp, svc) = fresh_service();
-        svc.project_create(Parameters(ProjectCreateArgs {
+        block_on(svc.project_create(Parameters(ProjectCreateArgs {
             slug: "alpha".to_owned(),
             title: "Alpha".to_owned(),
             description: String::new(),
             actor: "human:test".to_owned(),
-        }))
+        })))
         .expect("project.create");
-        match svc.project_update(Parameters(ProjectUpdateArgs {
+        match block_on(svc.project_update(Parameters(ProjectUpdateArgs {
             slug: "alpha".to_owned(),
             actor: Some(String::new()),
             title: None,
             description: None,
             status: None,
-        })) {
+        }))) {
             Err(err) => assert_eq!(err.code, ErrorCode::INVALID_PARAMS),
             Ok(_) => panic!("empty actor must be rejected"),
         }
@@ -2079,32 +2071,31 @@ mod tests {
     #[test]
     fn task_update_reject_done_via_update_returns_invalid_params() {
         let (_tmp, svc) = fresh_service();
-        svc.project_create(Parameters(ProjectCreateArgs {
+        block_on(svc.project_create(Parameters(ProjectCreateArgs {
             slug: "alpha".to_owned(),
             title: "Alpha".to_owned(),
             description: String::new(),
             actor: "human:test".to_owned(),
-        }))
+        })))
         .expect("project.create");
-        let Json(task) = svc
-            .task_create(Parameters(TaskCreateArgs {
-                project: "alpha".to_owned(),
-                phase: None,
-                slug: "t1".to_owned(),
-                title: "T".to_owned(),
-                body: String::new(),
-                actor: "human:test".to_owned(),
-                depends_on: Vec::new(),
-            }))
-            .expect("task.create");
-        match svc.task_update(Parameters(TaskUpdateArgs {
+        let Json(task) = block_on(svc.task_create(Parameters(TaskCreateArgs {
+            project: "alpha".to_owned(),
+            phase: None,
+            slug: "t1".to_owned(),
+            title: "T".to_owned(),
+            body: String::new(),
+            actor: "human:test".to_owned(),
+            depends_on: Vec::new(),
+        })))
+        .expect("task.create");
+        match block_on(svc.task_update(Parameters(TaskUpdateArgs {
             id: task.id,
             body: None,
             status: Some(TaskStatus::Done),
             note: None,
             actor: "human:test".to_owned(),
             depends_on: None,
-        })) {
+        }))) {
             Err(err) => assert_eq!(err.code, ErrorCode::INVALID_PARAMS),
             Ok(_) => panic!("done via update must be rejected"),
         }
@@ -2715,15 +2706,15 @@ mod tests {
     fn project_update_and_phase_update_succeed_without_actor() {
         let (_tmp, svc) = fresh_service();
 
-        svc.project_create(Parameters(ProjectCreateArgs {
+        block_on(svc.project_create(Parameters(ProjectCreateArgs {
             slug: "alpha".to_owned(),
             title: "Alpha".to_owned(),
             description: String::new(),
             actor: "human:test".to_owned(),
-        }))
+        })))
         .expect("project.create");
 
-        svc.phase_add(Parameters(PhaseAddArgs {
+        block_on(svc.phase_add(Parameters(PhaseAddArgs {
             project: "alpha".to_owned(),
             slug: "spec".to_owned(),
             title: "Spec".to_owned(),
@@ -2731,31 +2722,29 @@ mod tests {
             after_phase: None,
             actor: "human:test".to_owned(),
             owner: "human:test".to_owned(),
-        }))
+        })))
         .expect("phase.add");
 
-        let Json(project) = svc
-            .project_update(Parameters(ProjectUpdateArgs {
-                slug: "alpha".to_owned(),
-                actor: None,
-                title: Some("Alpha2".to_owned()),
-                description: None,
-                status: Some(ProjectStatus::Active),
-            }))
-            .expect("project.update");
+        let Json(project) = block_on(svc.project_update(Parameters(ProjectUpdateArgs {
+            slug: "alpha".to_owned(),
+            actor: None,
+            title: Some("Alpha2".to_owned()),
+            description: None,
+            status: Some(ProjectStatus::Active),
+        })))
+        .expect("project.update");
         assert_eq!(project.title, "Alpha2");
         assert_eq!(project.status, ProjectStatus::Active);
 
-        let Json(phase) = svc
-            .phase_update(Parameters(PhaseUpdateArgs {
-                project: "alpha".to_owned(),
-                slug: "spec".to_owned(),
-                title: Some("Spec2".to_owned()),
-                body: None,
-                status: Some(PhaseStatus::Done),
-                owner: None,
-            }))
-            .expect("phase.update");
+        let Json(phase) = block_on(svc.phase_update(Parameters(PhaseUpdateArgs {
+            project: "alpha".to_owned(),
+            slug: "spec".to_owned(),
+            title: Some("Spec2".to_owned()),
+            body: None,
+            status: Some(PhaseStatus::Done),
+            owner: None,
+        })))
+        .expect("phase.update");
         assert_eq!(phase.title, "Spec2");
         assert_eq!(phase.status, PhaseStatus::Done);
     }
@@ -2764,23 +2753,23 @@ mod tests {
     fn project_get_scopes_phases_and_tasks_to_requested_project() {
         let (_tmp, svc) = fresh_service();
 
-        svc.project_create(Parameters(ProjectCreateArgs {
+        block_on(svc.project_create(Parameters(ProjectCreateArgs {
             slug: "alpha".to_owned(),
             title: "Alpha".to_owned(),
             description: String::new(),
             actor: "human:test".to_owned(),
-        }))
+        })))
         .expect("create alpha");
 
-        svc.project_create(Parameters(ProjectCreateArgs {
+        block_on(svc.project_create(Parameters(ProjectCreateArgs {
             slug: "beta".to_owned(),
             title: "Beta".to_owned(),
             description: String::new(),
             actor: "human:test".to_owned(),
-        }))
+        })))
         .expect("create beta");
 
-        svc.phase_add(Parameters(PhaseAddArgs {
+        block_on(svc.phase_add(Parameters(PhaseAddArgs {
             project: "alpha".to_owned(),
             slug: "alpha-phase".to_owned(),
             title: "Alpha phase".to_owned(),
@@ -2788,10 +2777,10 @@ mod tests {
             after_phase: None,
             actor: "human:test".to_owned(),
             owner: "human:test".to_owned(),
-        }))
+        })))
         .expect("alpha phase");
 
-        svc.phase_add(Parameters(PhaseAddArgs {
+        block_on(svc.phase_add(Parameters(PhaseAddArgs {
             project: "beta".to_owned(),
             slug: "beta-phase".to_owned(),
             title: "Beta phase".to_owned(),
@@ -2799,10 +2788,10 @@ mod tests {
             after_phase: None,
             actor: "human:test".to_owned(),
             owner: "human:test".to_owned(),
-        }))
+        })))
         .expect("beta phase");
 
-        svc.task_create(Parameters(TaskCreateArgs {
+        block_on(svc.task_create(Parameters(TaskCreateArgs {
             project: "alpha".to_owned(),
             phase: None,
             slug: "alpha-task".to_owned(),
@@ -2810,10 +2799,10 @@ mod tests {
             body: String::new(),
             actor: "human:test".to_owned(),
             depends_on: Vec::new(),
-        }))
+        })))
         .expect("alpha task");
 
-        svc.task_create(Parameters(TaskCreateArgs {
+        block_on(svc.task_create(Parameters(TaskCreateArgs {
             project: "beta".to_owned(),
             phase: None,
             slug: "beta-task".to_owned(),
@@ -2821,7 +2810,7 @@ mod tests {
             body: String::new(),
             actor: "human:test".to_owned(),
             depends_on: Vec::new(),
-        }))
+        })))
         .expect("beta task");
 
         let Json(view) = block_on(svc.project_get(Parameters(ProjectGetArgs {
@@ -2841,72 +2830,70 @@ mod tests {
     fn artifact_list_filters_combine_task_and_kind_predicates() {
         let (_tmp, svc) = fresh_service();
 
-        svc.project_create(Parameters(ProjectCreateArgs {
+        block_on(svc.project_create(Parameters(ProjectCreateArgs {
             slug: "corp".to_owned(),
             title: "Corp".to_owned(),
             description: String::new(),
             actor: "human:test".to_owned(),
-        }))
+        })))
         .expect("create project");
 
-        let Json(t1) = svc
-            .task_create(Parameters(TaskCreateArgs {
-                project: "corp".to_owned(),
-                phase: None,
-                slug: "t1".to_owned(),
-                title: "T1".to_owned(),
-                body: String::new(),
-                actor: "human:test".to_owned(),
-                depends_on: Vec::new(),
-            }))
-            .expect("t1");
+        let Json(t1) = block_on(svc.task_create(Parameters(TaskCreateArgs {
+            project: "corp".to_owned(),
+            phase: None,
+            slug: "t1".to_owned(),
+            title: "T1".to_owned(),
+            body: String::new(),
+            actor: "human:test".to_owned(),
+            depends_on: Vec::new(),
+        })))
+        .expect("t1");
 
-        let Json(t2) = svc
-            .task_create(Parameters(TaskCreateArgs {
-                project: "corp".to_owned(),
-                phase: None,
-                slug: "t2".to_owned(),
-                title: "T2".to_owned(),
-                body: String::new(),
-                actor: "human:test".to_owned(),
-                depends_on: Vec::new(),
-            }))
-            .expect("t2");
+        let Json(t2) = block_on(svc.task_create(Parameters(TaskCreateArgs {
+            project: "corp".to_owned(),
+            phase: None,
+            slug: "t2".to_owned(),
+            title: "T2".to_owned(),
+            body: String::new(),
+            actor: "human:test".to_owned(),
+            depends_on: Vec::new(),
+        })))
+        .expect("t2");
 
         let tid1 = t1.id;
         let tid2 = t2.id;
 
-        let Json(Artifact { id: id_a1, .. }) = svc
-            .artifact_link(Parameters(ArtifactLinkArgs {
+        let Json(Artifact { id: id_a1, .. }) =
+            block_on(svc.artifact_link(Parameters(ArtifactLinkArgs {
                 project: "corp".to_owned(),
                 task: Some(tid1.clone()),
                 kind: "pr".to_owned(),
                 reference: "https://example/pr/1".to_owned(),
                 label: "art1".to_owned(),
                 actor: "human:test".to_owned(),
-            }))
+            })))
             .expect("art1");
 
-        let Json(Artifact { id: id_a2, .. }) = svc
-            .artifact_link(Parameters(ArtifactLinkArgs {
+        let Json(Artifact { id: id_a2, .. }) =
+            block_on(svc.artifact_link(Parameters(ArtifactLinkArgs {
                 project: "corp".to_owned(),
                 task: Some(tid2),
                 kind: "pr".to_owned(),
                 reference: "https://example/pr/2".to_owned(),
                 label: "art2".to_owned(),
                 actor: "human:test".to_owned(),
-            }))
+            })))
             .expect("art2");
 
-        let Json(Artifact { id: id_a3, .. }) = svc
-            .artifact_link(Parameters(ArtifactLinkArgs {
+        let Json(Artifact { id: id_a3, .. }) =
+            block_on(svc.artifact_link(Parameters(ArtifactLinkArgs {
                 project: "corp".to_owned(),
                 task: Some(tid1.clone()),
                 kind: "commit".to_owned(),
                 reference: "deadbeef".to_owned(),
                 label: "art3".to_owned(),
                 actor: "human:test".to_owned(),
-            }))
+            })))
             .expect("art3");
 
         macro_rules! ids {
