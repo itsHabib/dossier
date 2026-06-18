@@ -4,20 +4,32 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 Project memory for the solo developer. One markdown-on-disk corpus tracking
-design docs, TDDs, and task notes across a portfolio, queryable through any
-LLM via MCP. See [docs/vision.md](docs/vision.md) for the longer "what +
-why + what we're explicitly not building."
+projects, phases (design docs / TDDs), tasks, and the artifacts (PRs, commits,
+files) that shipped them — across an entire portfolio, queryable and mutable
+through any LLM. You point an agent at it and it answers "what's open in
+`<project>`?", "show me the auth design doc", "what did I close last week?" —
+and creates the structure as work starts, without you typing in a UI.
+
+dossier exposes the corpus two ways: an **MCP server** (`dossier serve`) that
+gives any LLM the full read + write verb set over stdio, and a thin **CLI**
+for the handful of verbs worth scripting from a shell or a CI hook
+(`task_complete`, `task_update`, `artifact_link`, `task_list`). The corpus
+itself is the source of truth — plain markdown you can grep and edit by hand;
+the server re-reads it on every call.
+
+See [docs/vision.md](docs/vision.md) for the longer "what + why + what we're
+explicitly not building."
 
 ## Quick start
 
 ```sh
-# 1. Build + install the mesh binary
+# 1. Build + install the `dossier` binary
 cargo install --path .
 
 # 2. Pick (or create) a corpus directory
 mkdir -p ~/dossier-corpus/.dossier   # the .dossier/ marker is all you need
 
-# 3. Register the mesh with Claude Code as an MCP server
+# 3. Register dossier with Claude Code as an MCP server
 claude mcp add dossier -- "$(which dossier)" serve --corpus ~/dossier-corpus
 
 # 4. Open a new Claude Code session
@@ -151,17 +163,30 @@ The hosted multi-writer tier built on it is in progress — see
 
 ## Verbs
 
-| Read | Write |
+The MCP server registers 16 tools. Reads never mutate; writes route through the
+runtime-guarded task state machine and atomic file writes.
+
+| Read | what it does |
 | --- | --- |
-| `project.list` | `project.create` |
-| `project.get` | `project.update` |
-| `phase.list` | `phase.add` |
-| `task.list` | `phase.update` |
-| `artifact.list` | `task.create` |
-| | `task.claim` |
-| | `task.update` |
-| | `task.complete` |
-| | `artifact.link` |
+| `project.list` | list projects, filtered by status / body / date ranges |
+| `project.get` | one project with its phases, tasks, artifacts, and body |
+| `phase.list` | list phases (cross-project or scoped), bodies included |
+| `task.list` | list tasks, filtered by status / assignee / phase / dates |
+| `task.get` | fetch a single task by id, no project slug needed |
+| `artifact.list` | list a project's linked artifacts (PRs, commits, files) |
+| `search` | one ranked case-insensitive substring pass over project / phase / task titles + bodies |
+
+| Write | what it does |
+| --- | --- |
+| `project.create` | new project (unique lowercase slug; server stamps id + timestamps) |
+| `project.update` | edit title / description / status (slug is immutable) |
+| `phase.add` | append or insert a phase (`after_phase` for ordering) |
+| `phase.update` | edit phase title / body / status / owner |
+| `task.create` | new task, optionally anchored to a phase |
+| `task.claim` | sole entry to `claimed`; same-actor re-claim is a no-op |
+| `task.update` | edit body / status / append a progress note |
+| `task.complete` | sole entry to `done`; implicit-claims from `todo` / `claimed` |
+| `artifact.link` | append-only link of a PR / commit / file / url / run / doc |
 
 Data model: [project](PROTOCOL.md#project) ·
 [phase](PROTOCOL.md#phase) ·
@@ -169,6 +194,20 @@ Data model: [project](PROTOCOL.md#project) ·
 [artifact](PROTOCOL.md#artifact) ·
 [task state machine](PROTOCOL.md#task-state-machine).
 See [PROTOCOL.md](PROTOCOL.md) for the full spec.
+
+### CLI
+
+`dossier serve` is the main surface. For shell / CI use, three writes plus
+`task_list` are exposed as one-shot subcommands that print their result as JSON
+— they share the `--corpus` flag (or `DOSSIER_CORPUS`, or a walk-up search for
+`.dossier/`):
+
+```sh
+dossier task_list --project tower --status in_progress
+dossier task_update --id tsk_… --note "blocked on review"
+dossier task_complete --id tsk_… --note "merged in #42"
+dossier artifact_link --project tower --kind pr --ref https://github.com/itsHabib/tower/pull/42 --label "PR #42"
+```
 
 ## Develop
 
@@ -183,12 +222,52 @@ make release      # release build
 CI runs `make check` on every PR. Lint discipline + conventions live in
 [CLAUDE.md](CLAUDE.md).
 
+## Architecture
+
+A strict one-directional layering — each layer depends only on the one below,
+so the storage backend is swappable and the MCP transport is just the top edge:
+
+```
+bin  (src/bin/dossier.rs)   CLI + stdio MCP transport, arg parsing
+ │
+server  (src/server.rs)     MeshService — the 16 verbs over rmcp
+ │
+store   (src/store.rs)      Store trait + FsStore  ┐ swappable backend
+        (src/s3store.rs)    S3Store (CAS via ETags)┘ behind one trait
+ │
+domain  (src/domain.rs)     pure types + the task state machine, no I/O
+```
+
+| Module | Responsibility |
+| --- | --- |
+| `domain` | primitives + status enums + state machine. No I/O; 1:1 with PROTOCOL.md. |
+| `store` | `Store` trait and `FsStore` — read/write the on-disk corpus per LAYOUT.md. |
+| `s3store` | `S3Store` — the same layout on an S3-compatible object store, with compare-and-swap writes. |
+| `server` | `MeshService` — wraps a `Store` and registers every MCP verb. |
+| `bin` | CLI entry, stdio transport, the one-shot subcommands. |
+
 ## Why this exists
 
 A solo dev with a dozen side projects has the same recurring problem:
 *where did I write that down?* The design doc for the auth migration
 lives in one repo, the TDD for the data pipeline in another, and the
 PRs are scattered across GitHub. dossier consolidates the project-state
-plane in plain markdown that humans grep and LLMs query. The full
-framing — and the explicit list of things we're *not* building — is in
+plane in plain markdown that humans grep and LLMs query.
+
+The discipline is to be excellent at one thing — *track project docs and tasks
+for a solo developer, and let an LLM answer questions about them* — before
+adding a second. So a lot stays deliberately out of scope:
+
+- **Semantic / vector / RAG search lives in the LLM consumer, not the store.**
+  dossier ships literal substring `search` and nothing fancier; embedding
+  indexes belong to whatever agent queries the corpus.
+- **Natural-language understanding lives in the LLM, not dossier.** The server
+  provides structured truth; the model is the conversational layer.
+- **History / audit lives in git.** No `last_updated_by`, no audit log — the
+  corpus is checked in, so `git log` already has it.
+- **No web UI, no conflict-detection engine, no cross-project dependency
+  graph, no multi-implementer protocol machinery.** Markdown + grep + an
+  MCP-aware agent is the interface; single-actor is the assumption for v0.
+
+The full framing — and the running list of things we're *not* building — is in
 [docs/vision.md](docs/vision.md).
