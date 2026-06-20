@@ -47,6 +47,11 @@ history belongs to git, which already versions the markdown. Those are
 architectural lines about where a job is best done — drawn deliberately,
 revisited as the work demands.
 
+Concretely, the scope today is the four primitives — project, phase,
+task, artifact — over markdown, read and mutated through MCP by an LLM
+(the shipped surface in *What you have today*). Everything past that
+arrives when a real need does.
+
 ## What you have today
 
 Shipped on `main`:

@@ -9,7 +9,7 @@
 
 `project.get` is the natural call an agent makes to orient in a project — the documented first step of *"what's the state of `<project>`?"* It has stopped working at scale.
 
-In a real ship-on-ship driver session (2026-06-19), `project_get { slug: "ship" }` returned **~395,675 characters** (393,675 corpus bytes + JSON envelope; see Evidence), exceeded the MCP tool-result token cap, and could not be consumed inline at all — the harness dumped it to a file and the agent had to `jq` it just to read the phase slugs. The single most natural orientation read is now unusable on a project that has been used for months.
+In a real ship-on-ship driver session (2026-06-19), `project.get { slug: "ship" }` (the MCP client emits it as `project_get`) returned ~395,675 characters — 393,675 corpus bytes plus the JSON envelope (see Evidence; the doc reports bytes throughout) — exceeded the MCP tool-result token cap, and could not be consumed inline at all — the harness dumped it to a file and the agent had to `jq` it just to read the phase slugs. The single most natural orientation read is now unusable on a project that has been used for months.
 
 Root cause: `project.get` always hydrates the **entire subtree in one unbounded blob** — project meta + every phase (full body) + every task (full body + notes) + every artifact. Fine when a project is young; the cost grows monotonically as a dogfooded project accumulates phases and tasks. `done` and `cancelled` work never leaves the read. This is the natural consequence of dossier *succeeding*: the more a project is used, the heavier its overview read becomes.
 
@@ -73,7 +73,7 @@ project.overview { slug } →
   project: {
     id, slug, title, status,
     created_at, updated_at, created_by,
-    description,                   // first ~N chars of project.md body; see D2
+    description,                   // first 600 chars of project.md body; see D2
     description_truncated: bool     // true if the body was clipped
   },
   phases: [                        // ordered by `order` ASC, ties by id ASC (= phase.list single-project default)
@@ -127,7 +127,7 @@ Move 1's tool description (and the steering in Move 3) routes agents *off* `proj
 
 Add an opt-in `bodies: false` (default `true` = unchanged) to `phase.list` and `task.list` that drops the `body` (and, for tasks, `notes`) field at serialization time. This is a clean field-strip — a true subset of the existing shape, no aggregation, no union, no schema change beyond the field already being `skip_serializing_if`-eligible. It is the one mechanism that makes *every* enumeration bounded, and it closes the secondary hole the friction task named directly. `task.get` stays full-body (it's already a single, intentionally-hydrated row).
 
-This makes the recommended orient → drill-down path bounded end to end. It also subsumes the friction's option 1 cleanly: overview for *aggregation/orientation*, `bodies:false` for *bounded enumeration*. Complementary, not redundant.
+This makes the recommended orient → drill-down path bounded end to end — *when an agent follows the steering and passes `bodies:false`*; the default stays full-body so existing callers are unaffected (the bound is opt-in, not automatic — which is why Move 3's steering matters). It also subsumes the friction's option 1 cleanly: overview for *aggregation/orientation*, `bodies:false` for *bounded enumeration*. Complementary, not redundant.
 
 ### Move 3 — steer agents to the new surface (the activation)
 
@@ -142,13 +142,14 @@ Description steering is best-effort, not a hard guarantee. That is the honest ar
 ### Tool descriptions (verbatim)
 
 `project.overview`:
-> Orient in a project — the bounded "what's the state of `<project>`?" read, and the one to call FIRST. Returns project meta + a (truncated) description + an ordered phase index where each phase carries task-status COUNTS (todo|claimed|in_progress|blocked|done|cancelled, plus total) instead of bodies, an `unphased` bucket for tasks not anchored to a phase, and project-level rollups (phase + task counts, artifact count). Stays a few KB no matter how much work has accumulated. To read a specific design doc or task body, follow up with phase.list / task.get / task.list. project.get is the full unbounded hydrate — heavy on mature projects.
+> Orient in a project — the bounded "what's the state of `<project>`?" read, and the one to call FIRST. Returns project meta + a (truncated) description + an ordered phase index where each phase carries task-status COUNTS (todo|claimed|in_progress|blocked|done|cancelled, plus total) instead of bodies, an `unphased` bucket for tasks not anchored to a live phase (empty *or* dangling phase id), and project-level rollups (phase + task counts, artifact count). Stays a few KB no matter how much work has accumulated. To read a specific design doc or task body, follow up with phase.list / task.get / task.list. project.get is the full unbounded hydrate — heavy on mature projects.
 
 `project.get` (revised):
 > Full hydrate: one project with every phase, task, and artifact body inline. Heavy on mature projects — can exceed the result size cap. To orient, call project.overview; to read a specific part, use phase.list / task.get / task.list.
 
 `project.list` (append): `… (corpus-wide; for one project's state, use project.overview).`
 `phase.list` (append): `… Pass bodies:false to omit phase bodies (slug/title/status/order only).`
+`task.list` (append): `… Pass bodies:false to omit task bodies + notes (frontmatter only) — use it when drilling down from project.overview.`
 
 ## Backward compatibility
 
@@ -156,7 +157,7 @@ dossier is public and tagged, and pre-1.0 (PROTOCOL.md §Versioning: tool/field 
 
 - **`project.overview` is purely additive** at the protocol level. The only real costs: (a) a slightly larger `tools/list` schema bundle every client downloads at handshake — acceptable; the verb earns its description budget by routing the common orient call; and (b) the standard rmcp registration requirements (return `Json<ProjectOverview>`, derive `JsonSchema` on the new types, keep schemars aligned per `CLAUDE.md`). Covered by `make check`.
 - **`bodies:false` on `phase.list` / `task.list` is opt-in**, default `true` = today's behavior. No existing caller changes.
-- **`project.get` is unchanged in shape and default behavior.** Only its description changes (non-breaking). The deterministic over-size guardrail is *deferred* (D4) precisely because, as originally specced, it would have been a behavior change for callers that aren't failing — see D4.
+- **`project.get` is unchanged in shape and default behavior.** Only its description changes — non-breaking for programmatic callers, but note a description change *is* behavioral for LLM agents (they read it to pick a verb): steering them off `project.get` is the deliberate intent of Move 3, not a side effect. The deterministic over-size guardrail is *deferred* (D4) precisely because, as originally specced, it would have been a behavior change for callers that aren't failing — see D4.
 - **On-disk format is untouched.** No new frontmatter, no new files, no migration. Everything is derived at read time. (Contrast option 5, which *would* touch the format.)
 - **Counts are a best-effort snapshot, not a transactional read.** Overview issues separate `list_phases` / `list_tasks` calls under no lock (as `project.get` does today). At single-writer v0 this is exact. Under the future multi-writer / bounded-stale cache backend (TDD D7) counts are exact-per-object but not point-in-time consistent — fine for orientation; stated so the "exact aggregation" claim isn't read as transactional.
 
@@ -200,12 +201,13 @@ Be honest about the upgrade path, because a naïve version doesn't work: a `bodi
 ## Decisions to lock
 
 - **D1 — verb vs flag for orientation.** Dedicated `project.overview` verb (bounded by phase count forever; service-layer aggregation per the `search`/D9 precedent), *plus* `bodies:false` on the list verbs for bounded drill-down. The two are complementary.
-- **D2 — `project.description` in overview, truncated.** Include it, but **bounded** — first ~N chars (recommend ~500–800, one or two paragraphs) with a `description_truncated` flag, matching `search`'s snippet precedent. A project.md *is* the full design doc and is **not** length-bounded; including it whole would re-blow the cap on the `description` field for a project with a long doc. Truncation keeps "a few KB regardless" literally true. (N is the one number to pick; recommend a fixed, non-configurable value.)
+- **D2 — `project.description` in overview, truncated to 600 chars.** Include it, but **bounded** — the first **600 characters** of the project.md body (a fixed, non-configurable value — roughly one tight paragraph, enough for an agent to grasp the project without the full design doc) with a `description_truncated` flag, matching `search`'s snippet precedent. A project.md *is* the full design doc and is **not** length-bounded; including it whole would re-blow the cap on the `description` field for a project with a long doc. The 600-char bound keeps "a few KB regardless" literally true.
 - **D3 — per-phase artifact counts: no, project-level only.** Artifacts link to a project (and optionally a task), never to a phase — `Artifact` has no `phase` field, and a project-only artifact (no `task`) has *no* phase attribution at all. A per-phase breakdown is therefore not just awkward but undefined-for-totality. Project-level rollup is the only well-defined aggregation.
 - **D4 — `project.get` over-size guardrail: deferred, and redesigned if revived.** The original "typed error when the assembled payload exceeds a byte budget" had three problems the review surfaced: (a) it's a *regression* for callers that aren't failing — dossier-self (172 KB) sits inside the candidate budget yet is currently consumable, and programmatic full-hydrate callers (`dossier export`, cortex) have no token cap and legitimately want the whole blob; (b) a "lockable byte budget" is an un-opinionated config knob; (c) "assemble-then-measure" does the full O(all-tasks) hydrate (pathological on S3) just to refuse it. If revived after evidence: a *fixed* threshold set **at/above the real result cap** (so it only fires where the call already failed), an explicit `full: true` escape for deliberate full-hydrate callers, a named error code (`invalid_request` with a machine-readable `{ reason: "too_large", suggest: "project.overview" }`), and a *cheap* pre-check from counts — never assemble-then-discard. Until then, Move 3's steering carries it.
 - **D5 — overview includes all phases, all statuses.** Including `done` and `skipped` phases (with their counts) — the point is seeing where finished vs open work sits; hiding done phases here would pre-empt the option-5 question. (Phase-level archival is the separate, deferred lever.)
-- **D6 — partition of tasks across phases.** `phase` is a phase *id*. A task joins a phase row iff `task.phase == phase.id`; it falls into `unphased` iff `phase` is empty **or** dangling (a non-empty id matching no existing phase — possible via hand-edits per LAYOUT.md, or a future phase-delete). The reconcile invariant (Move 1) and an orphan-injection test keep the partition exhaustive.
+- **D6 — partition of tasks across phases.** `phase` is a phase *id*. A task joins a phase row iff `task.phase == phase.id`; it falls into `unphased` iff `phase` is empty **or** dangling (a non-empty id matching no existing phase — possible via hand-edits per LAYOUT.md, or a future phase-delete). The reconcile invariant (Move 1) and an orphan-injection test keep the partition exhaustive. The field stays named `unphased` (not `unanchored` / `orphaned`) — the common case is genuinely unphased, and the rare dangling case is folded in with the contract spelled out in the tool description ("empty or referring to a deleted phase") so the name isn't misread.
 - **D7 — phase recency.** Include `updated_at` on each `PhaseOverview` row (free; phase frontmatter already carries it; stays bounded) so "what changed recently" is answerable in the one orient call instead of a follow-up `phase.list { order_by: updated_at }`.
+- **D8 — corrupt-corpus behavior: fail, don't skip.** A corrupt / unparseable task or phase file fails the whole `project.overview`, matching `project.get`'s current behavior. Corrupted state must never silently become "fewer tasks" — a skip-and-count policy would mask data loss behind a plausible number. Surface it loudly.
 
 ## Non-goals
 
@@ -226,7 +228,7 @@ Be honest about the upgrade path, because a naïve version doesn't work: a `bodi
 - **`bodies:false`** (Move 2): `phase.list { project, bodies:false }` and `task.list { project, bodies:false }` omit the body (and notes) fields; default still returns them.
 - **Empty project**: no phases/tasks → empty `phases`, zeroed counts, not an error.
 - **Not found**: unknown slug → typed `invalid_params`, same shape as `project.get` today.
-- **Corrupt corpus**: overview still parses frontmatter+body to count, so a corrupt task/phase file fails the overview the same way `project.get` fails today — counting doesn't change parse behavior. Pin whichever behavior we want (fail vs skip) with a test so it's defined, not incidental.
+- **Corrupt corpus** (D8): a corrupt task/phase file fails the whole overview (not skip-and-undercount), matching `project.get` today — a test pins fail-on-corrupt so it's defined, not incidental.
 - **Dogfood**: `project.overview { slug: "dossier" }` against the in-repo fixture returns a bounded result (assert a byte ceiling) and the right phase count; pins the on-disk pipeline like `read_dogfood_corpus` does.
 - **`make check` green** on the repo matrix (fmt + clippy `-D warnings` + test).
 
