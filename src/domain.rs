@@ -313,6 +313,128 @@ pub struct SearchHit {
     pub score: f64,
 }
 
+/// Per-status task tally for one phase row (or the `unphased` bucket) in a
+/// [`ProjectOverview`]. Every field is always present (zero when none);
+/// `total` is the authoritative sum of the six status buckets.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TaskStatusCounts {
+    pub todo: u32,
+    pub claimed: u32,
+    pub in_progress: u32,
+    pub blocked: u32,
+    pub done: u32,
+    pub cancelled: u32,
+    pub total: u32,
+}
+
+impl TaskStatusCounts {
+    /// Tally one task's status into the matching bucket and bump `total`.
+    pub const fn add(&mut self, status: TaskStatus) {
+        match status {
+            TaskStatus::Todo => self.todo += 1,
+            TaskStatus::Claimed => self.claimed += 1,
+            TaskStatus::InProgress => self.in_progress += 1,
+            TaskStatus::Blocked => self.blocked += 1,
+            TaskStatus::Done => self.done += 1,
+            TaskStatus::Cancelled => self.cancelled += 1,
+        }
+        self.total += 1;
+    }
+}
+
+/// Per-status phase tally for the project-level rollup in a
+/// [`ProjectOverview`]. Every field is always present (zero when none).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PhaseStatusCounts {
+    pub pending: u32,
+    pub active: u32,
+    pub done: u32,
+    pub skipped: u32,
+}
+
+impl PhaseStatusCounts {
+    /// Tally one phase's status into the matching bucket.
+    pub const fn add(&mut self, status: PhaseStatus) {
+        match status {
+            PhaseStatus::Pending => self.pending += 1,
+            PhaseStatus::Active => self.active += 1,
+            PhaseStatus::Done => self.done += 1,
+            PhaseStatus::Skipped => self.skipped += 1,
+        }
+    }
+}
+
+/// One ordered phase row in a [`ProjectOverview`]: identity + status +
+/// recency + per-status task counts (no bodies).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PhaseOverview {
+    pub id: String,
+    pub slug: String,
+    pub title: String,
+    pub order: i32,
+    pub status: PhaseStatus,
+    pub owner: String,
+    pub updated_at: DateTime<Utc>,
+    pub task_counts: TaskStatusCounts,
+}
+
+/// Project-level rollups for a [`ProjectOverview`].
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct OverviewTotals {
+    pub phases_by_status: PhaseStatusCounts,
+    pub tasks_by_status: TaskStatusCounts,
+    pub artifact_count: u32,
+}
+
+/// The `unphased` bucket of a [`ProjectOverview`]: tasks whose `phase` is
+/// empty or refers to no existing phase.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct UnphasedOverview {
+    pub task_counts: TaskStatusCounts,
+}
+
+/// Project identity block for a [`ProjectOverview`], carrying a bounded
+/// description instead of the full project.md body.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ProjectOverviewMeta {
+    pub id: String,
+    pub slug: String,
+    pub title: String,
+    pub status: ProjectStatus,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub created_by: String,
+    /// First 600 characters of the project.md body (char-safe), bounded.
+    pub description: String,
+    /// `true` iff the body was clipped to fit the 600-char bound.
+    pub description_truncated: bool,
+}
+
+/// Bounded "state of this project" snapshot returned by `project.overview`.
+///
+/// Carries project meta, an ordered phase index with per-status task counts
+/// (no bodies), an `unphased` bucket, and project-level rollups.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ProjectOverview {
+    pub project: ProjectOverviewMeta,
+    pub phases: Vec<PhaseOverview>,
+    pub unphased: UnphasedOverview,
+    pub totals: OverviewTotals,
+}
+
+/// Max characters of the project description carried in a [`ProjectOverview`].
+pub const OVERVIEW_DESCRIPTION_CHARS: usize = 600;
+
+/// Char-safe truncation of `body` to [`OVERVIEW_DESCRIPTION_CHARS`]. Returns
+/// the (possibly clipped) string and whether it was clipped. Never splits a
+/// UTF-8 codepoint — operates on `chars`, not bytes.
+pub fn truncate_description(body: &str) -> (String, bool) {
+    let truncated = body.chars().count() > OVERVIEW_DESCRIPTION_CHARS;
+    let out: String = body.chars().take(OVERVIEW_DESCRIPTION_CHARS).collect();
+    (out, truncated)
+}
+
 // --- Write-verb argument DTOs (protocol inputs; no I/O) ---
 
 /// Arguments for `project.create`.
@@ -630,5 +752,46 @@ pub fn apply_task_complete(mut task: Task, actor: &str, now: DateTime<Utc>) -> R
             task = apply_task_status_update(task, TaskStatus::InProgress, now)?;
             apply_complete_task(task, now)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::panic)]
+
+    use super::{truncate_description, OVERVIEW_DESCRIPTION_CHARS};
+
+    #[test]
+    fn truncate_short_description_unchanged() {
+        let (out, truncated) = truncate_description("a short body");
+        assert_eq!(out, "a short body");
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn truncate_long_description_clips_to_bound() {
+        let body = "x".repeat(OVERVIEW_DESCRIPTION_CHARS + 100);
+        let (out, truncated) = truncate_description(&body);
+        assert_eq!(out.chars().count(), OVERVIEW_DESCRIPTION_CHARS);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn truncate_at_exact_bound_is_not_truncated() {
+        let body = "x".repeat(OVERVIEW_DESCRIPTION_CHARS);
+        let (out, truncated) = truncate_description(&body);
+        assert_eq!(out.chars().count(), OVERVIEW_DESCRIPTION_CHARS);
+        assert!(!truncated, "exactly at the bound is not clipped");
+    }
+
+    #[test]
+    fn truncate_respects_utf8_boundaries() {
+        // Multi-byte chars: clipping must count chars, never split a codepoint.
+        let body = "é".repeat(OVERVIEW_DESCRIPTION_CHARS + 50);
+        let (out, truncated) = truncate_description(&body);
+        assert_eq!(out.chars().count(), OVERVIEW_DESCRIPTION_CHARS);
+        assert!(truncated);
+        // Round-trips as valid UTF-8 (String guarantees it; assert no partial char).
+        assert!(out.chars().all(|c| c == 'é'));
     }
 }
