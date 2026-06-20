@@ -85,11 +85,11 @@ Single PR, "amazing" band.
 
 | Bucket | Files | Est. LOC | Weighted |
 |---|---|---|---|
-| Production | `src/domain.rs` (predicates), `src/store.rs` (default injection in 3 lists + search), `src/server.rs` (`include_terminal` arg + descriptions) | ~100 | ~100 |
-| Tests | `src/store.rs` test module + dogfood count updates | ~120 | ~60 |
+| Production | `src/domain.rs` (`is_terminal` / `live_statuses` predicates), `src/server.rs` (`include_terminal` arg, `From`-boundary resolution, the `search_corpus` walk, descriptions) | ~100 | ~100 |
+| Tests | `src/domain.rs` + `src/server.rs` test modules | ~120 | ~60 |
 | **Total** | | | **~160** |
 
-Sequencing: touches the same list-verb arg/filter structs as #85's `bodies:false`. Land in either order; the second rebases. The two are the "reads at scale" pair — ship close together.
+`src/store.rs` is **unchanged** — the store stays mechanism (D6), so the policy lives entirely in `domain` + `server`. Sequencing: touches the same list-verb *arg* structs (`PhaseListArgs` / `TaskListArgs`) as #85's `bodies:false`; land in either order, the second rebases. The two are the "reads at scale" pair — ship close together.
 
 ## Decisions to lock
 
@@ -115,7 +115,7 @@ Sequencing: touches the same list-verb arg/filter structs as #85's `bodies:false
 - **Explicit `status` honored**: `status: ["done"]` returns terminal rows even with `include_terminal` false (D2).
 - **`is_terminal()` units**: every enum variant maps to the table; `blocked`/`paused` are live.
 - **search**: terminal hits present by default; `include_terminal: false` scopes to live-only.
-- **Dogfood**: update `read_dogfood_corpus` to the live-default count (exact `== 6`, not a weakened `> 0`); add an assertion that `include_terminal: true` recovers the full 58 — regression coverage in both directions.
+- **Dogfood**: `read_dogfood_corpus` (a *store*-level test) is **unchanged** — the store has no live-default. Add a *verb*-level test instead: the `task.list` handler against the in-repo fixture returns the live count (exact `== 6`, not a weak `> 0`), and `include_terminal: true` recovers the full `== 58` — regression coverage in both directions.
 - **`make check` green** on the repo matrix.
 
 ## Acceptance
