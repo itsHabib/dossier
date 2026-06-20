@@ -1,7 +1,7 @@
 **Status**: proposal — design for review; not a build commitment.
 **Owner**: @itsHabib
 **Date**: 2026-06-19
-**Related**: [vision.md](../../vision.md), [filter-expansion/spec.md](../filter-expansion/spec.md), [search/spec.md](../search/spec.md), the orientation sibling [project-overview/spec.md](../project-overview/spec.md) (PR #85), PROTOCOL.md. Implements **option 1** of the dossier task `deletes-not-just-cancel`.
+**Related**: [vision.md](../../vision.md), [filter-expansion/spec.md](../filter-expansion/spec.md), [search/spec.md](../search/spec.md), the orientation sibling [project-overview/spec.md](../project-overview/spec.md) (PR #85, merged), [PROTOCOL.md](../../../PROTOCOL.md). Implements **option 1** of the dossier task `deletes-not-just-cancel`.
 
 # Default-live reads — drop terminal clutter from the default list/search surface
 
@@ -37,11 +37,15 @@ When a list verb is called **without an explicit `status` filter**, default to *
 | omitted | `false` (default) | live statuses only — **new default** |
 | omitted | `true` | all statuses — today's behavior, opt-in |
 
+**Where it's resolved (policy, not mechanism).** `include_terminal` is a *verb-level* arg, resolved at the `From<…ListArgs> for …ListFilter` boundary in `server.rs` into a concrete `status` set — `live_statuses()` when omitted, all when `include_terminal: true`, the explicit list otherwise. The store's `list_*` never learns about "live by default"; it filters by whatever statuses it receives. That keeps the opinion in the verb layer **and** means `search` — which builds store filters directly — is unaffected by construction (next section).
+
 ### `search` keeps finding terminal work (D4)
 
 `search` answers a *different* question — "where does X appear, anywhere?" — and finding **completed** work ("did I already build this?", "have I designed auth before?") is a core, deliberate use of it. Default-hiding terminal would make search worse at its primary job. So **search keeps returning terminal hits by default**, but gains the *same* `include_terminal` knob (default **true** for search) so a caller can scope to live-only when they want.
 
 The control is uniform across the read surface; the **default differs by verb because the verbs answer different questions** — lists answer "what's the current work" (live-by-default), search answers "where does this appear" (everything-by-default). That asymmetry is the design, not an inconsistency.
+
+Mechanically, `search_corpus` (in `server.rs`) enumerates the corpus directly, **not** through the list verbs' arg conversion, so its scan is all-statuses by construction — the live-default cannot leak in. Its own `include_terminal` (default `true`) is applied *during* the walk: when `false`, items whose status `is_terminal()` are skipped before ranking; when `true`, nothing is dropped. No `SearchHit` schema change.
 
 ## Why this shape
 
@@ -69,9 +73,9 @@ Complementary, not overlapping — together they complete "reads work well at sc
 
 Respects `domain → store → server → bin`:
 
-- **`domain.rs`** — `is_terminal()` on `TaskStatus` / `PhaseStatus` / `ProjectStatus`; a small `live_statuses()` helper per enum. Pure policy, 1:1 with the state machine.
-- **`store.rs`** — in `list_tasks` / `list_phases` / `list_projects`, when the filter's `status` is `None` and `include_terminal` is false, restrict to the live set before the existing match/sort/limit chain; mirror in `search`.
-- **`server.rs`** — add `include_terminal` to the four read verbs' arg structs (+ the filter structs) and update the tool descriptions.
+- **`domain.rs`** — `is_terminal()` on `TaskStatus` / `PhaseStatus` / `ProjectStatus` (+ a `live_statuses()` helper per enum). Pure policy, 1:1 with the state machine.
+- **`server.rs`** (policy) — `include_terminal` is added to the **verb arg structs only** (`TaskListArgs` / `PhaseListArgs` / `ProjectListArgs` / `SearchArgs`), **not** the store filter structs. The live-default is resolved at the `From<…ListArgs> for …ListFilter` conversion (omitted `status` + `include_terminal:false` → inject `live_statuses()`; `include_terminal:true` → leave all; explicit `status` → pass through). `search_corpus` applies its `include_terminal` during its own corpus walk. Tool descriptions updated.
+- **`store.rs`** (mechanism) — **unchanged.** The list methods keep honoring the `status` filter exactly as received and gain no opinion about "live by default." This is precisely what keeps `search_corpus`'s direct filter construction (`TaskListFilter { project, ..Default::default() }`) scanning all statuses — the trap @codex/@claude flagged is avoided by construction, not by remembering to pass a flag.
 
 No new dependency direction; no on-disk format change.
 
@@ -90,10 +94,11 @@ Sequencing: touches the same list-verb arg/filter structs as #85's `bodies:false
 ## Decisions to lock
 
 - **D1 — flip the default to live; no opt-in-hide.** The clutter is the default; the default is what changes.
-- **D2 — explicit `status` always wins.** `include_terminal` only governs the omitted-status default. (An explicit `status: ["done"]` returns done regardless of `include_terminal`.)
+- **D2 — explicit `status` always wins.** `include_terminal` only governs the omitted-status default. (An explicit `status: ["done"]` returns done regardless of `include_terminal`.) The existing matcher treats an explicit empty list `status: []` as "no filter" (all pass), so `status: []` returns everything including terminal — consistent with "explicit wins," but worth a code comment so it isn't mistaken for a bug.
 - **D3 — terminal sets per the table.** `blocked` and `paused` are live, not terminal.
 - **D4 — search defaults to all (opt-in live-only); lists default to live (opt-in terminal).** Uniform `include_terminal` knob, verb-appropriate defaults.
 - **D5 — no delete in this PR.** This is `deletes-not-just-cancel` option 1; soft-delete (option 2) and hard `*.delete` verbs (option 3) stay parked, graduated only on residual evidence after this lands.
+- **D6 — the live-default is verb-layer policy, not a store default.** `include_terminal` lives only on the verb arg structs and resolves at the `From` boundary; the store's `list_*` stay mechanism (honor the status set as received). This respects policy/mechanism separation and — critically — means `search_corpus`, which constructs store filters directly, keeps scanning all statuses, so D4 holds *by construction* rather than by remembering to pass a flag on every internal call. (Surfaced by @codex + @claude review of this spec.)
 
 ## Non-goals
 
@@ -110,7 +115,7 @@ Sequencing: touches the same list-verb arg/filter structs as #85's `bodies:false
 - **Explicit `status` honored**: `status: ["done"]` returns terminal rows even with `include_terminal` false (D2).
 - **`is_terminal()` units**: every enum variant maps to the table; `blocked`/`paused` are live.
 - **search**: terminal hits present by default; `include_terminal: false` scopes to live-only.
-- **Dogfood**: update `read_dogfood_corpus` to the live-default counts; add an assertion that `include_terminal: true` recovers the full counts (proves opt-out works against the real corpus).
+- **Dogfood**: update `read_dogfood_corpus` to the live-default count (exact `== 6`, not a weakened `> 0`); add an assertion that `include_terminal: true` recovers the full 58 — regression coverage in both directions.
 - **`make check` green** on the repo matrix.
 
 ## Acceptance
