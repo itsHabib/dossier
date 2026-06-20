@@ -27,25 +27,30 @@ folder of markdown.
 
 ## Samurai sword, not swiss army
 
-The discipline is to be excellent at one thing before adding the
-second. The one thing is: **track project docs and tasks for a solo
-developer, and let an LLM answer questions about them.** Everything
-that doesn't directly serve that gets cut or deferred.
+A samurai is defined by mastery, not by carrying one blade. The
+discipline here is the same: be **excellent** at what dossier does, and
+add the next capability when a real need shows up — in the right order,
+from evidence. The core today is sharp — *track project docs and tasks
+for a solo developer, and let an LLM answer questions about them* — and
+it earns the next thing rather than sprawling to chase every idea at
+once.
 
-### Explicitly NOT building (yet, possibly ever)
+That's a bias toward focus and sequencing, not a vow of staying small.
+The needs of the software change, and dossier changes with them; nothing
+is forbidden forever. When a workflow keeps hitting a wall, that's the
+signal to build — and we build it well.
 
-- **Conflict detection** (same-assignee multi-claim, stale-claim
-  warnings, slug-similarity heuristics). Enterprise problems.
-- **Multi-implementer concerns** (`request_id` idempotency, conformance
-  language, protocol-version negotiation). Single-actor today.
-- **Audit logs / `last_updated_by`**. Git history covers it.
-- **RAG / vector / semantic search inside dossier**. Literal substring
-  `search` ships; embedding indexes and semantic retrieval stay in the
-  LLM consumer, not the store.
-- **Web UI**. Markdown + grep + an MCP-aware agent is the UI.
-- **Cross-project relationship graphs / dependency tracking**. YAGNI.
+Some capabilities naturally live *outside* dossier because of how it
+**composes**, not because they're banned: semantic retrieval and
+natural-language understanding belong to the LLM that queries the corpus;
+history belongs to git, which already versions the markdown. Those are
+architectural lines about where a job is best done — drawn deliberately,
+revisited as the work demands.
 
-These are not bad ideas. They're the wrong target *now*.
+Concretely, the scope today is the four primitives — project, phase,
+task, artifact — over markdown, read and mutated through MCP by an LLM
+(the shipped surface in *What you have today*). Everything past that
+arrives when a real need does.
 
 ## What you have today
 

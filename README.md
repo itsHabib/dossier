@@ -17,8 +17,7 @@ for the handful of verbs worth scripting from a shell or a CI hook
 itself is the source of truth — plain markdown you can grep and edit by hand;
 the server re-reads it on every call.
 
-See [docs/vision.md](docs/vision.md) for the longer "what + why + what we're
-explicitly not building."
+See [docs/vision.md](docs/vision.md) for the longer "what + why."
 
 ## Quick start
 
@@ -255,19 +254,18 @@ PRs are scattered across GitHub. dossier consolidates the project-state
 plane in plain markdown that humans grep and LLMs query.
 
 The discipline is to be excellent at one thing — *track project docs and tasks
-for a solo developer, and let an LLM answer questions about them* — before
-adding a second. So a lot stays deliberately out of scope:
+for a solo developer, and let an LLM answer questions about them* — and to grow
+from there in the right order, as real needs show up. Some jobs compose better
+*outside* dossier than inside it:
 
-- **Semantic / vector / RAG search lives in the LLM consumer, not the store.**
-  dossier ships literal substring `search` and nothing fancier; embedding
-  indexes belong to whatever agent queries the corpus.
-- **Natural-language understanding lives in the LLM, not dossier.** The server
-  provides structured truth; the model is the conversational layer.
-- **History / audit lives in git.** No `last_updated_by`, no audit log — the
-  corpus is checked in, so `git log` already has it.
-- **No web UI, no conflict-detection engine, no cross-project dependency
-  graph, no multi-implementer protocol machinery.** Markdown + grep + an
-  MCP-aware agent is the interface; single-actor is the assumption for v0.
+- **Semantic / vector retrieval lives in the LLM consumer.** dossier ships fast
+  literal substring `search`; the embedding index belongs to whatever agent
+  queries the corpus.
+- **Natural-language understanding lives in the LLM.** The server provides
+  structured truth; the model is the conversational layer.
+- **History lives in git.** The corpus is checked-in markdown, so `git log`
+  already carries the audit trail.
 
-The full framing — and the running list of things we're *not* building — is in
-[docs/vision.md](docs/vision.md).
+Those are architectural lines about where a job is best done — not a list of
+things we refuse to build. dossier changes as the needs of the work change; the
+longer framing is in [docs/vision.md](docs/vision.md).
