@@ -9,7 +9,7 @@
 
 `project.get` is the natural call an agent makes to orient in a project — the documented first step of *"what's the state of `<project>`?"* It has stopped working at scale.
 
-In a real ship-on-ship driver session (2026-06-19), `project.get { slug: "ship" }` (the MCP client emits it as `project_get`) returned ~395,675 characters — 393,675 corpus bytes plus the JSON envelope (see Evidence; the doc reports bytes throughout) — exceeded the MCP tool-result token cap, and could not be consumed inline at all — the harness dumped it to a file and the agent had to `jq` it just to read the phase slugs. The single most natural orientation read is now unusable on a project that has been used for months.
+In a real ship-on-ship driver session (2026-06-19), `project.get { slug: "ship" }` (the MCP client emits it as `project_get`) returned ~395,675 characters — 393,675 corpus bytes plus the JSON envelope (see Evidence; the doc reports bytes throughout) — overran the MCP tool-result size cap, and could not be consumed inline at all — the harness dumped it to a file and the agent had to `jq` it just to read the phase slugs. The single most natural orientation read is now unusable on a project that has been used for months.
 
 Root cause: `project.get` always hydrates the **entire subtree in one unbounded blob** — project meta + every phase (full body) + every task (full body + notes) + every artifact. Fine when a project is young; the cost grows monotonically as a dogfooded project accumulates phases and tasks. `done` and `cancelled` work never leaves the read. This is the natural consequence of dossier *succeeding*: the more a project is used, the heavier its overview read becomes.
 
@@ -42,7 +42,7 @@ When an agent asks *"what's the state of ship?"* it needs:
 
 - Project identity + status (is this active? paused?).
 - The **shape**: which phases exist, in what order, what status each is in, who owns it, when it was last touched.
-- A sense of **where the work is**: how many tasks per phase, broken down by status — so it can see "phase 18 has 6 todo, everything else is done" and even pick the next claimable task without a second call.
+- A sense of **where the work is**: how many tasks per phase, broken down by status — so it can see "phase 18 has 6 todo, everything else is done" and know exactly where to drill down. (The counts point at the *phase*; the actual task rows come from a scoped `task.list { phase, status, bodies:false }` — overview carries counts, not task ids/titles.)
 - **Not** every phase's design-doc body. Not 94 terminal task bodies. You read *one* body once you've decided which one matters — and the drill-down reads (`phase.list`, `task.get`, `task.list { status }`) serve that, *provided they're bounded too* (they aren't today — see Move 2).
 
 So the orientation read is an **aggregation** (counts), not an **enumeration** (rows-with-bodies). That single observation selects the design below.
@@ -99,7 +99,7 @@ On ship this is ~25 phase rows + a handful of count maps — **a few KB, down fr
 
 - **Every status key is always present**, zero when none — no missing-key-vs-zero ambiguity. Task counts use `todo|claimed|in_progress|blocked|done|cancelled`; phase counts use `pending|active|done|skipped`. The two enum sets are named in the tool description so an agent doesn't conflate them.
 - **`total` is always present and authoritative** (= sum of the status buckets). An agent trusts it; it never re-derives.
-- **Full per-phase status granularity is deliberate, not noise.** Carrying `claimed`/`in_progress`/`blocked` per phase (not just open/done) lets an agent see *which* phase has claimable work and pick the next task straight from the overview, without a second `task.list`. The cost is integers; the payload stays a few KB.
+- **Full per-phase status granularity is deliberate, not noise.** Carrying `claimed`/`in_progress`/`blocked` per phase (not just open/done) lets an agent see *which* phase has claimable work and decide where to drill down — the counts route it to the right phase, then a scoped `task.list { phase, status, bodies:false }` returns the actual task rows (overview carries counts, not task ids/titles). The cost is integers; the payload stays a few KB.
 - **Partition is exhaustive and reconciles.** Invariant: `Σ phases[].task_counts.total + unphased.task_counts.total == totals.tasks_by_status.total`. A task counts toward a phase row iff its `phase` id equals that phase's id; toward `unphased` iff `phase` is empty *or* dangling (D6). A test injects an orphaned-phase-id task to prove the partition leaves nothing uncounted.
 
 #### Why a new verb, not a `bodies:false` flag on `project.get`
@@ -234,7 +234,7 @@ Be honest about the upgrade path, because a naïve version doesn't work: a `bodi
 
 ## Acceptance
 
-- `project.overview { slug: "ship" }` returns a payload that fits inline (target: low-KB, < 1% of the current 394 KB) and lets an agent read every phase slug + status + per-phase open-task counts + recency in one call.
+- `project.overview { slug: "ship" }` returns a payload that fits inline — a few KB, roughly two orders of magnitude under today's 394 KB — and lets an agent read every phase slug + status + per-phase open-task counts + recency in one call. (The dogfood byte-ceiling is set from the *measured* output once fields are final, not a fixed percentage: at 25 phases the schema floor alone is ~6 KB, above a naïve "< 1%" target — so the test asserts an absolute ceiling, e.g. ≤ 25 KB, not a ratio.)
 - The recommended orient → drill-down path is bounded end to end: `phase.list { bodies:false }` / `task.list { bodies:false }` return slug/title/status without bodies.
 - The onboarding surfaces are updated so agents actually reach for `project.overview` first: the verb's tool description, the dossier MCP server `instructions`, and the `CLAUDE.md` orientation recipe (this is an acceptance criterion, not an aside).
 - No existing verb changes default shape; no on-disk migration.
