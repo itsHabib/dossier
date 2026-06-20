@@ -173,21 +173,31 @@ This document is `v0` — pre-1.0. Tool names and field names may change
 between revisions. When dossier picks up an external consumer that
 needs version stability, this section grows; today it doesn't.
 
-## Out of scope (v0)
+## Not in v0
 
-Deliberately not built. See [docs/vision.md](docs/vision.md) for the
-"samurai sword, not swiss army" framing.
+What the v0 surface leaves out, and why. These are where the work sits
+today — not a list of things dossier refuses to build. The core earns
+the next capability when a real workflow keeps hitting the wall it
+solves; see [docs/vision.md](docs/vision.md) for the "samurai = mastery
++ sequencing" framing.
 
-- **Semantic query / vector / RAG inside dossier** — literal substring
-  `search` ships; embedding indexes and semantic retrieval stay in the
-  LLM consumer, not the store.
+Some jobs compose better *outside* dossier than inside it:
+
+- **Semantic query / vector / RAG** — literal substring `search` ships;
+  the embedding index and semantic retrieval belong to whatever LLM
+  queries the corpus, not the store.
+- **Decisions** as a first-class primitive — today a task or an
+  `artifact` of kind `doc` carries them.
+
+The rest are sequencing calls — not yet needed at solo scale, added when
+the evidence shows up:
+
 - **Conflict detection** (multi-claim, slug similarity, stale claims) —
-  enterprise problem; solo dev doesn't have it.
-- **Decisions** as a first-class primitive — use a task or an
-  artifact-of-kind=doc.
-- **Cross-project links / dependencies** — keep projects independent.
+  a multi-writer concern; a solo corpus doesn't hit it yet.
+- **Cross-project links / dependencies** — projects stay independent
+  until a workflow genuinely spans them.
 - **Permissions / multi-tenant auth** — solo today.
-- **Notifications / subscriptions / streaming** — poll.
-- **Rich attachments** — use artifacts pointing at external storage.
-- **Time tracking, estimates, sprints** — workflow conventions on top,
-  not primitives.
+- **Notifications / subscriptions / streaming** — poll for now.
+- **Rich attachments** — artifacts point at external storage instead.
+- **Time tracking, estimates, sprints** — workflow conventions on top of
+  the primitives, not primitives themselves.

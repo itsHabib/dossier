@@ -23,8 +23,9 @@ validation is enforced on every create path.
 
 `artifact.link` is the next chunk (~80 LOC). After that: a
 `dossier init` / `sync` CLI that scaffolds a fresh corpus from
-an existing repo. Conflict detection and other "enterprise" verbs are
-explicitly deferred — see [docs/vision.md](docs/vision.md).
+an existing repo. Conflict detection and other multi-writer verbs aren't here yet — they
+land when a real workflow needs them, in the right order (see
+[docs/vision.md](docs/vision.md)).
 
 <!-- BEGIN dev-workbench (managed by /dev-workbench skill — re-run to refresh; hand-edits inside this block will be overwritten) -->
 ## Dev workbench
@@ -207,7 +208,7 @@ direction, lift the shared concern into `domain`.
 
 ## Docs
 
-- [docs/vision.md](docs/vision.md) — what dossier is, why, what we're explicitly NOT building. Read first.
+- [docs/vision.md](docs/vision.md) — what dossier is, why, and how it sequences what to build next. Read first.
 - [PROTOCOL.md](PROTOCOL.md) — data model: primitives, verbs, task state machine.
 - [LAYOUT.md](LAYOUT.md) — on-disk corpus convention: directory tree, frontmatter shape, append-only `artifacts.jsonl`, concurrency assumptions.
 - [docs/features/&lt;feature&gt;/spec.md](docs/features/) — design spec per feature (problem, scope, decisions, acceptance).
@@ -398,8 +399,12 @@ machine, single schema you can't ship half of, etc.).
   state machine" → stop. The state machine is the protocol. Add an
   enforcement test if you can't see why.
 - "I want to add a feature that pulls dossier toward generic doc
-  storage / Notion / RAG" → stop. dossier is opinionated PM. Generic doc
-  store is explicitly out of scope; see PROTOCOL.md "Out of scope (v0)".
+  storage / Notion / RAG" → pause and check the fit. dossier is
+  opinionated project memory; a generic doc store is a different shape,
+  and semantic retrieval composes better in the LLM that queries the
+  corpus (see PROTOCOL.md "Not in v0"). If a real workflow keeps needing
+  it here, that's the signal to design it in — deliberately, not by
+  default.
 - "Tests pass on Linux, fail on Windows" → most likely a path
   separator (`/` vs `\`) or line-ending (CRLF) assumption. Use
   `Path::join` and `lines()` rather than splitting on `\n`.
