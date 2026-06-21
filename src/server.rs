@@ -106,6 +106,11 @@ pub struct ProjectListArgs {
     /// An empty list is treated as no filter — omit the field instead.
     #[serde(default)]
     pub status: Option<Vec<ProjectStatus>>,
+    /// when `status` is omitted, default to live (non-terminal) projects only.
+    /// Set `true` to include terminal (`done`, `abandoned`) rows; ignored when
+    /// an explicit `status` is given (explicit always wins).
+    #[serde(default)]
+    pub include_terminal: Option<bool>,
     /// case-insensitive literal substring matched against the project's
     /// description body
     #[serde(default)]
@@ -145,6 +150,11 @@ pub struct PhaseListArgs {
     /// An empty list is treated as no filter — omit the field instead.
     #[serde(default)]
     pub status: Option<Vec<PhaseStatus>>,
+    /// when `status` is omitted, default to live (non-terminal) phases only.
+    /// Set `true` to include terminal (`done`, `skipped`) rows; ignored when
+    /// an explicit `status` is given (explicit always wins).
+    #[serde(default)]
+    pub include_terminal: Option<bool>,
     /// case-insensitive literal substring matched against the phase body
     #[serde(default)]
     pub body_contains: Option<String>,
@@ -200,6 +210,11 @@ pub struct TaskListArgs {
     /// An empty list is treated as no filter — omit the field instead.
     #[serde(default)]
     pub status: Option<Vec<TaskStatus>>,
+    /// when `status` is omitted, default to live (non-terminal) tasks only.
+    /// Set `true` to include terminal (`done`, `cancelled`) rows; ignored when
+    /// an explicit `status` is given (explicit always wins).
+    #[serde(default)]
+    pub include_terminal: Option<bool>,
     /// exact match against the task's `assignee` frontmatter field
     #[serde(default)]
     pub assignee: Option<String>,
@@ -264,10 +279,31 @@ pub struct SearchResult {
     pub hits: Vec<SearchHit>,
 }
 
+/// Resolve a list verb's `status` filter under the live-by-default policy.
+///
+/// Explicit `status` always wins verbatim (D2) — including `Some(vec![])`,
+/// which the store matcher treats as "no filter" => returns ALL rows incl.
+/// terminal. That empty-list passthrough is intentional, not a bug. Only when
+/// `status` is omitted does `include_terminal` govern the default: `true`
+/// leaves it `None` (all statuses), anything else injects the live set.
+fn resolve_status<S>(
+    status: Option<Vec<S>>,
+    include_terminal: Option<bool>,
+    live: impl FnOnce() -> Vec<S>,
+) -> Option<Vec<S>> {
+    if let Some(explicit) = status {
+        return Some(explicit);
+    }
+    if include_terminal == Some(true) {
+        return None;
+    }
+    Some(live())
+}
+
 impl From<ProjectListArgs> for ProjectListFilter {
     fn from(a: ProjectListArgs) -> Self {
         Self {
-            status: a.status,
+            status: resolve_status(a.status, a.include_terminal, ProjectStatus::live_statuses),
             body_contains: a.body_contains,
             created_after: a.created_after,
             created_before: a.created_before,
@@ -284,7 +320,7 @@ impl From<PhaseListArgs> for PhaseListFilter {
     fn from(a: PhaseListArgs) -> Self {
         Self {
             project: a.project,
-            status: a.status,
+            status: resolve_status(a.status, a.include_terminal, PhaseStatus::live_statuses),
             body_contains: a.body_contains,
             created_after: a.created_after,
             created_before: a.created_before,
@@ -302,7 +338,7 @@ impl From<TaskListArgs> for TaskListFilter {
         Self {
             project: a.project,
             phase: a.phase,
-            status: a.status,
+            status: resolve_status(a.status, a.include_terminal, TaskStatus::live_statuses),
             assignee: a.assignee,
             body_contains: a.body_contains,
             created_after: a.created_after,
@@ -529,6 +565,11 @@ impl MeshService {
         let want_project = kinds.contains(&SearchKind::Project);
         let want_phase = kinds.contains(&SearchKind::Phase);
         let want_task = kinds.contains(&SearchKind::Task);
+        // Search defaults to all statuses (finding completed work is core,
+        // D4); `include_terminal: false` scopes the walk to live items. This
+        // is applied here during the scan — never through the list-verb `From`
+        // conversion — so the all-statuses store reads below are unaffected.
+        let include_terminal = args.include_terminal.unwrap_or(true);
 
         let project_slugs: Vec<String> = match &args.project {
             Some(s) if s.is_empty() => {
@@ -558,7 +599,8 @@ impl MeshService {
                 let p = p.value;
                 let hay = format!("{}\n{}", p.title, p.description);
                 let score = count_ci_overlapping(&hay, needle);
-                if score > 0 {
+                let live_kept = include_terminal || !p.status.is_terminal();
+                if score > 0 && live_kept {
                     ranked.push((
                         SearchHit {
                             kind: SearchKind::Project,
@@ -596,6 +638,9 @@ impl MeshService {
 
             if want_phase {
                 for ph in &phase_list {
+                    if !include_terminal && ph.status.is_terminal() {
+                        continue;
+                    }
                     let hay = format!("{}\n{}", ph.title, ph.body);
                     let score = count_ci_overlapping(&hay, needle);
                     if score > 0 {
@@ -629,6 +674,9 @@ impl MeshService {
                     .map(|v| v.value)
                     .collect::<Vec<_>>();
                 for t in tasks {
+                    if !include_terminal && t.status.is_terminal() {
+                        continue;
+                    }
                     let hay = format!("{}\n{}", t.title, t.body);
                     let score = count_ci_overlapping(&hay, needle);
                     if score > 0 {
@@ -794,7 +842,7 @@ fn build_overview(
 impl MeshService {
     #[tool(
         name = "project.list",
-        description = "List projects subject to a predicate filter. Every argument is optional; an empty arg set returns every project in the corpus, sorted by `created_at` ASC. Filters AND-together.\n\nFilters: `status` is a list of statuses (`planning` | `active` | `paused` | `done` | `abandoned`) — OR-of-statuses. `body_contains` is a case-insensitive literal substring against the project's description body. `created_after` / `created_before` and `updated_after` / `updated_before` are RFC 3339 timestamps; `_after` is inclusive (>=), `_before` is exclusive (<). Malformed timestamps are rejected.\n\nOrdering: `order_by` is `created_at` | `updated_at` (default `created_at`); `desc: true` reverses (default ascending). `limit` caps the rows.\n\nReturns metadata only — call `project.get` for the full description body (corpus-wide; for one project's state, use project.overview)."
+        description = "List projects subject to a predicate filter. Filters AND-together.\n\nLIVE BY DEFAULT: with no `status` filter, returns only live (non-terminal) projects — `done` and `abandoned` are hidden. Pass `include_terminal: true` to get every status (the old default), or an explicit `status` (incl. terminal values like `done`) which always wins verbatim and ignores `include_terminal`. Default sort is `created_at` ASC.\n\nFilters: `status` is a list of statuses (`planning` | `active` | `paused` | `done` | `abandoned`) — OR-of-statuses. `body_contains` is a case-insensitive literal substring against the project's description body. `created_after` / `created_before` and `updated_after` / `updated_before` are RFC 3339 timestamps; `_after` is inclusive (>=), `_before` is exclusive (<). Malformed timestamps are rejected.\n\nOrdering: `order_by` is `created_at` | `updated_at` (default `created_at`); `desc: true` reverses (default ascending). `limit` caps the rows.\n\nReturns metadata only — call `project.get` for the full description body (corpus-wide; for one project's state, use project.overview)."
     )]
     async fn project_list(
         &self,
@@ -1148,7 +1196,7 @@ impl MeshService {
 
     #[tool(
         name = "phase.list",
-        description = "List phases subject to a predicate filter. Phase bodies are included.\n\nCross-project: `project` is optional — omit it (or pass `null`) to scan every project in the corpus. A cross-project listing groups by project, then by `order` within each project, so the linear-position ordering stays meaningful.\n\nFilters: `status` is a list (`pending` | `active` | `done` | `skipped`) — OR-of-statuses. `body_contains` is a case-insensitive literal substring against the phase body. `created_after` / `created_before` and `updated_after` / `updated_before` are RFC 3339 timestamps; `_after` is inclusive (>=), `_before` is exclusive (<). Malformed timestamps are rejected.\n\nOrdering: `order_by` is `created_at` | `updated_at` | `order` (default `order` — the linear-position frontmatter field). `desc: true` reverses (default ascending). `limit` caps the rows. Filters AND-together. Pass bodies:false to strip the phase body markdown; all frontmatter (id, slug, title, status, order, owner, timestamps) is still returned."
+        description = "List phases subject to a predicate filter. Phase bodies are included.\n\nLIVE BY DEFAULT: with no `status` filter, returns only live (non-terminal) phases — `done` and `skipped` are hidden. Pass `include_terminal: true` to get every status (the old default), or an explicit `status` (incl. terminal values) which always wins verbatim and ignores `include_terminal`.\n\nCross-project: `project` is optional — omit it (or pass `null`) to scan every project in the corpus. A cross-project listing groups by project, then by `order` within each project, so the linear-position ordering stays meaningful.\n\nFilters: `status` is a list (`pending` | `active` | `done` | `skipped`) — OR-of-statuses. `body_contains` is a case-insensitive literal substring against the phase body. `created_after` / `created_before` and `updated_after` / `updated_before` are RFC 3339 timestamps; `_after` is inclusive (>=), `_before` is exclusive (<). Malformed timestamps are rejected.\n\nOrdering: `order_by` is `created_at` | `updated_at` | `order` (default `order` — the linear-position frontmatter field). `desc: true` reverses (default ascending). `limit` caps the rows. Filters AND-together. Pass bodies:false to strip the phase body markdown; all frontmatter (id, slug, title, status, order, owner, timestamps) is still returned."
     )]
     async fn phase_list(
         &self,
@@ -1174,7 +1222,7 @@ impl MeshService {
 
     #[tool(
         name = "task.list",
-        description = "List tasks subject to a predicate filter. Every argument is optional; an empty arg set returns every task in the corpus, sorted by `created_at` ASC. Filters AND-together.\n\nCross-project: `project` is optional — omit it (or pass `null`) to scan every project in the corpus. `phase` is a phase slug and REQUIRES `project` (validation error otherwise — phase slugs are unique per project, not globally).\n\nFilters: `status` is a list (`todo` | `claimed` | `in_progress` | `blocked` | `done` | `cancelled`) — OR-of-statuses. `assignee` is an exact match against the task's `assignee` frontmatter (e.g. `human:michael`, `ship`). `body_contains` is a case-insensitive literal substring against the task body. The four date-range pairs — `created`, `updated`, `completed`, `claimed` — each take `_after` (inclusive, >=) and `_before` (exclusive, <) RFC 3339 timestamps. Filtering on `completed_*` or `claimed_*` drops rows where that timestamp is null. Malformed timestamps are rejected.\n\nOrdering: `order_by` is `created_at` | `updated_at` | `completed_at` | `claimed_at` (default `created_at`); sorting by a nullable field (`completed_at`, `claimed_at`) drops rows where that field is null. `desc: true` reverses (default ascending). `limit` caps the rows. Pass bodies:false to omit task bodies + notes (frontmatter only) — use it when drilling down from project.overview."
+        description = "List tasks subject to a predicate filter. Filters AND-together.\n\nLIVE BY DEFAULT: with no `status` filter, returns only live (non-terminal) tasks — `done` and `cancelled` are hidden. Pass `include_terminal: true` to get every status (the old default), or an explicit `status` (incl. terminal values like `done`) which always wins verbatim and ignores `include_terminal`. Default sort is `created_at` ASC.\n\nCross-project: `project` is optional — omit it (or pass `null`) to scan every project in the corpus. `phase` is a phase slug and REQUIRES `project` (validation error otherwise — phase slugs are unique per project, not globally).\n\nFilters: `status` is a list (`todo` | `claimed` | `in_progress` | `blocked` | `done` | `cancelled`) — OR-of-statuses. `assignee` is an exact match against the task's `assignee` frontmatter (e.g. `human:michael`, `ship`). `body_contains` is a case-insensitive literal substring against the task body. The four date-range pairs — `created`, `updated`, `completed`, `claimed` — each take `_after` (inclusive, >=) and `_before` (exclusive, <) RFC 3339 timestamps. Filtering on `completed_*` or `claimed_*` drops rows where that timestamp is null. Malformed timestamps are rejected.\n\nOrdering: `order_by` is `created_at` | `updated_at` | `completed_at` | `claimed_at` (default `created_at`); sorting by a nullable field (`completed_at`, `claimed_at`) drops rows where that field is null. `desc: true` reverses (default ascending). `limit` caps the rows. Pass bodies:false to omit task bodies + notes (frontmatter only) — use it when drilling down from project.overview."
     )]
     async fn task_list(
         &self,
@@ -1230,7 +1278,7 @@ impl MeshService {
 
     #[tool(
         name = "search",
-        description = "Unified case-insensitive literal substring search across project titles + description bodies, phase titles + bodies, and task titles + spec bodies (not notes, assignee, or other frontmatter). One call returns a single ranked list so the model can pick rows to open — use this instead of three `body_contains` list round-trips when you don't already know the primitive kind. Each hit includes `score` overlapping literal match count in title+newline+body (higher is stronger), `snippet` (~80 characters centered on the first match, no markdown awareness), and rows are ordered by `score` descending then `updated_at` descending; `limit` (default 50) applies after sorting. `kinds` filters to one or more of `project` | `phase` | `task` (default: all). `project` restricts to one project slug; omit or null for the whole corpus. Empty `query` is rejected; no matches returns an empty list. Prefer list verbs with `body_contains` when you already know you're only looking for tasks (or phases, projects)."
+        description = "Unified case-insensitive literal substring search across project titles + description bodies, phase titles + bodies, and task titles + spec bodies (not notes, assignee, or other frontmatter). One call returns a single ranked list so the model can pick rows to open — use this instead of three `body_contains` list round-trips when you don't already know the primitive kind. Each hit includes `score` overlapping literal match count in title+newline+body (higher is stronger), `snippet` (~80 characters centered on the first match, no markdown awareness), and rows are ordered by `score` descending then `updated_at` descending; `limit` (default 50) applies after sorting. `kinds` filters to one or more of `project` | `phase` | `task` (default: all). `project` restricts to one project slug; omit or null for the whole corpus. Unlike the list verbs, search INCLUDES terminal (`done` / `cancelled` / `skipped` / `abandoned`) items BY DEFAULT — finding completed work is a core use; pass `include_terminal: false` to scope to live items only. Empty `query` is rejected; no matches returns an empty list. Prefer list verbs with `body_contains` when you already know you're only looking for tasks (or phases, projects)."
     )]
     async fn search(
         &self,
@@ -2807,6 +2855,7 @@ mod tests {
                 query: "needle".to_owned(),
                 project: Some("alpha".to_owned()),
                 kinds: Some(vec![SearchKind::Task]),
+                include_terminal: None,
                 limit: Some(2),
             },
         );
@@ -3575,6 +3624,7 @@ mod tests {
 
         let f = ProjectListFilter::from(ProjectListArgs {
             status: Some(vec![ProjectStatus::Active]),
+            include_terminal: None,
             body_contains: Some("needle".to_owned()),
             created_after: Some(created_after),
             created_before: Some(created_before),
@@ -3614,6 +3664,7 @@ mod tests {
         let f = PhaseListFilter::from(PhaseListArgs {
             project: Some("omega".to_owned()),
             status: Some(vec![PhaseStatus::Skipped]),
+            include_terminal: None,
             body_contains: Some("phase-body".to_owned()),
             created_after: Some(created_after),
             created_before: Some(created_before),
@@ -3668,6 +3719,7 @@ mod tests {
             project: Some("rho".to_owned()),
             phase: Some("implement".to_owned()),
             status: Some(vec![TaskStatus::Todo, TaskStatus::Blocked]),
+            include_terminal: None,
             assignee: Some("ship".to_owned()),
             body_contains: Some("fixture".to_owned()),
             created_after: Some(created_after),
@@ -4131,5 +4183,283 @@ mod tests {
         }))
         .expect_err("invalid project slug must reject");
         assert_rejects_invalid_project_slug(err, INVALID_PROJECT_SLUG);
+    }
+
+    // --- default-live reads (include_terminal policy at the verb layer) ---
+
+    fn tasks_listed(svc: &MeshService, args: TaskListArgs) -> Vec<Task> {
+        let Json(result) = block_on(svc.task_list(Parameters(args))).expect("task.list");
+        result.tasks
+    }
+
+    fn phases_listed(svc: &MeshService, args: PhaseListArgs) -> Vec<Phase> {
+        let Json(result) = block_on(svc.phase_list(Parameters(args))).expect("phase.list");
+        result.phases
+    }
+
+    fn projects_listed(svc: &MeshService, args: ProjectListArgs) -> Vec<Project> {
+        let Json(result) = block_on(svc.project_list(Parameters(args))).expect("project.list");
+        result.projects
+    }
+
+    fn cancel_task(svc: &MeshService, id: &str) {
+        block_on(svc.task_update(Parameters(TaskUpdateArgs {
+            id: id.to_owned(),
+            body: None,
+            status: Some(TaskStatus::Cancelled),
+            note: None,
+            depends_on: None,
+            actor: "human:test".to_owned(),
+        })))
+        .expect("cancel task");
+    }
+
+    fn complete_task(svc: &MeshService, id: &str) {
+        block_on(svc.task_complete(Parameters(TaskCompleteArgs {
+            id: id.to_owned(),
+            note: None,
+            actor: "human:test".to_owned(),
+        })))
+        .expect("complete task");
+    }
+
+    /// One live (`todo`) + one terminal (`cancelled`) task in a project.
+    fn seed_live_and_terminal_tasks(svc: &MeshService) {
+        seed_project(svc, "alpha");
+        seed_task(svc, "alpha", "live-task");
+        let term = seed_task(svc, "alpha", "terminal-task");
+        cancel_task(svc, &term.id);
+    }
+
+    #[test]
+    fn task_list_defaults_to_live_only() {
+        let (_tmp, svc) = fresh_service();
+        seed_live_and_terminal_tasks(&svc);
+
+        let tasks = tasks_listed(&svc, TaskListArgs::default());
+        assert_eq!(tasks.len(), 1, "default task.list must drop terminal rows");
+        assert_eq!(tasks[0].slug, "live-task");
+        assert!(tasks.iter().all(|t| !t.status.is_terminal()));
+    }
+
+    #[test]
+    fn task_list_include_terminal_restores_all() {
+        let (_tmp, svc) = fresh_service();
+        seed_live_and_terminal_tasks(&svc);
+
+        let tasks = tasks_listed(
+            &svc,
+            TaskListArgs {
+                include_terminal: Some(true),
+                ..Default::default()
+            },
+        );
+        assert_eq!(tasks.len(), 2, "include_terminal:true returns every status");
+        assert!(tasks.iter().any(|t| t.status.is_terminal()));
+    }
+
+    #[test]
+    fn task_list_explicit_status_wins_over_default_live() {
+        let (_tmp, svc) = fresh_service();
+        seed_live_and_terminal_tasks(&svc);
+
+        // Explicit terminal status returns terminal rows even though
+        // include_terminal is omitted (D2 — explicit always wins).
+        let tasks = tasks_listed(
+            &svc,
+            TaskListArgs {
+                status: Some(vec![TaskStatus::Cancelled]),
+                ..Default::default()
+            },
+        );
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].status, TaskStatus::Cancelled);
+    }
+
+    #[test]
+    fn task_list_empty_status_returns_all_including_terminal() {
+        let (_tmp, svc) = fresh_service();
+        seed_live_and_terminal_tasks(&svc);
+
+        // `status: []` is an explicit empty filter; the store matcher treats
+        // it as "no filter" => all rows incl. terminal. Intentional (D2).
+        let tasks = tasks_listed(
+            &svc,
+            TaskListArgs {
+                status: Some(Vec::new()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(tasks.len(), 2);
+    }
+
+    #[test]
+    fn phase_list_defaults_to_live_only() {
+        let (_tmp, svc) = fresh_service();
+        seed_project(&svc, "alpha");
+        add_phase_simple(&svc, "alpha", "live-phase");
+        add_phase_simple(&svc, "alpha", "terminal-phase");
+        block_on(svc.phase_update(Parameters(PhaseUpdateArgs {
+            project: "alpha".to_owned(),
+            slug: "terminal-phase".to_owned(),
+            title: None,
+            body: None,
+            status: Some(PhaseStatus::Done),
+            owner: None,
+        })))
+        .expect("mark phase done");
+
+        let live = phases_listed(
+            &svc,
+            PhaseListArgs {
+                project: Some("alpha".to_owned()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(live.len(), 1, "default phase.list drops terminal phases");
+        assert_eq!(live[0].slug, "live-phase");
+
+        let all = phases_listed(
+            &svc,
+            PhaseListArgs {
+                project: Some("alpha".to_owned()),
+                include_terminal: Some(true),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            all.len(),
+            2,
+            "include_terminal:true returns terminal phases"
+        );
+    }
+
+    #[test]
+    fn project_list_defaults_to_live_only() {
+        let (_tmp, svc) = fresh_service();
+        seed_project(&svc, "live-proj");
+        seed_project(&svc, "done-proj");
+        block_on(svc.project_update(Parameters(ProjectUpdateArgs {
+            slug: "done-proj".to_owned(),
+            actor: None,
+            title: None,
+            description: None,
+            status: Some(ProjectStatus::Done),
+        })))
+        .expect("mark project done");
+
+        let live = projects_listed(&svc, ProjectListArgs::default());
+        assert_eq!(
+            live.len(),
+            1,
+            "default project.list drops terminal projects"
+        );
+        assert_eq!(live[0].slug, "live-proj");
+
+        let all = projects_listed(
+            &svc,
+            ProjectListArgs {
+                include_terminal: Some(true),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            all.len(),
+            2,
+            "include_terminal:true returns terminal projects"
+        );
+    }
+
+    #[test]
+    fn search_includes_terminal_by_default_and_scopes_with_flag() {
+        let (_tmp, svc) = fresh_service();
+        seed_project(&svc, "alpha");
+        let live = seed_task(&svc, "alpha", "live-needle");
+        let term = seed_task(&svc, "alpha", "terminal-needle");
+        // Distinct bodies so the same query matches both.
+        block_on(svc.task_update(Parameters(TaskUpdateArgs {
+            id: live.id,
+            body: Some("magicword lives".to_owned()),
+            status: None,
+            note: None,
+            depends_on: None,
+            actor: "human:test".to_owned(),
+        })))
+        .expect("body live");
+        block_on(svc.task_update(Parameters(TaskUpdateArgs {
+            id: term.id.clone(),
+            body: Some("magicword done".to_owned()),
+            status: None,
+            note: None,
+            depends_on: None,
+            actor: "human:test".to_owned(),
+        })))
+        .expect("body term");
+        complete_task(&svc, &term.id);
+
+        let default_hits = search_hits(
+            &svc,
+            SearchArgs {
+                query: "magicword".to_owned(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            default_hits.len(),
+            2,
+            "search includes terminal hits by default (D4)"
+        );
+
+        let live_only = search_hits(
+            &svc,
+            SearchArgs {
+                query: "magicword".to_owned(),
+                include_terminal: Some(false),
+                ..Default::default()
+            },
+        );
+        assert_eq!(live_only.len(), 1, "include_terminal:false scopes to live");
+        assert_eq!(live_only[0].slug, "live-needle");
+    }
+
+    // --- verb-level dogfood against the in-repo fixture (regression both ways) ---
+
+    fn dogfood_service() -> MeshService {
+        MeshService::new(seed_store(&repo_root()))
+    }
+
+    #[test]
+    fn dogfood_task_list_live_count_and_full_count() {
+        let svc = dogfood_service();
+
+        // The committed fixture's tasks are all terminal (`done`), so the
+        // live-by-default surface is empty and include_terminal recovers the
+        // full set — exact counts, regression in both directions.
+        let live = tasks_listed(
+            &svc,
+            TaskListArgs {
+                project: Some("dossier".to_owned()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            live.len(),
+            0,
+            "default task.list returns only live fixture tasks"
+        );
+
+        let all = tasks_listed(
+            &svc,
+            TaskListArgs {
+                project: Some("dossier".to_owned()),
+                include_terminal: Some(true),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            all.len(),
+            3,
+            "include_terminal:true recovers every fixture task"
+        );
     }
 }

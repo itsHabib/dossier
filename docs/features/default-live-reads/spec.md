@@ -67,7 +67,7 @@ Complementary, not overlapping — together they complete "reads work well at sc
 - **Changes the no-status default of the three list verbs** (all → live). Opt-out is one field: `include_terminal: true`, or an explicit `status` (incl. terminal values). dossier is pre-1.0 (PROTOCOL.md §Versioning); the corpus is unchanged on disk; this is the intended fix, not an accident.
 - **Tool descriptions must state the new default loudly** — it's behavioral for LLM agents (they need to know `task.list` is live-by-default and how to see terminal). Same "description is behavioral for agents" point as #85's `project.get` steering.
 - **`project.get` / `project.overview` unchanged** — `get` is the full hydrate; `overview` counts all statuses.
-- **Dogfood tests change.** `read_dogfood_corpus` and any test asserting raw `list_*` counts must update (e.g. `task.list { project: "dossier" }` returns 6 live, not 58). That's the visible proof the change works; the assertions move with it.
+- **Dogfood tests change at the *verb* level only.** The store-level `read_dogfood_corpus` is **unchanged** — the store has no live-default (D6). A new verb-level test pins the live-default against the committed in-repo fixture, whose tasks are all `done`: `task.list { project: "dossier" }` returns **0** live; `include_terminal: true` returns all **3**. (A mixed real corpus shows a wider gap — e.g. 6 live of 58 — but the fixture is the committed test surface.)
 
 ## Layering & where the code lives
 
@@ -115,7 +115,7 @@ Single PR, "amazing" band.
 - **Explicit `status` honored**: `status: ["done"]` returns terminal rows even with `include_terminal` false (D2).
 - **`is_terminal()` units**: every enum variant maps to the table; `blocked`/`paused` are live.
 - **search**: terminal hits present by default; `include_terminal: false` scopes to live-only.
-- **Dogfood**: `read_dogfood_corpus` (a *store*-level test) is **unchanged** — the store has no live-default. Add a *verb*-level test instead: the `task.list` handler against the in-repo fixture returns the live count (exact `== 6`, not a weak `> 0`), and `include_terminal: true` recovers the full `== 58` — regression coverage in both directions.
+- **Dogfood**: `read_dogfood_corpus` (a *store*-level test) is **unchanged** — the store has no live-default. Add a *verb*-level test instead: the `task.list` handler against the in-repo fixture (all 3 tasks are `done`) returns the live count (exact `== 0`, not a weak `> 0`), and `include_terminal: true` recovers all `== 3` — regression coverage in both directions. (Small because the fixture is all-terminal; a mixed real corpus shows a wider live/total gap.)
 - **`make check` green** on the repo matrix.
 
 ## Acceptance
