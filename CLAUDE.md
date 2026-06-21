@@ -40,7 +40,7 @@ Long-term home for what's planned, in-flight, and shipped across the portfolio. 
 
 **Use proactively for:**
 
-- *"What's the state of `<project>`?"* → `mcp__dossier__project_get { slug }`, then `mcp__dossier__phase_list` + `mcp__dossier__task_list { project, status: ["in_progress"] }`.
+- *"What's the state of `<project>`?"* → `mcp__dossier__project_overview { slug }` FIRST (bounded: phase index + per-phase task-status counts + rollups, no bodies), then drill down with `mcp__dossier__phase_list { project, bodies: false }` / `mcp__dossier__task_list { project, status: ["in_progress"], bodies: false }` / `mcp__dossier__task_get { id }`. Reach for `mcp__dossier__project_get` only when you truly need every body inline (heavy on mature projects — can exceed the result size cap).
 - *"I'm starting `<new chunk of work>`."* → `mcp__dossier__phase_add { project, slug, title, body }`.
 - *"I need to do X"* / discrete actionable surface → `mcp__dossier__task_create { project, phase?, slug, title, body }` (status defaults to `todo`).
 - User picks up a task → `mcp__dossier__task_claim { id, actor: "human:michael" }`. Re-claim by same actor is a no-op.

@@ -20,10 +20,12 @@ use ulid::Ulid;
 
 use crate::domain::{
     append_task_note, apply_claim_task, apply_task_body_update, apply_task_complete,
-    apply_task_status_update, compute_new_phase_order, is_valid_slug, new_id, validate_single_line,
-    validate_task_body, Artifact, Phase, PhaseListFilter, PhaseOrderField, PhaseStatus, Project,
-    ProjectListFilter, ProjectOrderField, ProjectStatus, SearchArgs, SearchHit, SearchKind, Task,
-    TaskGetArgs, TaskListFilter, TaskOrderField, TaskStatus,
+    apply_task_status_update, compute_new_phase_order, is_valid_slug, new_id, truncate_description,
+    validate_single_line, validate_task_body, Artifact, OverviewTotals, Phase, PhaseListFilter,
+    PhaseOrderField, PhaseOverview, PhaseStatus, PhaseStatusCounts, Project, ProjectListFilter,
+    ProjectOrderField, ProjectOverview, ProjectOverviewMeta, ProjectStatus, SearchArgs, SearchHit,
+    SearchKind, Task, TaskGetArgs, TaskListFilter, TaskOrderField, TaskStatus, TaskStatusCounts,
+    UnphasedOverview,
 };
 use crate::store::{
     now_utc, ArtifactListFilter, ClaimTask, CompleteTask, FsStore, LinkArtifact, NewPhase,
@@ -73,6 +75,13 @@ pub struct ProjectListResult {
 /// Arguments for `project.get`.
 #[derive(Deserialize, JsonSchema)]
 pub struct ProjectGetArgs {
+    /// project slug, e.g. "dossier"
+    pub slug: String,
+}
+
+/// Arguments for `project.overview`.
+#[derive(Deserialize, JsonSchema)]
+pub struct ProjectOverviewArgs {
     /// project slug, e.g. "dossier"
     pub slug: String,
 }
@@ -161,6 +170,10 @@ pub struct PhaseListArgs {
     /// cap the number of returned rows
     #[serde(default)]
     pub limit: Option<usize>,
+    /// include phase bodies (default `true`); pass `false` to strip just the
+    /// body markdown (all frontmatter is still returned) for a bounded read
+    #[serde(default)]
+    pub bodies: Option<bool>,
 }
 
 /// Response envelope for `phase.list`.
@@ -233,6 +246,10 @@ pub struct TaskListArgs {
     /// cap the number of returned rows
     #[serde(default)]
     pub limit: Option<usize>,
+    /// include task bodies + notes (default `true`); pass `false` to omit
+    /// them (frontmatter only) for a bounded drill-down read from project.overview
+    #[serde(default)]
+    pub bodies: Option<bool>,
 }
 
 /// Response envelope for `task.list`.
@@ -701,11 +718,83 @@ fn search_snippet(haystack: &str, needle: &str, width: usize) -> String {
     chars.into_iter().skip(lo).take(hi - lo).collect()
 }
 
+/// Aggregate a project's phases, tasks, and artifact count into a bounded
+/// [`ProjectOverview`]. Pure policy over already-loaded rows: partitions
+/// tasks across phase rows (joined by `task.phase == phase.id`) and an
+/// `unphased` bucket (empty or dangling phase id), tallies per-status
+/// counts, and bounds the description. No bodies or notes are read.
+fn build_overview(
+    project: &Project,
+    phases: Vec<Phase>,
+    tasks: &[Task],
+    artifact_count: usize,
+) -> ProjectOverview {
+    let (description, description_truncated) = truncate_description(&project.description);
+
+    let mut phase_counts: std::collections::HashMap<String, TaskStatusCounts> =
+        std::collections::HashMap::with_capacity(phases.len());
+    for ph in &phases {
+        phase_counts.insert(ph.id.clone(), TaskStatusCounts::default());
+    }
+
+    let mut unphased = TaskStatusCounts::default();
+    let mut tasks_by_status = TaskStatusCounts::default();
+    for t in tasks {
+        tasks_by_status.add(t.status);
+        match phase_counts.get_mut(&t.phase) {
+            Some(counts) => counts.add(t.status),
+            None => unphased.add(t.status),
+        }
+    }
+
+    let mut phases_by_status = PhaseStatusCounts::default();
+    let mut phase_rows: Vec<PhaseOverview> = Vec::with_capacity(phases.len());
+    for ph in phases {
+        phases_by_status.add(ph.status);
+        let task_counts = phase_counts.get(&ph.id).copied().unwrap_or_default();
+        phase_rows.push(PhaseOverview {
+            id: ph.id,
+            slug: ph.slug,
+            title: ph.title,
+            order: ph.order,
+            status: ph.status,
+            owner: ph.owner,
+            updated_at: ph.updated_at,
+            task_counts,
+        });
+    }
+    phase_rows.sort_by(|a, b| a.order.cmp(&b.order).then_with(|| a.id.cmp(&b.id)));
+
+    ProjectOverview {
+        project: ProjectOverviewMeta {
+            id: project.id.clone(),
+            slug: project.slug.clone(),
+            title: project.title.clone(),
+            status: project.status,
+            created_at: project.created_at,
+            updated_at: project.updated_at,
+            created_by: project.created_by.clone(),
+            description,
+            description_truncated,
+        },
+        phases: phase_rows,
+        unphased: UnphasedOverview {
+            task_counts: unphased,
+        },
+        totals: OverviewTotals {
+            phases_by_status,
+            tasks_by_status,
+            #[allow(clippy::cast_possible_truncation)] // corpus artifact counts are far below u32::MAX
+            artifact_count: artifact_count as u32,
+        },
+    }
+}
+
 #[tool_router(server_handler)]
 impl MeshService {
     #[tool(
         name = "project.list",
-        description = "List projects subject to a predicate filter. Every argument is optional; an empty arg set returns every project in the corpus, sorted by `created_at` ASC. Filters AND-together.\n\nFilters: `status` is a list of statuses (`planning` | `active` | `paused` | `done` | `abandoned`) — OR-of-statuses. `body_contains` is a case-insensitive literal substring against the project's description body. `created_after` / `created_before` and `updated_after` / `updated_before` are RFC 3339 timestamps; `_after` is inclusive (>=), `_before` is exclusive (<). Malformed timestamps are rejected.\n\nOrdering: `order_by` is `created_at` | `updated_at` (default `created_at`); `desc: true` reverses (default ascending). `limit` caps the rows.\n\nReturns metadata only — call `project.get` for the full description body."
+        description = "List projects subject to a predicate filter. Every argument is optional; an empty arg set returns every project in the corpus, sorted by `created_at` ASC. Filters AND-together.\n\nFilters: `status` is a list of statuses (`planning` | `active` | `paused` | `done` | `abandoned`) — OR-of-statuses. `body_contains` is a case-insensitive literal substring against the project's description body. `created_after` / `created_before` and `updated_after` / `updated_before` are RFC 3339 timestamps; `_after` is inclusive (>=), `_before` is exclusive (<). Malformed timestamps are rejected.\n\nOrdering: `order_by` is `created_at` | `updated_at` (default `created_at`); `desc: true` reverses (default ascending). `limit` caps the rows.\n\nReturns metadata only — call `project.get` for the full description body (corpus-wide; for one project's state, use project.overview)."
     )]
     async fn project_list(
         &self,
@@ -769,7 +858,7 @@ impl MeshService {
 
     #[tool(
         name = "project.get",
-        description = "Get one project by slug, including phases, tasks, artifacts, and full description body."
+        description = "Full hydrate: one project with every phase, task, and artifact body inline. Heavy on mature projects — can exceed the result size cap. To orient, call project.overview; to read a specific part, use phase.list / task.get / task.list."
     )]
     async fn project_get(
         &self,
@@ -822,6 +911,62 @@ impl MeshService {
             tasks,
             artifacts,
         }))
+    }
+
+    #[tool(
+        name = "project.overview",
+        description = "Orient in a project — the bounded \"what's the state of `<project>`?\" read, and the one to call FIRST. Returns project meta + a (truncated) description + an ordered phase index where each phase carries task-status COUNTS (todo|claimed|in_progress|blocked|done|cancelled, plus total) instead of bodies, an `unphased` bucket for tasks not anchored to a live phase (empty *or* dangling phase id), and project-level rollups (phase + task counts, artifact count). Stays a few KB no matter how much work has accumulated. To read a specific design doc or task body, follow up with phase.list / task.get / task.list. project.get is the full unbounded hydrate — heavy on mature projects."
+    )]
+    async fn project_overview(
+        &self,
+        Parameters(args): Parameters<ProjectOverviewArgs>,
+    ) -> Result<Json<ProjectOverview>, ErrorData> {
+        let project = match self.store.get_project(&args.slug).await {
+            Err(StoreError::NotFound) => {
+                return Err(ErrorData::invalid_params(
+                    format!("project not found: {}", args.slug),
+                    None,
+                ));
+            }
+            Err(err) => return Err(store_err(err)),
+            Ok(versioned) => versioned.value,
+        };
+        let phases: Vec<Phase> = self
+            .store
+            .list_phases(PhaseListFilter {
+                project: Some(args.slug.clone()),
+                ..Default::default()
+            })
+            .await
+            .map_err(store_err)?
+            .into_iter()
+            .map(|v| v.value)
+            .collect();
+        let tasks: Vec<Task> = self
+            .store
+            .list_tasks(TaskListFilter {
+                project: Some(args.slug.clone()),
+                ..Default::default()
+            })
+            .await
+            .map_err(store_err)?
+            .into_iter()
+            .map(|v| v.value)
+            .collect();
+        let artifact_count = self
+            .store
+            .list_artifacts(ArtifactListFilter {
+                project: args.slug.clone(),
+            })
+            .await
+            .map_err(store_err)?
+            .len();
+        Ok(Json(build_overview(
+            &project,
+            phases,
+            &tasks,
+            artifact_count,
+        )))
     }
 
     #[tool(
@@ -1003,14 +1148,15 @@ impl MeshService {
 
     #[tool(
         name = "phase.list",
-        description = "List phases subject to a predicate filter. Phase bodies are included.\n\nCross-project: `project` is optional — omit it (or pass `null`) to scan every project in the corpus. A cross-project listing groups by project, then by `order` within each project, so the linear-position ordering stays meaningful.\n\nFilters: `status` is a list (`pending` | `active` | `done` | `skipped`) — OR-of-statuses. `body_contains` is a case-insensitive literal substring against the phase body. `created_after` / `created_before` and `updated_after` / `updated_before` are RFC 3339 timestamps; `_after` is inclusive (>=), `_before` is exclusive (<). Malformed timestamps are rejected.\n\nOrdering: `order_by` is `created_at` | `updated_at` | `order` (default `order` — the linear-position frontmatter field). `desc: true` reverses (default ascending). `limit` caps the rows. Filters AND-together."
+        description = "List phases subject to a predicate filter. Phase bodies are included.\n\nCross-project: `project` is optional — omit it (or pass `null`) to scan every project in the corpus. A cross-project listing groups by project, then by `order` within each project, so the linear-position ordering stays meaningful.\n\nFilters: `status` is a list (`pending` | `active` | `done` | `skipped`) — OR-of-statuses. `body_contains` is a case-insensitive literal substring against the phase body. `created_after` / `created_before` and `updated_after` / `updated_before` are RFC 3339 timestamps; `_after` is inclusive (>=), `_before` is exclusive (<). Malformed timestamps are rejected.\n\nOrdering: `order_by` is `created_at` | `updated_at` | `order` (default `order` — the linear-position frontmatter field). `desc: true` reverses (default ascending). `limit` caps the rows. Filters AND-together. Pass bodies:false to strip the phase body markdown; all frontmatter (id, slug, title, status, order, owner, timestamps) is still returned."
     )]
     async fn phase_list(
         &self,
         Parameters(args): Parameters<PhaseListArgs>,
     ) -> Result<Json<PhaseListResult>, ErrorData> {
+        let with_bodies = args.bodies.unwrap_or(true);
         let filter = PhaseListFilter::from(args);
-        let phases = self
+        let mut phases: Vec<Phase> = self
             .store
             .list_phases(filter)
             .await
@@ -1018,12 +1164,17 @@ impl MeshService {
             .into_iter()
             .map(|v| v.value)
             .collect();
+        if !with_bodies {
+            for p in &mut phases {
+                p.body.clear();
+            }
+        }
         Ok(Json(PhaseListResult { phases }))
     }
 
     #[tool(
         name = "task.list",
-        description = "List tasks subject to a predicate filter. Every argument is optional; an empty arg set returns every task in the corpus, sorted by `created_at` ASC. Filters AND-together.\n\nCross-project: `project` is optional — omit it (or pass `null`) to scan every project in the corpus. `phase` is a phase slug and REQUIRES `project` (validation error otherwise — phase slugs are unique per project, not globally).\n\nFilters: `status` is a list (`todo` | `claimed` | `in_progress` | `blocked` | `done` | `cancelled`) — OR-of-statuses. `assignee` is an exact match against the task's `assignee` frontmatter (e.g. `human:michael`, `ship`). `body_contains` is a case-insensitive literal substring against the task body. The four date-range pairs — `created`, `updated`, `completed`, `claimed` — each take `_after` (inclusive, >=) and `_before` (exclusive, <) RFC 3339 timestamps. Filtering on `completed_*` or `claimed_*` drops rows where that timestamp is null. Malformed timestamps are rejected.\n\nOrdering: `order_by` is `created_at` | `updated_at` | `completed_at` | `claimed_at` (default `created_at`); sorting by a nullable field (`completed_at`, `claimed_at`) drops rows where that field is null. `desc: true` reverses (default ascending). `limit` caps the rows."
+        description = "List tasks subject to a predicate filter. Every argument is optional; an empty arg set returns every task in the corpus, sorted by `created_at` ASC. Filters AND-together.\n\nCross-project: `project` is optional — omit it (or pass `null`) to scan every project in the corpus. `phase` is a phase slug and REQUIRES `project` (validation error otherwise — phase slugs are unique per project, not globally).\n\nFilters: `status` is a list (`todo` | `claimed` | `in_progress` | `blocked` | `done` | `cancelled`) — OR-of-statuses. `assignee` is an exact match against the task's `assignee` frontmatter (e.g. `human:michael`, `ship`). `body_contains` is a case-insensitive literal substring against the task body. The four date-range pairs — `created`, `updated`, `completed`, `claimed` — each take `_after` (inclusive, >=) and `_before` (exclusive, <) RFC 3339 timestamps. Filtering on `completed_*` or `claimed_*` drops rows where that timestamp is null. Malformed timestamps are rejected.\n\nOrdering: `order_by` is `created_at` | `updated_at` | `completed_at` | `claimed_at` (default `created_at`); sorting by a nullable field (`completed_at`, `claimed_at`) drops rows where that field is null. `desc: true` reverses (default ascending). `limit` caps the rows. Pass bodies:false to omit task bodies + notes (frontmatter only) — use it when drilling down from project.overview."
     )]
     async fn task_list(
         &self,
@@ -1035,8 +1186,9 @@ impl MeshService {
                 None,
             ));
         }
+        let with_bodies = args.bodies.unwrap_or(true);
         let filter = TaskListFilter::from(args);
-        let tasks = self
+        let mut tasks: Vec<Task> = self
             .store
             .list_tasks(filter)
             .await
@@ -1044,6 +1196,12 @@ impl MeshService {
             .into_iter()
             .map(|v| v.value)
             .collect();
+        if !with_bodies {
+            for t in &mut tasks {
+                t.body.clear();
+                t.notes.clear();
+            }
+        }
         Ok(Json(TaskListResult { tasks }))
     }
 
@@ -2865,6 +3023,411 @@ mod tests {
         assert_eq!(view.tasks[0].slug, "alpha-task");
     }
 
+    fn phase_file_path(corpus: &Path, project_slug: &str, order: i32, slug: &str) -> PathBuf {
+        corpus
+            .join("projects")
+            .join(project_slug)
+            .join("phases")
+            .join(format!("{order:02}-{slug}.md"))
+    }
+
+    fn overview_for(svc: &MeshService, slug: &str) -> ProjectOverview {
+        let Json(ov) = block_on(svc.project_overview(Parameters(ProjectOverviewArgs {
+            slug: slug.to_owned(),
+        })))
+        .expect("project.overview");
+        ov
+    }
+
+    fn create_task_in_phase(svc: &MeshService, project: &str, phase: &str, slug: &str) -> Task {
+        let Json(t) = block_on(svc.task_create(Parameters(TaskCreateArgs {
+            project: project.to_owned(),
+            phase: Some(phase.to_owned()),
+            slug: slug.to_owned(),
+            title: slug.to_owned(),
+            body: String::new(),
+            actor: "human:test".to_owned(),
+            depends_on: Vec::new(),
+        })))
+        .expect("task.create");
+        t
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn project_overview_aggregates_counts_and_partitions_tasks() {
+        let (tmp, svc) = fresh_service();
+        let corpus = tmp.path();
+        seed_project(&svc, "alpha");
+
+        // Two phases at mixed statuses.
+        block_on(svc.phase_add(Parameters(PhaseAddArgs {
+            project: "alpha".to_owned(),
+            slug: "p1".to_owned(),
+            title: "Phase 1".to_owned(),
+            body: "phase one body".to_owned(),
+            after_phase: None,
+            actor: "human:test".to_owned(),
+            owner: "human:p1".to_owned(),
+        })))
+        .expect("p1");
+        block_on(svc.phase_add(Parameters(PhaseAddArgs {
+            project: "alpha".to_owned(),
+            slug: "p2".to_owned(),
+            title: "Phase 2".to_owned(),
+            body: String::new(),
+            after_phase: None,
+            actor: "human:test".to_owned(),
+            owner: "human:p2".to_owned(),
+        })))
+        .expect("p2");
+        block_on(svc.phase_update(Parameters(PhaseUpdateArgs {
+            project: "alpha".to_owned(),
+            slug: "p2".to_owned(),
+            title: None,
+            body: None,
+            status: Some(PhaseStatus::Done),
+            owner: None,
+        })))
+        .expect("p2 done");
+
+        // p1: one todo, one done. p2: one in_progress.
+        let _t_todo = create_task_in_phase(&svc, "alpha", "p1", "t-todo");
+        let t_done = create_task_in_phase(&svc, "alpha", "p1", "t-done");
+        block_on(svc.task_complete(Parameters(TaskCompleteArgs {
+            id: t_done.id,
+            note: None,
+            actor: "human:test".to_owned(),
+        })))
+        .expect("complete t-done");
+        let t_prog = create_task_in_phase(&svc, "alpha", "p2", "t-prog");
+        block_on(svc.task_claim(Parameters(TaskClaimArgs {
+            id: t_prog.id.clone(),
+            actor: "human:test".to_owned(),
+        })))
+        .expect("claim t-prog");
+        block_on(svc.task_update(Parameters(TaskUpdateArgs {
+            id: t_prog.id,
+            body: None,
+            status: Some(TaskStatus::InProgress),
+            note: None,
+            depends_on: None,
+            actor: "human:test".to_owned(),
+        })))
+        .expect("t-prog in_progress");
+
+        // A genuinely unphased task (no phase).
+        let _u = seed_task(&svc, "alpha", "t-unphased");
+
+        // An orphaned-phase-id task: hand-edit its phase to a dangling id.
+        let orphan = seed_task(&svc, "alpha", "t-orphan");
+        set_task_field(corpus, &orphan, "phase", "phs_01J05M3K9N4F8Z7K3N9P5Q1RZZ");
+
+        let ov = overview_for(&svc, "alpha");
+
+        // All phases present, ordered by order ASC.
+        assert_eq!(ov.phases.len(), 2);
+        assert_eq!(ov.phases[0].slug, "p1");
+        assert_eq!(ov.phases[1].slug, "p2");
+        assert_eq!(ov.phases[0].owner, "human:p1");
+
+        // p1 counts: 1 todo, 1 done, total 2.
+        let p1 = &ov.phases[0].task_counts;
+        assert_eq!(p1.todo, 1);
+        assert_eq!(p1.done, 1);
+        assert_eq!(p1.total, 2);
+        // p2 counts: 1 in_progress, total 1.
+        let p2 = &ov.phases[1].task_counts;
+        assert_eq!(p2.in_progress, 1);
+        assert_eq!(p2.total, 1);
+
+        // unphased holds the empty-phase task AND the dangling-id task.
+        assert_eq!(ov.unphased.task_counts.total, 2);
+        assert_eq!(ov.unphased.task_counts.todo, 2);
+
+        // Totals.
+        assert_eq!(ov.totals.tasks_by_status.total, 5);
+        assert_eq!(ov.totals.tasks_by_status.todo, 3);
+        assert_eq!(ov.totals.tasks_by_status.done, 1);
+        assert_eq!(ov.totals.tasks_by_status.in_progress, 1);
+        assert_eq!(ov.totals.phases_by_status.pending, 1);
+        assert_eq!(ov.totals.phases_by_status.done, 1);
+        assert_eq!(ov.totals.artifact_count, 0);
+
+        // RECONCILE INVARIANT: sum(phase totals) + unphased == grand total.
+        let phase_sum: u32 = ov.phases.iter().map(|p| p.task_counts.total).sum();
+        assert_eq!(
+            phase_sum + ov.unphased.task_counts.total,
+            ov.totals.tasks_by_status.total,
+            "partition must be exhaustive even with an orphan task"
+        );
+
+        // No body/notes anywhere in the serialized output.
+        let json = serde_json::to_string(&ov).expect("serialize overview");
+        assert!(
+            !json.contains("phase one body"),
+            "no phase body in overview"
+        );
+        assert!(
+            !json.contains("\"body\""),
+            "no body field anywhere in overview"
+        );
+        assert!(
+            !json.contains("\"notes\""),
+            "no notes field anywhere in overview"
+        );
+    }
+
+    #[test]
+    fn project_overview_counts_have_every_key_and_total_is_sum() {
+        let (_tmp, svc) = fresh_service();
+        seed_project(&svc, "alpha");
+        block_on(svc.phase_add(Parameters(PhaseAddArgs {
+            project: "alpha".to_owned(),
+            slug: "p1".to_owned(),
+            title: "Phase 1".to_owned(),
+            body: String::new(),
+            after_phase: None,
+            actor: "human:test".to_owned(),
+            owner: "human:p1".to_owned(),
+        })))
+        .expect("p1");
+        create_task_in_phase(&svc, "alpha", "p1", "t1");
+
+        let ov = overview_for(&svc, "alpha");
+        // Serialize and assert every status key is present (zero when none).
+        let v: serde_json::Value = serde_json::to_value(&ov).expect("to value");
+        let counts = &v["phases"][0]["task_counts"];
+        for key in [
+            "todo",
+            "claimed",
+            "in_progress",
+            "blocked",
+            "done",
+            "cancelled",
+            "total",
+        ] {
+            assert!(
+                counts.get(key).is_some(),
+                "missing key {key} in task_counts"
+            );
+        }
+        let c = &ov.phases[0].task_counts;
+        assert_eq!(
+            c.total,
+            c.todo + c.claimed + c.in_progress + c.blocked + c.done + c.cancelled,
+            "total must equal the sum of the six buckets"
+        );
+    }
+
+    #[test]
+    fn project_overview_truncates_long_description() {
+        let (_tmp, svc) = fresh_service();
+        let long = "x".repeat(900);
+        block_on(svc.create_project(NewProject {
+            slug: "longp".to_owned(),
+            title: "Long".to_owned(),
+            description: long,
+            actor: "human:test".to_owned(),
+        }))
+        .expect("create longp");
+
+        let ov = overview_for(&svc, "longp");
+        assert_eq!(ov.project.description.chars().count(), 600);
+        assert!(ov.project.description_truncated);
+    }
+
+    #[test]
+    fn project_overview_keeps_short_description_full() {
+        let (_tmp, svc) = fresh_service();
+        block_on(svc.create_project(NewProject {
+            slug: "shortp".to_owned(),
+            title: "Short".to_owned(),
+            description: "a tight paragraph".to_owned(),
+            actor: "human:test".to_owned(),
+        }))
+        .expect("create shortp");
+
+        let ov = overview_for(&svc, "shortp");
+        assert_eq!(ov.project.description, "a tight paragraph");
+        assert!(!ov.project.description_truncated);
+    }
+
+    #[test]
+    fn project_overview_empty_project_is_zeroed_not_error() {
+        let (_tmp, svc) = fresh_service();
+        seed_project(&svc, "empty");
+        let ov = overview_for(&svc, "empty");
+        assert!(ov.phases.is_empty());
+        assert_eq!(ov.totals.tasks_by_status.total, 0);
+        assert_eq!(ov.totals.phases_by_status.pending, 0);
+        assert_eq!(ov.totals.artifact_count, 0);
+        assert_eq!(ov.unphased.task_counts.total, 0);
+    }
+
+    #[test]
+    fn project_overview_not_found_returns_invalid_params() {
+        let (_tmp, svc) = fresh_service();
+        match block_on(svc.project_overview(Parameters(ProjectOverviewArgs {
+            slug: "nope".to_owned(),
+        }))) {
+            Err(err) => {
+                assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+                assert!(
+                    err.message.contains("project not found"),
+                    "unexpected message: {}",
+                    err.message
+                );
+            }
+            Ok(_) => panic!("unknown slug must be rejected"),
+        }
+    }
+
+    #[test]
+    fn project_overview_fails_on_corrupt_file() {
+        let (tmp, svc) = fresh_service();
+        let corpus = tmp.path();
+        seed_project(&svc, "alpha");
+        block_on(svc.phase_add(Parameters(PhaseAddArgs {
+            project: "alpha".to_owned(),
+            slug: "p1".to_owned(),
+            title: "Phase 1".to_owned(),
+            body: String::new(),
+            after_phase: None,
+            actor: "human:test".to_owned(),
+            owner: "human:p1".to_owned(),
+        })))
+        .expect("p1");
+
+        // Corrupt the phase file (no frontmatter delimiters).
+        let path = phase_file_path(corpus, "alpha", 1, "p1");
+        std::fs::write(&path, "garbage, not a phase file").expect("corrupt phase");
+
+        let result = block_on(svc.project_overview(Parameters(ProjectOverviewArgs {
+            slug: "alpha".to_owned(),
+        })));
+        assert!(
+            result.is_err(),
+            "corrupt file must fail the whole overview, not skip-and-undercount"
+        );
+    }
+
+    #[test]
+    fn project_overview_fails_on_corrupt_task_file() {
+        let (tmp, svc) = fresh_service();
+        let corpus = tmp.path();
+        seed_project(&svc, "alpha");
+        let task = seed_task(&svc, "alpha", "t1");
+
+        // Corrupt the task file (no frontmatter delimiters). D8 covers tasks
+        // too, not just phases — a corrupt task must fail the whole overview.
+        std::fs::write(task_file_path(corpus, &task), "garbage, not a task file")
+            .expect("corrupt task");
+
+        let result = block_on(svc.project_overview(Parameters(ProjectOverviewArgs {
+            slug: "alpha".to_owned(),
+        })));
+        assert!(
+            result.is_err(),
+            "corrupt task file must fail the whole overview, not skip-and-undercount"
+        );
+    }
+
+    #[test]
+    fn phase_list_bodies_false_strips_body() {
+        let (_tmp, svc) = fresh_service();
+        seed_project(&svc, "alpha");
+        block_on(svc.phase_add(Parameters(PhaseAddArgs {
+            project: "alpha".to_owned(),
+            slug: "p1".to_owned(),
+            title: "Phase 1".to_owned(),
+            body: "secret phase body".to_owned(),
+            after_phase: None,
+            actor: "human:test".to_owned(),
+            owner: "human:p1".to_owned(),
+        })))
+        .expect("p1");
+
+        // Default keeps the body.
+        let Json(full) = block_on(svc.phase_list(Parameters(PhaseListArgs {
+            project: Some("alpha".to_owned()),
+            ..Default::default()
+        })))
+        .expect("phase.list default");
+        assert_eq!(full.phases[0].body, "secret phase body");
+
+        // bodies: false strips it.
+        let Json(stripped) = block_on(svc.phase_list(Parameters(PhaseListArgs {
+            project: Some("alpha".to_owned()),
+            bodies: Some(false),
+            ..Default::default()
+        })))
+        .expect("phase.list bodies false");
+        assert!(stripped.phases[0].body.is_empty());
+        assert_eq!(stripped.phases[0].slug, "p1");
+    }
+
+    #[test]
+    fn task_list_bodies_false_strips_body_and_notes() {
+        let (_tmp, svc) = fresh_service();
+        seed_project(&svc, "alpha");
+        let Json(t) = block_on(svc.task_create(Parameters(TaskCreateArgs {
+            project: "alpha".to_owned(),
+            phase: None,
+            slug: "t1".to_owned(),
+            title: "T1".to_owned(),
+            body: "secret task body".to_owned(),
+            actor: "human:test".to_owned(),
+            depends_on: Vec::new(),
+        })))
+        .expect("task.create");
+        block_on(svc.task_update(Parameters(TaskUpdateArgs {
+            id: t.id,
+            body: None,
+            status: None,
+            note: Some("a progress note".to_owned()),
+            depends_on: None,
+            actor: "human:test".to_owned(),
+        })))
+        .expect("note");
+
+        // Default keeps body + notes.
+        let Json(full) = block_on(svc.task_list(Parameters(TaskListArgs {
+            project: Some("alpha".to_owned()),
+            ..Default::default()
+        })))
+        .expect("task.list default");
+        assert_eq!(full.tasks[0].body, "secret task body");
+        assert!(!full.tasks[0].notes.is_empty());
+
+        // bodies: false strips both.
+        let Json(stripped) = block_on(svc.task_list(Parameters(TaskListArgs {
+            project: Some("alpha".to_owned()),
+            bodies: Some(false),
+            ..Default::default()
+        })))
+        .expect("task.list bodies false");
+        assert!(stripped.tasks[0].body.is_empty());
+        assert!(stripped.tasks[0].notes.is_empty());
+        assert_eq!(stripped.tasks[0].slug, "t1");
+    }
+
+    #[test]
+    fn project_overview_dogfood_is_bounded() {
+        let store = FsStore::open(repo_root()).expect("open corpus");
+        let svc = MeshService::new(store);
+        let ov = overview_for(&svc, "dossier");
+        assert_eq!(ov.phases.len(), 4, "in-repo fixture has 4 phases");
+        assert_eq!(ov.totals.tasks_by_status.total, 3, "fixture has 3 tasks");
+        assert_eq!(ov.totals.artifact_count, 3, "fixture has 3 artifacts");
+        let json = serde_json::to_string(&ov).expect("serialize");
+        assert!(
+            json.len() <= 25_000,
+            "overview must stay bounded; got {} bytes",
+            json.len()
+        );
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)]
     fn artifact_list_filters_combine_task_and_kind_predicates() {
@@ -3059,6 +3622,7 @@ mod tests {
             order_by: Some(PhaseOrderField::CreatedAt),
             desc: Some(true),
             limit: Some(42),
+            bodies: None,
         });
 
         assert_eq!(f.project.as_deref(), Some("omega"));
@@ -3117,6 +3681,7 @@ mod tests {
             order_by: Some(TaskOrderField::ClaimedAt),
             desc: Some(true),
             limit: Some(99),
+            bodies: None,
         });
 
         assert_eq!(f.project.as_deref(), Some("rho"));
