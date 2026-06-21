@@ -20,12 +20,12 @@ use ulid::Ulid;
 
 use crate::domain::{
     append_task_note, apply_claim_task, apply_task_body_update, apply_task_complete,
-    apply_task_status_update, compute_new_phase_order, is_valid_slug, new_id, truncate_description,
-    validate_single_line, validate_task_body, Artifact, OverviewTotals, Phase, PhaseListFilter,
-    PhaseOrderField, PhaseOverview, PhaseStatus, PhaseStatusCounts, Project, ProjectListFilter,
-    ProjectOrderField, ProjectOverview, ProjectOverviewMeta, ProjectStatus, SearchArgs, SearchHit,
-    SearchKind, Task, TaskGetArgs, TaskListFilter, TaskOrderField, TaskStatus, TaskStatusCounts,
-    UnphasedOverview,
+    apply_task_status_update, compute_new_phase_order, is_valid_slug, new_id, resolve_status,
+    truncate_description, validate_single_line, validate_task_body, Artifact, OverviewTotals,
+    Phase, PhaseListFilter, PhaseOrderField, PhaseOverview, PhaseStatus, PhaseStatusCounts,
+    Project, ProjectListFilter, ProjectOrderField, ProjectOverview, ProjectOverviewMeta,
+    ProjectStatus, SearchArgs, SearchHit, SearchKind, Task, TaskGetArgs, TaskListFilter,
+    TaskOrderField, TaskStatus, TaskStatusCounts, UnphasedOverview,
 };
 use crate::store::{
     now_utc, ArtifactListFilter, ClaimTask, CompleteTask, FsStore, LinkArtifact, NewPhase,
@@ -96,14 +96,19 @@ pub struct ProjectView {
     pub artifacts: Vec<Artifact>,
 }
 
-/// Predicate-shaped arguments for `project.list`. Every field is
-/// optional; an empty arg set returns every project in the corpus
-/// sorted by `created_at` ASC.
+/// Predicate-shaped arguments for `project.list`. Every field is optional.
+///
+/// With no `status` filter the default is live projects only (non-terminal),
+/// sorted by `created_at` ASC — pass `include_terminal: true` to include
+/// `done` / `abandoned`.
 #[derive(Deserialize, JsonSchema, Default)]
 pub struct ProjectListArgs {
     /// if set, only projects whose status is in this list
     /// (`planning` | `active` | `paused` | `done` | `abandoned`).
-    /// An empty list is treated as no filter — omit the field instead.
+    /// Omit `status` for the live-only default (non-terminal rows); pass
+    /// `include_terminal: true` to include terminal rows. An explicit list
+    /// selects exact statuses; an explicit empty `[]` is "no filter" (all
+    /// statuses) — distinct from omitting.
     #[serde(default)]
     pub status: Option<Vec<ProjectStatus>>,
     /// when `status` is omitted, default to live (non-terminal) projects only.
@@ -147,7 +152,10 @@ pub struct PhaseListArgs {
     pub project: Option<String>,
     /// if set, only phases whose status is in this list
     /// (`pending` | `active` | `done` | `skipped`).
-    /// An empty list is treated as no filter — omit the field instead.
+    /// Omit `status` for the live-only default (non-terminal rows); pass
+    /// `include_terminal: true` to include terminal rows. An explicit list
+    /// selects exact statuses; an explicit empty `[]` is "no filter" (all
+    /// statuses) — distinct from omitting.
     #[serde(default)]
     pub status: Option<Vec<PhaseStatus>>,
     /// when `status` is omitted, default to live (non-terminal) phases only.
@@ -207,7 +215,10 @@ pub struct TaskListArgs {
     pub phase: Option<String>,
     /// if set, only tasks whose status is in this list
     /// (`todo` | `claimed` | `in_progress` | `blocked` | `done` | `cancelled`).
-    /// An empty list is treated as no filter — omit the field instead.
+    /// Omit `status` for the live-only default (non-terminal rows); pass
+    /// `include_terminal: true` to include terminal rows. An explicit list
+    /// selects exact statuses; an explicit empty `[]` is "no filter" (all
+    /// statuses) — distinct from omitting.
     #[serde(default)]
     pub status: Option<Vec<TaskStatus>>,
     /// when `status` is omitted, default to live (non-terminal) tasks only.
@@ -277,27 +288,6 @@ pub struct TaskListResult {
 #[derive(Serialize, JsonSchema)]
 pub struct SearchResult {
     pub hits: Vec<SearchHit>,
-}
-
-/// Resolve a list verb's `status` filter under the live-by-default policy.
-///
-/// Explicit `status` always wins verbatim (D2) — including `Some(vec![])`,
-/// which the store matcher treats as "no filter" => returns ALL rows incl.
-/// terminal. That empty-list passthrough is intentional, not a bug. Only when
-/// `status` is omitted does `include_terminal` govern the default: `true`
-/// leaves it `None` (all statuses), anything else injects the live set.
-fn resolve_status<S>(
-    status: Option<Vec<S>>,
-    include_terminal: Option<bool>,
-    live: impl FnOnce() -> Vec<S>,
-) -> Option<Vec<S>> {
-    if let Some(explicit) = status {
-        return Some(explicit);
-    }
-    if include_terminal == Some(true) {
-        return None;
-    }
-    Some(live())
 }
 
 impl From<ProjectListArgs> for ProjectListFilter {
@@ -599,6 +589,9 @@ impl MeshService {
                 let p = p.value;
                 let hay = format!("{}\n{}", p.title, p.description);
                 let score = count_ci_overlapping(&hay, needle);
+                // Item-level filtering: the project hit is gated inline (not an
+                // early `continue`) because a terminal project can still hold
+                // live phases/tasks that must be searched in the same iteration.
                 let live_kept = include_terminal || !p.status.is_terminal();
                 if score > 0 && live_kept {
                     ranked.push((

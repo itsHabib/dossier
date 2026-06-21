@@ -85,6 +85,29 @@ impl TaskStatus {
     }
 }
 
+/// Resolve a list verb's effective `status` filter under the live-by-default policy.
+///
+/// The single source of truth shared by the MCP `From<…Args>` conversions and
+/// the `dossier task_list` CLI, so the two surfaces never diverge.
+///
+/// Explicit `status` always wins verbatim — including `Some(vec![])`, which the
+/// store matcher treats as "no filter" => ALL rows incl. terminal (intentional,
+/// not a bug). Only when `status` is omitted does `include_terminal` govern:
+/// `Some(true)` => `None` (all statuses); otherwise inject the live set.
+pub fn resolve_status<S>(
+    status: Option<Vec<S>>,
+    include_terminal: Option<bool>,
+    live: impl FnOnce() -> Vec<S>,
+) -> Option<Vec<S>> {
+    if let Some(explicit) = status {
+        return Some(explicit);
+    }
+    if include_terminal == Some(true) {
+        return None;
+    }
+    Some(live())
+}
+
 /// Top-level project row — metadata in frontmatter, description body on disk.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Project {
