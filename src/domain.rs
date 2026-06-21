@@ -430,9 +430,11 @@ pub const OVERVIEW_DESCRIPTION_CHARS: usize = 600;
 /// the (possibly clipped) string and whether it was clipped. Never splits a
 /// UTF-8 codepoint — operates on `chars`, not bytes.
 pub fn truncate_description(body: &str) -> (String, bool) {
-    let truncated = body.chars().count() > OVERVIEW_DESCRIPTION_CHARS;
-    let out: String = body.chars().take(OVERVIEW_DESCRIPTION_CHARS).collect();
-    (out, truncated)
+    // Single pass: take the first N chars, then peek one more to decide
+    // truncation — avoids a second full `chars().count()` over a large body.
+    let mut chars = body.chars();
+    let out: String = chars.by_ref().take(OVERVIEW_DESCRIPTION_CHARS).collect();
+    (out, chars.next().is_some())
 }
 
 // --- Write-verb argument DTOs (protocol inputs; no I/O) ---

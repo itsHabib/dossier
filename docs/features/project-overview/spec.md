@@ -148,7 +148,7 @@ Description steering is best-effort, not a hard guarantee. That is the honest ar
 > Full hydrate: one project with every phase, task, and artifact body inline. Heavy on mature projects — can exceed the result size cap. To orient, call project.overview; to read a specific part, use phase.list / task.get / task.list.
 
 `project.list` (append): `… (corpus-wide; for one project's state, use project.overview).`
-`phase.list` (append): `… Pass bodies:false to omit phase bodies (slug/title/status/order only).`
+`phase.list` (append): `… Pass bodies:false to strip the phase body markdown (all frontmatter still returned).`
 `task.list` (append): `… Pass bodies:false to omit task bodies + notes (frontmatter only) — use it when drilling down from project.overview.`
 
 ## Backward compatibility

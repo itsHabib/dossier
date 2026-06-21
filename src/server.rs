@@ -170,8 +170,8 @@ pub struct PhaseListArgs {
     /// cap the number of returned rows
     #[serde(default)]
     pub limit: Option<usize>,
-    /// include phase bodies (default `true`); pass `false` to omit them
-    /// (slug/title/status/order/frontmatter only) for a bounded drill-down read
+    /// include phase bodies (default `true`); pass `false` to strip just the
+    /// body markdown (all frontmatter is still returned) for a bounded read
     #[serde(default)]
     pub bodies: Option<bool>,
 }
@@ -1148,7 +1148,7 @@ impl MeshService {
 
     #[tool(
         name = "phase.list",
-        description = "List phases subject to a predicate filter. Phase bodies are included.\n\nCross-project: `project` is optional — omit it (or pass `null`) to scan every project in the corpus. A cross-project listing groups by project, then by `order` within each project, so the linear-position ordering stays meaningful.\n\nFilters: `status` is a list (`pending` | `active` | `done` | `skipped`) — OR-of-statuses. `body_contains` is a case-insensitive literal substring against the phase body. `created_after` / `created_before` and `updated_after` / `updated_before` are RFC 3339 timestamps; `_after` is inclusive (>=), `_before` is exclusive (<). Malformed timestamps are rejected.\n\nOrdering: `order_by` is `created_at` | `updated_at` | `order` (default `order` — the linear-position frontmatter field). `desc: true` reverses (default ascending). `limit` caps the rows. Filters AND-together. Pass bodies:false to omit phase bodies (slug/title/status/order only)."
+        description = "List phases subject to a predicate filter. Phase bodies are included.\n\nCross-project: `project` is optional — omit it (or pass `null`) to scan every project in the corpus. A cross-project listing groups by project, then by `order` within each project, so the linear-position ordering stays meaningful.\n\nFilters: `status` is a list (`pending` | `active` | `done` | `skipped`) — OR-of-statuses. `body_contains` is a case-insensitive literal substring against the phase body. `created_after` / `created_before` and `updated_after` / `updated_before` are RFC 3339 timestamps; `_after` is inclusive (>=), `_before` is exclusive (<). Malformed timestamps are rejected.\n\nOrdering: `order_by` is `created_at` | `updated_at` | `order` (default `order` — the linear-position frontmatter field). `desc: true` reverses (default ascending). `limit` caps the rows. Filters AND-together. Pass bodies:false to strip the phase body markdown; all frontmatter (id, slug, title, status, order, owner, timestamps) is still returned."
     )]
     async fn phase_list(
         &self,
@@ -3309,6 +3309,27 @@ mod tests {
         assert!(
             result.is_err(),
             "corrupt file must fail the whole overview, not skip-and-undercount"
+        );
+    }
+
+    #[test]
+    fn project_overview_fails_on_corrupt_task_file() {
+        let (tmp, svc) = fresh_service();
+        let corpus = tmp.path();
+        seed_project(&svc, "alpha");
+        let task = seed_task(&svc, "alpha", "t1");
+
+        // Corrupt the task file (no frontmatter delimiters). D8 covers tasks
+        // too, not just phases — a corrupt task must fail the whole overview.
+        std::fs::write(task_file_path(corpus, &task), "garbage, not a task file")
+            .expect("corrupt task");
+
+        let result = block_on(svc.project_overview(Parameters(ProjectOverviewArgs {
+            slug: "alpha".to_owned(),
+        })));
+        assert!(
+            result.is_err(),
+            "corrupt task file must fail the whole overview, not skip-and-undercount"
         );
     }
 
