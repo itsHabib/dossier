@@ -21,6 +21,20 @@ pub enum ProjectStatus {
     Abandoned,
 }
 
+impl ProjectStatus {
+    /// `true` for finished lifecycles (`done`, `abandoned`); `paused` is live —
+    /// it is still yours and belongs in a default portfolio list.
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Done | Self::Abandoned)
+    }
+
+    /// The non-terminal statuses, in declaration order. Injected as the
+    /// default `status` filter when a list verb is called without one.
+    pub fn live_statuses() -> Vec<Self> {
+        vec![Self::Planning, Self::Active, Self::Paused]
+    }
+}
+
 /// Lifecycle status of a phase (`pending` | `active` | `done` | `skipped`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -29,6 +43,19 @@ pub enum PhaseStatus {
     Active,
     Done,
     Skipped,
+}
+
+impl PhaseStatus {
+    /// `true` for finished lifecycles (`done`, `skipped`).
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Done | Self::Skipped)
+    }
+
+    /// The non-terminal statuses, in declaration order. Injected as the
+    /// default `status` filter when a list verb is called without one.
+    pub fn live_statuses() -> Vec<Self> {
+        vec![Self::Pending, Self::Active]
+    }
 }
 
 /// Task state-machine status (`todo` | `claimed` | `in_progress` | `blocked` | `done` | `cancelled`).
@@ -42,6 +69,43 @@ pub enum TaskStatus {
     Blocked,
     Done,
     Cancelled,
+}
+
+impl TaskStatus {
+    /// `true` for finished lifecycles (`done`, `cancelled`); `blocked` is live —
+    /// stuck is not finished, and you want to see what is blocked.
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Done | Self::Cancelled)
+    }
+
+    /// The non-terminal statuses, in declaration order. Injected as the
+    /// default `status` filter when a list verb is called without one.
+    pub fn live_statuses() -> Vec<Self> {
+        vec![Self::Todo, Self::Claimed, Self::InProgress, Self::Blocked]
+    }
+}
+
+/// Resolve a list verb's effective `status` filter under the live-by-default policy.
+///
+/// The single source of truth shared by the MCP `From<…Args>` conversions and
+/// the `dossier task_list` CLI, so the two surfaces never diverge.
+///
+/// Explicit `status` always wins verbatim — including `Some(vec![])`, which the
+/// store matcher treats as "no filter" => ALL rows incl. terminal (intentional,
+/// not a bug). Only when `status` is omitted does `include_terminal` govern:
+/// `Some(true)` => `None` (all statuses); otherwise inject the live set.
+pub fn resolve_status<S>(
+    status: Option<Vec<S>>,
+    include_terminal: Option<bool>,
+    live: impl FnOnce() -> Vec<S>,
+) -> Option<Vec<S>> {
+    if let Some(explicit) = status {
+        return Some(explicit);
+    }
+    if include_terminal == Some(true) {
+        return None;
+    }
+    Some(live())
 }
 
 /// Top-level project row — metadata in frontmatter, description body on disk.
@@ -293,6 +357,10 @@ pub struct SearchArgs {
     /// Restrict to this project slug; omit or `null` for the whole corpus.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
+    /// Include hits in terminal items (default `true` — finding completed
+    /// work is a core use of search). Set `false` to scope to live items only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_terminal: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
 }
@@ -761,7 +829,74 @@ pub fn apply_task_complete(mut task: Task, actor: &str, now: DateTime<Utc>) -> R
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic)]
 
-    use super::{truncate_description, OVERVIEW_DESCRIPTION_CHARS};
+    use super::{
+        truncate_description, PhaseStatus, ProjectStatus, TaskStatus, OVERVIEW_DESCRIPTION_CHARS,
+    };
+
+    #[test]
+    fn task_is_terminal_matches_table() {
+        assert!(TaskStatus::Done.is_terminal());
+        assert!(TaskStatus::Cancelled.is_terminal());
+        assert!(!TaskStatus::Todo.is_terminal());
+        assert!(!TaskStatus::Claimed.is_terminal());
+        assert!(!TaskStatus::InProgress.is_terminal());
+        // `blocked` is stuck, not finished — live by design.
+        assert!(!TaskStatus::Blocked.is_terminal());
+    }
+
+    #[test]
+    fn task_live_statuses_are_the_non_terminal_set() {
+        let live = TaskStatus::live_statuses();
+        assert_eq!(
+            live,
+            vec![
+                TaskStatus::Todo,
+                TaskStatus::Claimed,
+                TaskStatus::InProgress,
+                TaskStatus::Blocked,
+            ]
+        );
+        assert!(live.iter().all(|s| !s.is_terminal()));
+    }
+
+    #[test]
+    fn phase_is_terminal_matches_table() {
+        assert!(PhaseStatus::Done.is_terminal());
+        assert!(PhaseStatus::Skipped.is_terminal());
+        assert!(!PhaseStatus::Pending.is_terminal());
+        assert!(!PhaseStatus::Active.is_terminal());
+    }
+
+    #[test]
+    fn phase_live_statuses_are_the_non_terminal_set() {
+        let live = PhaseStatus::live_statuses();
+        assert_eq!(live, vec![PhaseStatus::Pending, PhaseStatus::Active]);
+        assert!(live.iter().all(|s| !s.is_terminal()));
+    }
+
+    #[test]
+    fn project_is_terminal_matches_table() {
+        assert!(ProjectStatus::Done.is_terminal());
+        assert!(ProjectStatus::Abandoned.is_terminal());
+        assert!(!ProjectStatus::Planning.is_terminal());
+        assert!(!ProjectStatus::Active.is_terminal());
+        // a `paused` project is still yours — live by design.
+        assert!(!ProjectStatus::Paused.is_terminal());
+    }
+
+    #[test]
+    fn project_live_statuses_are_the_non_terminal_set() {
+        let live = ProjectStatus::live_statuses();
+        assert_eq!(
+            live,
+            vec![
+                ProjectStatus::Planning,
+                ProjectStatus::Active,
+                ProjectStatus::Paused,
+            ]
+        );
+        assert!(live.iter().all(|s| !s.is_terminal()));
+    }
 
     #[test]
     fn truncate_short_description_unchanged() {

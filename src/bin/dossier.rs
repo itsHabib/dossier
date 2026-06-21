@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 use rmcp::{transport::stdio, ServiceExt};
 use serde::Serialize;
 
-use dossier::domain::{Task, TaskListFilter, TaskStatus};
+use dossier::domain::{resolve_status, Task, TaskListFilter, TaskStatus};
 use dossier::server::MeshService;
 use dossier::store::{
     store_error_to_anyhow, CompleteTask, FsStore, LinkArtifact, Store, UpdateTask,
@@ -100,6 +100,9 @@ enum Command {
         /// cap the number of returned rows
         #[arg(long)]
         limit: Option<usize>,
+        /// include done/cancelled tasks (default: live only) — matches MCP `task.list`
+        #[arg(long)]
+        include_terminal: bool,
     },
 }
 
@@ -155,13 +158,17 @@ async fn main() -> Result<()> {
             status,
             assignee,
             limit,
+            include_terminal,
         } => run_task_list(
             &resolve_corpus(cli.corpus)?,
-            project,
-            phase,
-            &status,
-            assignee,
-            limit,
+            TaskListRequest {
+                project,
+                phase,
+                status,
+                assignee,
+                limit,
+                include_terminal,
+            },
         ),
     }
 }
@@ -377,21 +384,39 @@ async fn run_artifact_link(corpus: &Path, req: ArtifactLinkRequest) -> Result<()
     emit_json(&artifact)
 }
 
-fn run_task_list(
-    corpus: &Path,
+/// Inputs for the `task_list` CLI subcommand, bundled to stay within the
+/// argument-count cap (mirrors the `ArtifactLinkRequest` pattern).
+struct TaskListRequest {
     project: Option<String>,
     phase: Option<String>,
-    status: &[String],
+    status: Vec<String>,
     assignee: Option<String>,
     limit: Option<usize>,
-) -> Result<()> {
+    include_terminal: bool,
+}
+
+fn run_task_list(corpus: &Path, req: TaskListRequest) -> Result<()> {
+    let TaskListRequest {
+        project,
+        phase,
+        status,
+        assignee,
+        limit,
+        include_terminal,
+    } = req;
     if phase.is_some() && project.is_none() {
         bail!("phase requires project (phase slugs are unique per project, not across the corpus)");
     }
+    // Same live-by-default policy as MCP `task.list` (shared `resolve_status`)
+    // so the CLI and MCP task-list surfaces agree.
     let filter = TaskListFilter {
         project,
         phase,
-        status: parse_task_statuses(status)?,
+        status: resolve_status(
+            parse_task_statuses(&status)?,
+            Some(include_terminal),
+            TaskStatus::live_statuses,
+        ),
         assignee,
         limit,
         ..TaskListFilter::default()
