@@ -54,6 +54,9 @@ pub struct S3Config {
     /// When set, each `list_objects_v2` call increments the counter (integration tests).
     #[doc(hidden)]
     pub test_list_call_counter: Option<Arc<AtomicUsize>>,
+    /// When set, each `get_object` call increments the counter (integration tests).
+    #[doc(hidden)]
+    pub test_get_call_counter: Option<Arc<AtomicUsize>>,
 }
 
 /// Object store backend mirroring the on-disk corpus layout under an optional prefix.
@@ -63,6 +66,7 @@ pub struct S3Store {
     bucket: String,
     prefix: String,
     test_list_call_counter: Option<Arc<AtomicUsize>>,
+    test_get_call_counter: Option<Arc<AtomicUsize>>,
 }
 
 struct ObjectBody {
@@ -98,6 +102,7 @@ impl S3Store {
             bucket: cfg.bucket,
             prefix: Self::normalize_prefix(&cfg.prefix)?,
             test_list_call_counter: cfg.test_list_call_counter,
+            test_get_call_counter: cfg.test_get_call_counter,
         })
     }
 
@@ -197,6 +202,9 @@ impl S3Store {
     }
 
     async fn get_object_body_optional(&self, key: &str) -> Result<Option<ObjectBody>, StoreError> {
+        if let Some(counter) = &self.test_get_call_counter {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
         let resp = match self
             .client
             .get_object()
@@ -282,36 +290,49 @@ impl S3Store {
         Ok(())
     }
 
-    async fn load_phases_for(&self, project_slug: &str) -> Result<Vec<Phase>, StoreError> {
+    async fn load_phases_for(
+        &self,
+        project_slug: &str,
+    ) -> Result<Vec<Versioned<Phase>>, StoreError> {
         Self::validate_slug(project_slug)?;
         let prefix = format!("{}/", self.join_key(&["projects", project_slug, "phases"]));
         let keys = self.list_object_keys(&prefix).await?;
-        let mut out = Vec::new();
-        for key in keys {
-            if !key_is_markdown(&key) {
-                continue;
-            }
-            let obj = self.get_object_body(&key).await?;
-            let phase = parse_phase(&obj.raw).map_err(invalid_err)?;
-            out.push(phase);
-        }
-        Ok(out)
+        let md_keys = keys.into_iter().filter(|k| key_is_markdown(k));
+        // buffered (not buffer_unordered) keeps results in key order for
+        // deterministic output; the caller sorts, but stable input helps tests.
+        stream::iter(md_keys)
+            .map(|key| async move {
+                let obj = self.get_object_body(&key).await?;
+                let phase = parse_phase(&obj.raw).map_err(invalid_err)?;
+                Ok::<_, StoreError>(Versioned {
+                    value: phase,
+                    version: obj.version,
+                })
+            })
+            .buffered(LIST_CONCURRENCY)
+            .try_collect()
+            .await
     }
 
-    async fn load_tasks_for(&self, project_slug: &str) -> Result<Vec<Task>, StoreError> {
+    async fn load_tasks_for(&self, project_slug: &str) -> Result<Vec<Versioned<Task>>, StoreError> {
         Self::validate_slug(project_slug)?;
         let prefix = format!("{}/", self.join_key(&["projects", project_slug, "tasks"]));
         let keys = self.list_object_keys(&prefix).await?;
-        let mut out = Vec::new();
-        for key in keys {
-            if !key_is_markdown(&key) {
-                continue;
-            }
-            let obj = self.get_object_body(&key).await?;
-            let (task, _notes) = parse_task(&obj.raw, project_slug).map_err(invalid_err)?;
-            out.push(task);
-        }
-        Ok(out)
+        let md_keys = keys.into_iter().filter(|k| key_is_markdown(k));
+        // buffered (not buffer_unordered) keeps results in key order for
+        // deterministic output; the caller sorts, but stable input helps tests.
+        stream::iter(md_keys)
+            .map(|key| async move {
+                let obj = self.get_object_body(&key).await?;
+                let (task, _notes) = parse_task(&obj.raw, project_slug).map_err(invalid_err)?;
+                Ok::<_, StoreError>(Versioned {
+                    value: task,
+                    version: obj.version,
+                })
+            })
+            .buffered(LIST_CONCURRENCY)
+            .try_collect()
+            .await
     }
 
     async fn find_phase_key(
@@ -379,16 +400,6 @@ impl S3Store {
             };
             let project = parse_project(&obj.raw, false).map_err(invalid_err)?;
             if project.id == project_id {
-                return Ok(slug);
-            }
-        }
-        Err(StoreError::NotFound)
-    }
-
-    async fn project_slug_for_phase_id(&self, phase_id: &str) -> Result<String, StoreError> {
-        for slug in self.list_project_slugs().await? {
-            let phases = self.load_phases_for(&slug).await?;
-            if phases.iter().any(|p| p.id == phase_id) {
                 return Ok(slug);
             }
         }
@@ -486,38 +497,21 @@ impl Store for S3Store {
         } else {
             self.list_project_slugs().await?
         };
-        let mut phases = Vec::new();
+        let mut loaded = Vec::new();
         for project_slug in slugs {
-            phases.extend(self.load_phases_for(&project_slug).await?);
+            loaded.extend(self.load_phases_for(&project_slug).await?);
         }
+        let mut versions: HashMap<String, Version> = loaded
+            .iter()
+            .map(|v| (v.value.id.clone(), v.version.clone()))
+            .collect();
+        let mut phases: Vec<Phase> = loaded.into_iter().map(|v| v.value).collect();
         phases.retain(|p| phase_matches(p, &filter));
         sort_phases(&mut phases, &filter);
         if let Some(limit) = filter.limit {
             phases.truncate(limit);
         }
-        let project_filter = filter.project.clone();
-        stream::iter(phases)
-            .map(move |phase| {
-                let project_filter = project_filter.clone();
-                async move {
-                    let project_slug = if let Some(p) = &project_filter {
-                        p.clone()
-                    } else {
-                        self.project_slug_for_phase_id(&phase.id).await?
-                    };
-                    let key = self.find_phase_key(&project_slug, &phase.slug).await?;
-                    let obj = self.get_object_body(&key).await?;
-                    Ok(Versioned {
-                        value: phase,
-                        version: obj.version,
-                    })
-                }
-            })
-            // buffered (not buffer_unordered) so results stay in the sorted order
-            // established above — buffer_unordered would yield in completion order.
-            .buffered(LIST_CONCURRENCY)
-            .try_collect()
-            .await
+        pair_with_versions(phases, &mut versions, |p| &p.id)
     }
 
     async fn get_task(&self, id: &str) -> Result<Versioned<Task>, StoreError> {
@@ -536,18 +530,18 @@ impl Store for S3Store {
                 let phases = self.load_phases_for(project_slug).await?;
                 let phase = phases
                     .iter()
-                    .find(|p| &p.slug == phase_slug)
+                    .find(|p| p.value.slug == *phase_slug)
                     .ok_or_else(|| {
                         StoreError::Invalid(format!(
                             "phase not found: {phase_slug} in project {project_slug}"
                         ))
                     })?;
-                Some(phase.id.clone())
+                Some(phase.value.id.clone())
             }
             _ => None,
         };
 
-        let mut tasks = if let Some(slug) = &filter.project {
+        let loaded = if let Some(slug) = &filter.project {
             self.load_tasks_for(slug).await?
         } else {
             let mut all = Vec::new();
@@ -556,30 +550,17 @@ impl Store for S3Store {
             }
             all
         };
+        let mut versions: HashMap<String, Version> = loaded
+            .iter()
+            .map(|v| (v.value.id.clone(), v.version.clone()))
+            .collect();
+        let mut tasks: Vec<Task> = loaded.into_iter().map(|v| v.value).collect();
         tasks.retain(|t| task_matches(t, &filter, resolved_phase_id.as_deref()));
         sort_tasks(&mut tasks, &filter);
         if let Some(limit) = filter.limit {
             tasks.truncate(limit);
         }
-        stream::iter(tasks)
-            .map(|task| async move {
-                let key = self.join_key(&[
-                    "projects",
-                    &task.project_slug,
-                    "tasks",
-                    &task_filename(&task.id, &task.slug),
-                ]);
-                let obj = self.get_object_body(&key).await?;
-                Ok(Versioned {
-                    value: task,
-                    version: obj.version,
-                })
-            })
-            // buffered (not buffer_unordered) so results stay in the sorted order
-            // established above — buffer_unordered would yield in completion order.
-            .buffered(LIST_CONCURRENCY)
-            .try_collect()
-            .await
+        pair_with_versions(tasks, &mut versions, |t| &t.id)
     }
 
     async fn list_artifacts(
@@ -722,6 +703,23 @@ impl Store for S3Store {
         }
         Ok(())
     }
+}
+
+/// Re-pair filtered/sorted values with the versions captured on their body
+/// GET, keyed by id. Removes each match from `versions` so a duplicate id
+/// can't borrow another row's `ETag`. A value whose version is absent is a
+/// corpus inconsistency surfaced as [`StoreError::NotFound`].
+fn pair_with_versions<T>(
+    values: Vec<T>,
+    versions: &mut HashMap<String, Version>,
+    id_of: impl Fn(&T) -> &str,
+) -> Result<Vec<Versioned<T>>, StoreError> {
+    let mut out = Vec::with_capacity(values.len());
+    for value in values {
+        let version = versions.remove(id_of(&value)).ok_or(StoreError::NotFound)?;
+        out.push(Versioned { value, version });
+    }
+    Ok(out)
 }
 
 fn phase_order_and_slug_from_key(key: &str) -> Option<(i32, String)> {

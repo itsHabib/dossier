@@ -225,6 +225,7 @@ fn s3_config_from_env() -> Result<S3Config> {
         secret_access_key,
         force_path_style,
         test_list_call_counter: None,
+        test_get_call_counter: None,
     })
 }
 
