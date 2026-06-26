@@ -18,7 +18,7 @@ use aws_credential_types::Credentials;
 use aws_sdk_s3::Client;
 use chrono::Utc;
 use dossier::domain::{Artifact, Phase, PhaseStatus, Project, ProjectStatus, Task, TaskStatus};
-use dossier::store::{Store, StoreError, TaskListFilter, Version};
+use dossier::store::{PhaseListFilter, Store, StoreError, TaskListFilter, Version};
 use dossier::{S3Config, S3Store};
 use ulid::Ulid;
 
@@ -408,4 +408,73 @@ async fn list_tasks_issues_one_get_per_object() {
     // One GET per object (the body load that also carries the ETag), not 2N:
     // the second version-fetch pass was removed.
     assert_eq!(get_counter.load(Ordering::SeqCst), task_count);
+}
+
+#[tokio::test]
+async fn list_phases_preserves_duplicate_id_phases() {
+    let Some((store, _cfg)) = test_store().await else {
+        return;
+    };
+    let project = sample_project("dup-id-phases");
+    store
+        .put_project(&project, None)
+        .await
+        .expect("create project");
+    let alpha = seed_phase(&store, &project, "alpha", 1).await;
+
+    // Recreate the partial-shift transient: a COPY of alpha at order 2 (same id,
+    // same slug) lands on the new key 02-alpha.md before the old key is deleted.
+    let mut dup = alpha.clone();
+    dup.order = 2;
+    store
+        .put_phase(&dup, None)
+        .await
+        .expect("create-only duplicate phase at order 2");
+
+    let listed = store
+        .list_phases(PhaseListFilter {
+            project: Some(project.slug.clone()),
+            ..Default::default()
+        })
+        .await
+        .expect("list phases");
+
+    // Both rows survive the id-keyed collapse (pre-fix: NotFound or 1 row).
+    assert_eq!(listed.len(), 2);
+    assert!(listed.iter().all(|p| p.value.id == alpha.id));
+    assert!(listed.iter().all(|p| !p.version.as_str().is_empty()));
+}
+
+#[tokio::test]
+async fn list_phases_issues_one_get_per_object() {
+    let get_counter = Arc::new(AtomicUsize::new(0));
+    let Some((store, _cfg)) = test_store_with_counters(None, Some(Arc::clone(&get_counter))).await
+    else {
+        return;
+    };
+    let project = sample_project("list-phase-get-count");
+    store
+        .put_project(&project, None)
+        .await
+        .expect("create project");
+    let phase_count = 4;
+    for i in 0..phase_count {
+        seed_phase(&store, &project, &format!("p{i}"), i + 1).await;
+    }
+    get_counter.store(0, Ordering::SeqCst);
+
+    let listed = store
+        .list_phases(PhaseListFilter {
+            project: Some(project.slug.clone()),
+            ..Default::default()
+        })
+        .await
+        .expect("list phases");
+
+    assert_eq!(listed.len(), usize::try_from(phase_count).expect("count"));
+    // One GET per object (the body load that also carries the ETag), not 2N.
+    assert_eq!(
+        get_counter.load(Ordering::SeqCst),
+        usize::try_from(phase_count).expect("count")
+    );
 }

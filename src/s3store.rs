@@ -503,7 +503,7 @@ impl Store for S3Store {
         }
         let mut versions: HashMap<String, Version> = loaded
             .iter()
-            .map(|v| (v.value.id.clone(), v.version.clone()))
+            .map(|v| (phase_version_key(&v.value), v.version.clone()))
             .collect();
         let mut phases: Vec<Phase> = loaded.into_iter().map(|v| v.value).collect();
         phases.retain(|p| phase_matches(p, &filter));
@@ -511,7 +511,7 @@ impl Store for S3Store {
         if let Some(limit) = filter.limit {
             phases.truncate(limit);
         }
-        pair_with_versions(phases, &mut versions, |p| &p.id)
+        pair_with_versions(phases, &mut versions, phase_version_key)
     }
 
     async fn get_task(&self, id: &str) -> Result<Versioned<Task>, StoreError> {
@@ -530,7 +530,7 @@ impl Store for S3Store {
                 let phases = self.load_phases_for(project_slug).await?;
                 let phase = phases
                     .iter()
-                    .find(|p| p.value.slug == *phase_slug)
+                    .find(|p| &p.value.slug == phase_slug)
                     .ok_or_else(|| {
                         StoreError::Invalid(format!(
                             "phase not found: {phase_slug} in project {project_slug}"
@@ -560,7 +560,7 @@ impl Store for S3Store {
         if let Some(limit) = filter.limit {
             tasks.truncate(limit);
         }
-        pair_with_versions(tasks, &mut versions, |t| &t.id)
+        pair_with_versions(tasks, &mut versions, |t| t.id.clone())
     }
 
     async fn list_artifacts(
@@ -706,20 +706,30 @@ impl Store for S3Store {
 }
 
 /// Re-pair filtered/sorted values with the versions captured on their body
-/// GET, keyed by id. Removes each match from `versions` so a duplicate id
-/// can't borrow another row's `ETag`. A value whose version is absent is a
-/// corpus inconsistency surfaced as [`StoreError::NotFound`].
+/// GET. Removes each match from `versions` so a duplicate key can't borrow
+/// another row's `ETag`. A value whose version is absent is a corpus
+/// inconsistency surfaced as [`StoreError::NotFound`].
 fn pair_with_versions<T>(
     values: Vec<T>,
     versions: &mut HashMap<String, Version>,
-    id_of: impl Fn(&T) -> &str,
+    key_of: impl Fn(&T) -> String,
 ) -> Result<Vec<Versioned<T>>, StoreError> {
     let mut out = Vec::with_capacity(values.len());
     for value in values {
-        let version = versions.remove(id_of(&value)).ok_or(StoreError::NotFound)?;
+        let version = versions
+            .remove(&key_of(&value))
+            .ok_or(StoreError::NotFound)?;
         out.push(Versioned { value, version });
     }
     Ok(out)
+}
+
+/// Map key pairing a phase with its captured `ETag`. Keyed by (id, order),
+/// NOT id alone: a partial phase-shift recovery transiently holds two phase
+/// objects with the same id (old + new key, differing only in order); keying
+/// by id would collapse them and drop the second row as `NotFound`.
+fn phase_version_key(p: &Phase) -> String {
+    format!("{}#{}", p.id, p.order)
 }
 
 fn phase_order_and_slug_from_key(key: &str) -> Option<(i32, String)> {
