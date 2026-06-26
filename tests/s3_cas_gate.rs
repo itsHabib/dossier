@@ -96,6 +96,7 @@ async fn test_store() -> Option<(Arc<S3Store>, Client, S3Config)> {
         secret_access_key: secret,
         force_path_style: true,
         test_list_call_counter: None,
+        test_get_call_counter: None,
     };
     let client = build_client(&cfg).await;
     ensure_bucket(&client, &cfg.bucket).await;
