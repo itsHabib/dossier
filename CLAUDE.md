@@ -30,7 +30,7 @@ land when a real workflow needs them, in the right order (see
 <!-- BEGIN dev-workbench (managed by /dev-workbench skill — re-run to refresh; hand-edits inside this block will be overwritten) -->
 ## Dev workbench
 
-Several MCP servers + skills are available in any Claude session on this machine — the dev-workflow infrastructure built across the portfolio. **This is dossier — the project-memory plane itself** — so the dossier verbs are the most directly relevant when working in this repo, alongside ship (workflow execution), huddle (multi-seat coordination), and the `/worktree-*` skill family for git worktrees. When the signal matches, **just call the verb**. Don't ask permission.
+Several MCP servers + skills are available in any Claude session on this machine — the dev-workflow infrastructure built across the portfolio. **This is dossier — the project-memory plane itself** — so the dossier verbs are the most directly relevant when working in this repo, alongside ship (workflow execution), huddle (multi-seat coordination), and the `/worktree-*` skill family for git worktrees. When the signal matches, **just call the verb**. Don't ask permission. Stuck on a *knowledge* question about another portfolio repo — how it behaves, its conventions, what's in flight there — `/consult` its steward instead of asking the operator; only *authority* questions (direction, spend, irreversible calls) go to the operator.
 
 Dogfood reality: we track dossier's own work in the real corpus at `~/pers/dossier-state/projects/dossier/` (separate from the in-repo test fixture under `projects/dossier/`). When you call `phase.add` / `task.create` for dossier work, it lands there.
 
@@ -137,6 +137,14 @@ What happened / What's next / What I recommend / What I need from you, 1-3 sente
 
 **Pair with:** `/shipped` when the work is fully landed and the ask is "what shipped" rather than "where are we."
 
+### `/consult` — summon a sibling repo's steward
+
+- **/consult** — summon a sibling repo's steward for a same-turn answer; knowledge questions go to a peer, authority questions to the operator. An ephemeral subagent scoped to that repo answers in-turn; read-only, no side effects.
+
+**Triggers:** "ask the `<repo>` agent", "what does the ship steward think", stuck mid-task on how another portfolio repo behaves, explicit `/consult`.
+
+**Pair with:** the operator — but only for *authority* questions; `/consult` is the escalation step before that.
+
 ### `/worktree-*` — manage secondary git worktrees
 
 Thin skill family over plain `git worktree`. Use these instead of reaching for an MCP — they cover the verbs that mattered (add, list, remove, transfer, where) without an external state store. Default convention: branch name is user-chosen (no forced prefix); path is `<repo>/.claude/worktrees/<branch>/`.
@@ -185,7 +193,7 @@ Steps 3-7 of this loop are exactly what `/work-driver` automates when you fan mu
 
 ### Why this shape
 
-Each layer is independently swappable. Dossier could be Linear or GitHub Projects — it owns "what needs doing." The `/worktree-*` skills could be hand-rolled `git worktree` calls or a Codespace driver — they own "where work happens." Ship could be a different agent runner (Claude Code SDK, a local cursor subprocess, etc.) — it owns "drive an agent against a workdir + persist what happened." Huddle owns multi-seat coordination channels; playwright owns browser. Substituting any one doesn't ripple into the others.
+Each layer is independently swappable. Dossier could be Linear or GitHub Projects — it owns "what needs doing." The `/worktree-*` skills could be hand-rolled `git worktree` calls or a Codespace driver — they own "where work happens." Ship could be a different agent runner (Claude Code SDK, a local cursor subprocess, etc.) — it owns "drive an agent against a workdir + persist what happened." Huddle owns multi-seat coordination channels; playwright owns browser; `/consult` owns the stuck path (peer knowledge before operator attention). Substituting any one doesn't ripple into the others.
 
 Not every flow uses every tool. A one-off CLI fix can skip dossier; an existing-checkout edit can skip the worktree skills; a non-agent change skips ship. The workbench is a menu, not a checklist — but when the signals above match, default to calling the verb without checking in first.
 <!-- END dev-workbench -->
