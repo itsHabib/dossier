@@ -21,7 +21,7 @@ The gap: the workbench already **emits** that memory, but it's scattered. `ship`
 
 **The bet:** promote `verdict` and `receipt` to well-known artifact kinds, give artifacts a small structured `meta` map, and the existing `artifact.link` / `artifact.list` surface becomes the **one substrate** every retrospective read joins against. The artifact kind is already an extensible free-form string (`src/domain.rs` round-trips unknown kinds untouched), so this is a deepening of the existing primitive, not a new one.
 
-**Scope / budget:** two code PRs, each **< 300 wLOC** (amazing band), plus a docs-only PR (0×). Total well under the 700 ideal ceiling; no split-justification needed.
+**Scope / budget:** two code PRs — **≤300 wLOC** (meta field + immutability) and **≤200 wLOC** (`ref` filter) — plus a docs-only PR (0×). Both code PRs sit in the amazing band; total well under the 700 ideal ceiling, no split-justification needed.
 
 **Non-goals (this doc):**
 - **Jira-surface drift** — no boards, sprints, labels, estimates, swimlanes. Rejected per vision.md; workflow conventions layer on top of the primitives, they don't become primitives.
@@ -35,7 +35,7 @@ The gap: the workbench already **emits** that memory, but it's scattered. `ship`
 
 **Functional**
 - FR1 — A gate decision, driver run, merge, or grant usage can be linked to a dossier project (and optionally a task) as a typed artifact carrying a small structured summary.
-- FR2 — "Why did this PR merge?" is answerable from dossier alone: find the merge receipt, follow it to the verdict, read outcome / head sha / grant id — zero lookups in gate's or ship's stores for the *summary*, one `ref` hop for the *full* record.
+- FR2 — "Why did this PR merge?" is answerable from dossier alone, **given the owning project + the PR ref**: find the merge receipt, follow it to the verdict, read outcome / head sha / grant id — zero lookups in gate's or ship's stores for the *summary*, one `ref` hop for the *full* record. (The project scope is not a real cost: a PR URL already names `<owner>/<repo>`, which maps to the corpus project; `artifact.list` keeps `project` required to match the store seam — §6.)
 - FR3 — Existing corpora, unknown kinds, and meta-less artifacts keep working unchanged (round-trip untouched, readers degrade gracefully).
 - FR4 — `/wip`, `/shipped`, `flare`, and any LLM read one substrate via the existing `artifact.list` surface.
 
@@ -88,16 +88,22 @@ Nothing new structurally: the Artifact primitive, `artifacts.jsonl`, and the two
 
 `kind` well-known set becomes `commit | pr | file | url | run | doc | verdict | receipt` — still extensible, unknown kinds still round-trip.
 
-**Documented meta-key conventions** (conventions, not schema — unknown keys pass through; PROTOCOL.md carries this table):
+**Canonical `ref` form per kind** (the `ref` filter is exact-match — §6 — so the form must be pinned, not spelled three ways). PROTOCOL.md fixes one canonical `ref` per well-known kind:
+
+- `kind: receipt` — `ref` = the canonical GitHub PR URL `https://github.com/<owner>/<repo>/pull/<n>` (no trailing slash, no `.git`, lowercase host). This is the form `artifact.list { ref }` matches.
+- `kind: verdict` — `ref` = the gate audit ref (gate's opaque decision identifier, e.g. `gate://<repo>/pr/<n>/<dec_id>`), stable per decision.
+- Readers that don't want to depend on exact `ref` formatting can instead join on the task anchor + `kind` + `meta.pr` (§7.2) — `ref` exact-match is the fast path, the task+`meta.pr` join is the format-independent fallback.
+
+**Documented meta-key conventions** (conventions, not schema — unknown keys pass through; PROTOCOL.md carries this table). `actor` records *who linked the row* (the close-out caller); *who decided* is `meta.source` — the two are kept distinct so a skill-driven close-out and the gate that produced the verdict are both attributable:
 
 - `kind: verdict` — `source` (`gate` | `review-coordinator` | …), `outcome` (emitter's vocabulary, e.g. gate's `pass`/`blocked`/`parked`/`refused`), `pr`, `head_sha`, `grant` (grt_ id, when one applied), `tier`.
-- `kind: receipt` — `event` (`merge` | `close-out` | …), `pr`, `merge_sha`, `verdict` (the art_ id of the authorizing verdict — the join that answers FR2).
+- `kind: receipt` — `event` (`merge` | `close-out` | …), `pr`, `merge_sha`, `verdict` (the art_ id of the authorizing verdict — the FR2 fast-path join, with a fallback in §7.2), `supersedes` (art_ id, when this row corrects an earlier immutable one — §7.4).
 - `kind: run` (existing, enriched by convention) — `engine`, `run` (ship run id), `judgment`.
 
 **Example rows** (append-only `artifacts.jsonl`, one line each):
 
 ```jsonl
-{"id":"art_01K…","project":"prj_01KRSZ…","task":"tsk_01K…","kind":"verdict","ref":"gate://dossier/pr/93/dec_01K…","label":"gate pass PR #93","linked_at":"2026-07-23T18:00:00Z","actor":"agent:gate","meta":{"source":"gate","outcome":"pass","pr":"93","head_sha":"872b472","grant":"grt_01K…","tier":"2"}}
+{"id":"art_01K…","project":"prj_01KRSZ…","task":"tsk_01K…","kind":"verdict","ref":"gate://dossier/pr/93/dec_01K…","label":"gate pass PR #93","linked_at":"2026-07-23T18:00:00Z","actor":"claude-code:michael","meta":{"source":"gate","outcome":"pass","pr":"93","head_sha":"872b472","grant":"grt_01K…","tier":"2"}}
 {"id":"art_01K…","project":"prj_01KRSZ…","task":"tsk_01K…","kind":"receipt","ref":"https://github.com/itsHabib/dossier/pull/93","label":"merged PR #93","linked_at":"2026-07-23T18:05:00Z","actor":"claude-code:michael","meta":{"event":"merge","pr":"93","merge_sha":"a1b2c3d","verdict":"art_01K…"}}
 ```
 
@@ -113,12 +119,26 @@ artifact.link  { project, task?, kind, ref, label, meta?, actor } → Artifact
   is exceeded (too many keys / key too long / value too long / total too large).
   No per-kind validation of keys or values (D4).
 
-artifact.list  { project?, task?, kind?, ref? } → [Artifact]
-  ref: optional exact-match filter (a PR URL / run id / gate ref resolves to its records).
+  DEDUP + IMMUTABILITY (changes the shipped dedup): link_artifact today dedups on
+  (task, kind, ref) and returns the existing row. With meta, that dedup gains a
+  meta comparison:
+    - existing row found AND new meta byte-identical → return existing row (idempotent;
+      re-running close-out after a crash is safe).
+    - existing row found AND new meta differs → invalid_params
+      ("meta is immutable for an existing (task, kind, ref); supersede instead").
+    - no existing row → append.
+  Verdicts/receipts are immutable facts; a wrong meta is corrected by SUPERSEDING
+  (§7.4), never by mutation — consistent with append-only artifacts.jsonl.
+
+artifact.list  { project, task?, kind?, ref? } → [Artifact]
+  project: REQUIRED (matches ArtifactListFilter at the store seam, src/store.rs). A PR
+  URL already names <owner>/<repo> → the corpus project, so a ref-lookup supplies it.
+  ref: optional EXACT-MATCH filter over the canonical ref form for the kind (§5) — the
+  caller passes the canonical GitHub PR URL (receipt) or gate audit ref (verdict) verbatim.
   Returned artifacts include meta when present.
 ```
 
-Rust surface (`src/domain.rs`): `Artifact.meta: BTreeMap<String, String>` with `#[serde(default, skip_serializing_if = "BTreeMap::is_empty")]` — `BTreeMap` for deterministic serialization (stable git diffs). `LinkArtifact` gains the same field; cap enforcement lives in the policy layer above the store, per the policy/mechanism split. Both `FsStore` and `S3Store` round-trip the field.
+Rust surface (`src/domain.rs`): `Artifact.meta: BTreeMap<String, String>` with `#[serde(default, skip_serializing_if = "BTreeMap::is_empty")]` — `BTreeMap` for deterministic serialization (stable git diffs). `LinkArtifact` gains the same field; cap enforcement **and the meta-immutability dedup check** live in the policy layer above the store (`link_artifact_outcome` in `src/server.rs`), per the policy/mechanism split — the store stays a dumb append. Both `FsStore` and `S3Store` round-trip the field.
 
 **Error model:** cap violations → `invalid_params` with the failing key named; everything else unchanged.
 
@@ -137,23 +157,41 @@ Rust surface (`src/domain.rs`): `Artifact.meta: BTreeMap<String, String>` with `
 
 ### 7.2 Read — "why did this PR merge?"
 ```
-1. artifact.list { project, kind: "receipt", ref: <PR URL> }   → merge receipt
-2. receipt.meta.verdict → the verdict artifact (same list call's results or one more list)
+1. artifact.list { project, kind: "receipt", ref: <canonical PR URL> }   → merge receipt
+2. receipt → verdict, two joins (the second is the fallback for an unenforced FK):
+   FAST PATH:  receipt.meta.verdict (an art_ id) → the verdict artifact directly.
+   FALLBACK:   when meta.verdict is missing or dangles (it is a hand-maintained
+               foreign key with no referential integrity), join on the shared task
+               anchor: artifact.list { project, task: <receipt.task>, kind: "verdict" },
+               disambiguated by meta.pr — the format-independent path.
 3. verdict.meta: outcome, head_sha, grant, tier — the summary answer
 4. full record: follow verdict.ref into gate's audit chain (one hop, by design — D1)
 ```
+The `meta.verdict` FK is an *optimization*, not load-bearing: it saves a list call when
+present and correct, but the task+`meta.pr` join always answers, so a wrong or missing FK
+(including one written before the immutability rule, §7.4) degrades to slower, not broken.
 
 ### 7.3 Read — `/shipped` / `/wip` / flare
 One `artifact.list { project, kind: "receipt" }` (or `verdict`) per project instead of joining ship's ledger + gate's audit + GitHub. Task anchoring gives the join to phases via the task's `phase` field.
 
-### 7.4 Degraded / wrong-shape input
-- Emitter omits `meta` or uses unknown keys → link succeeds; readers show what's there (FR3). Missing `meta.verdict` on a receipt → the join stops at the receipt; the `ref` hop still works.
-- Duplicate links (retry, two close-out passes) → append-only tolerates them; readers take the latest `linked_at` per (kind, ref). No dedup in the store — idempotency via `(actor, request_id)` stays available per PROTOCOL.md.
-- A caller tries to stuff a run log into `meta` → cap rejection at link time (D5). The correct move is a `ref`.
+### 7.4 Degraded / wrong-shape input, dedup, and correcting a bad meta
+The shipped `link_artifact_outcome` **already dedups** on `(task, kind, ref)` — a second link with the same triple returns the existing row, it does not append. This TDD extends that dedup to reason about `meta` (§6), which makes verdicts/receipts *immutable facts*:
+
+- **Idempotent retry** (crash between close-out steps, two close-out passes with the same data) → the dedup returns the existing row; safe, no duplicate. This is the common case and it Just Works.
+- **Correcting a wrong meta** (e.g. a `meta.verdict` pointing at the wrong verdict art_ id): the same `(task, kind, ref)` with *different* `meta` is **rejected** with `invalid_params` ("meta is immutable; supersede instead"). You cannot silently overwrite — and because `artifacts.jsonl` is append-only with no update path, an immutable fact must be corrected by **superseding**, not mutating:
+  - **Supersede convention:** append a *new* artifact with a **distinct `ref`** (the correction carries a fresh gate audit ref, or the PR URL with a `#v2` fragment for a re-recorded receipt) and `meta.supersedes: <art_id of the bad row>`.
+  - **Reader rule:** among artifacts of a given `(kind, logical target)`, ignore any row that is named by a later row's `meta.supersedes`; take the survivor. This gives a deterministic "current" fact without an update path and without a fragile "latest `linked_at`" heuristic.
+- **Missing / unknown meta** → link succeeds; readers show what's there (FR3). A missing `meta.verdict` on a receipt falls back to the task+`meta.pr` join (§7.2), so it degrades, not breaks.
+- **Run log stuffed into `meta`** → cap rejection at link time (D5). The correct move is a `ref` to the log's home store.
+
+(There is no `request_id` field on `LinkArtifact`; idempotency here comes from the `(task, kind, ref)` dedup above, not from a request token.)
 
 ## 8. Concurrency / consistency / failure model
 
-Unchanged, deliberately: single-writer-per-corpus, append-only `artifacts.jsonl` with `O_APPEND` + file lock, atomic temp-file+rename for markdown. Verdicts/receipts are immutable facts — no update path, no CAS need. A crash between 7.1 step 2 and step 3 leaves a verdict without a receipt: consistent (the merge simply hasn't been recorded yet), repaired by re-running close-out.
+Unchanged, deliberately: single-writer-per-corpus, append-only `artifacts.jsonl` with `O_APPEND` + file lock, atomic temp-file+rename for markdown. Verdicts/receipts are immutable facts — no update path, no CAS need. Two failure cases, two answers:
+
+- **Crash between 7.1 step 2 and step 3** (verdict written, receipt not) → consistent: the merge simply hasn't been recorded yet. Repaired by re-running close-out — the `(task, kind, ref)` dedup (§7.4) makes the re-run idempotent for the already-written verdict and appends the missing receipt.
+- **A fact was written with wrong `meta`** → *not* repaired by re-running close-out (the dedup rejects a differing-meta re-link, §7.4). The only correction is the **supersede** path (§7.4): append a new artifact with a distinct `ref` and `meta.supersedes`, and readers take the non-superseded survivor. This keeps "immutable append-only" honest — nothing is ever rewritten in place — while still giving operators a way to correct a mistake.
 
 ## 9. Rollout / implementation plan
 
@@ -161,7 +199,7 @@ Validation gate after Phase B — the substrate must prove itself on dossier's o
 
 | Phase | Goal | High-level tasks | Depends on | Gate | ~wLOC |
 |---|---|---|---|---|---|
-| **A — schema + verbs** | The substrate exists | 1. `meta` field end-to-end: domain, FsStore + S3Store round-trip, `artifact.link` arg, cap enforcement (policy layer), PROTOCOL/LAYOUT updates in the same PR. 2. `artifact.list`: `ref` exact filter + `meta` in output, both stores. 3. Well-known kinds `verdict`/`receipt` + meta-key convention tables (docs). | — | pre-gate | ≤300 + ≤200 + 0 (docs) |
+| **A — schema + verbs** | The substrate exists | 1. `meta` field end-to-end: domain, FsStore + S3Store round-trip, `artifact.link` arg, cap enforcement + **meta-immutability dedup** (identical→idempotent, differ→`invalid_params`; §6/§7.4) in the policy layer, PROTOCOL/LAYOUT updates in the same PR. 2. `artifact.list`: `ref` exact filter + `meta` in output, both stores. 3. Well-known kinds `verdict`/`receipt` + canonical-`ref` + meta-key + supersede convention tables (docs). | — | pre-gate | ≤300 + ≤200 + 0 (docs) |
 | **B — dogfood** | Prove the reads | Record verdict + receipt artifacts for dossier's own merging PRs (starting with this TDD's PR) via close-out convention; backfill the last handful of merges; exercise 7.2/7.3 for real. | A | **GO/NO-GO** | ~0 (corpus writes) |
 | **C — observability cutover** *(post-gate, mostly outside this repo)* | One substrate for reads | Point `/shipped`, `/wip`, flare sweeps at `artifact.list`; retire their multi-store joins. | B | post-gate | — |
 | **D — driver auto-wiring** *(adjacent initiative, own TDD)* | Writes as a side effect of working | ship/driver + skills emit 7.1 automatically at land/record; not designed here (D6). | B | separate TDD | — |
@@ -176,4 +214,11 @@ Validation gate after Phase B — the substrate must prove itself on dossier's o
 
 ## 11. Validation plan (the gate)
 
-After Phase A ships and Phase B runs for the next **5 merged dossier PRs**: for each, the question *"which verdict authorized this merge, with what outcome, under which grant?"* is answered by `artifact.list` calls alone — **5/5, zero reads of gate's store or ship's ledger for the summary** (the `ref` hop to the full record is allowed and expected). Binary, baseline-free. Green → Phase C cutover and the driver auto-wiring TDD get written against a proven schema. Red (missing joins, meta too thin/too fat) → fix the conventions before any automation depends on them.
+After Phase A ships and Phase B runs for the next **5 merged dossier PRs**: for each, the question *"which verdict authorized this merge, with what outcome, under which grant?"* is answered by `artifact.list` calls alone — **5/5, zero reads of gate's store or ship's ledger for the summary** (the `ref` hop to the full record is allowed and expected). Binary, baseline-free.
+
+Two conditions harden the gate against author bias — proving the schema is **self-describing**, not just that its author can query rows he wrote:
+
+1. All 5 close-outs are written by the **normal close-out flow following only the PROTOCOL.md convention tables** (canonical `ref`, meta keys, supersede) — *not* by consulting this TDD. If the convention tables are insufficient to emit a correct row, that is a gate failure, fixed in the docs before proceeding.
+2. At least **1 of the 5 reads is performed by a fresh session given only PROTOCOL.md** (no this-TDD context). If it can't reconstruct verdict→outcome→grant from the protocol alone, the schema isn't self-describing yet.
+
+Green → Phase C cutover and the driver auto-wiring TDD get written against a proven schema. Red (missing joins, meta too thin/too fat, convention tables underspecified) → fix the conventions before any automation depends on them.
