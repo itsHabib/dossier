@@ -16,15 +16,20 @@ is a typed API over a folder of markdown. On-disk format in
 ## State
 
 Write side is shipped. Verbs available end-to-end: `project.list /
-get / create / update`, `phase.list / add / update`, `task.list /
-create / claim / update / complete`, `artifact.list`. The state
-machine is runtime-guarded, atomic writes route through helpers, slug
-validation is enforced on every create path.
+get / overview / create / update`, `phase.list / add / update`,
+`task.list / get / create / claim / update / complete`,
+`artifact.list / link`, and `search`. The state machine is
+runtime-guarded, atomic writes route through helpers, slug validation
+is enforced on every create path. List verbs are live-by-default (see
+[docs/vision.md](docs/vision.md)).
 
-`artifact.link` is the next chunk (~80 LOC). After that: a
-`dossier init` / `sync` CLI that scaffolds a fresh corpus from
-an existing repo. Conflict detection and other multi-writer verbs aren't here yet — they
-land when a real workflow needs them, in the right order (see
+What's not here yet: auto-wiring writes into the ship/driver loop (so
+merges/close-outs update the corpus without a human remembering to);
+richer retrieval (indexing the `## Notes` journal, a cross-corpus
+recap verb); and conflict detection / multi-writer verbs. The S3
+backend (`s3-cloud` phase) exists but multi-writer stays parked until a
+real team workflow needs it — single-writer local use is the priority.
+These land when a real workflow needs them, in the right order (see
 [docs/vision.md](docs/vision.md)).
 
 <!-- BEGIN dev-workbench (managed by /dev-workbench skill — re-run to refresh; hand-edits inside this block will be overwritten) -->
