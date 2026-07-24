@@ -168,6 +168,20 @@ Verdicts and receipts are immutable facts — a wrong `meta` (e.g. a
 This gives a deterministic "current" fact without an update path and
 without a fragile "latest `linked_at`" heuristic.
 
+**Lookup under supersession.** The exact-match `ref` lookup on the
+canonical (unfragmented) PR URL / gate audit ref returns the *original*
+row — which, once a correction lands, is the **superseded** one, since the
+replacement carries a distinct `ref`. That exact-ref lookup is the fast
+path for the common, un-superseded case; it cannot by itself surface a
+later supersede. To get the **current** fact when a supersede may have
+occurred, don't rely on it — use the format-independent task-anchor join
+(the §7.2 fallback): `artifact.list { project, task, kind: "receipt" }`
+(or `verdict`), then apply the reader rule above — drop any row named by a
+later row's `meta.supersedes` and take the survivor, disambiguating by
+`meta.pr` when needed. This is exactly why `meta.supersedes` and the
+task-anchor join exist: exact-`ref` is the fast path, the task + `meta.pr`
+join is the correct path under supersession.
+
 ## Slug scope
 
 Phase and task slugs are unique **within their parent project**, not globally. Two projects can both have phases named
