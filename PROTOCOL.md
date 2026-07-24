@@ -92,12 +92,95 @@ A pointer to something concrete the work produced or depends on.
 | `id`          | string                                                        |                                     |
 | `project`     | string                                                        |                                     |
 | `task`        | string \| null                                                |                                     |
-| `kind`        | `commit` \| `pr` \| `file` \| `url` \| `run` \| `doc`         | extensible                          |
+| `kind`        | `commit` \| `pr` \| `file` \| `url` \| `run` \| `doc` \| `verdict` \| `receipt` | extensible |
 | `ref`         | string                                                        | sha / url / path / run id           |
 | `label`       | string                                                        | short human-readable                |
 | `linked_at`   | timestamp                                                     |                                     |
 | `actor`       | string                                                        | who linked the row                  |
 | `meta`        | map string → string, optional                                 | flat denormalized summary; omitted when empty. Caps: ≤16 keys, key ≤64 bytes, value ≤512 bytes, ≤4 KiB total serialized. Unknown keys/values round-trip untouched. Immutable for an existing `(task, kind, ref)` — correction is via supersede (distinct `ref` + `meta.supersedes`), not mutation. |
+
+`kind: verdict` and `kind: receipt` are well-known kinds for the State
+substrate: a **pointer + denormalized summary** for a gate authorization
+decision (`verdict`) or a merge / close-out event (`receipt`). The
+authoritative record (gate's hash-chained decision, the full PR, ship's
+run) stays in its home store, reachable via `ref` — dossier stores the
+summary that makes retrospective reads ("why did this PR merge?") answerable
+from `artifact.list` alone, not a re-implementation of gate's or GitHub's
+data. Like every other kind, these are **conventions, not schema**: dossier
+does not validate `outcome` vocabularies or any other meta value, and an
+unrecognized kind or meta key still round-trips untouched (FR3).
+
+### Canonical `ref` form per kind
+
+The `ref` filter on `artifact.list` (when present) is exact-match, so the
+form is pinned per well-known kind rather than left to spell itself three
+ways:
+
+| kind      | canonical `ref` form                                                | notes |
+|-----------|-----------------------------------------------------------------------|-------|
+| `receipt` | the canonical GitHub PR URL: `https://github.com/<owner>/<repo>/pull/<n>` | no trailing slash, no `.git`, lowercase host |
+| `verdict` | the gate audit ref, e.g. `gate://<repo>/pr/<n>/<dec_id>`              | gate's opaque decision identifier, stable per decision |
+
+Readers that don't want to depend on exact `ref` formatting can instead join
+on the task anchor + `kind` + `meta.pr` — the `ref` exact-match is the fast
+path, the task+`meta.pr` join is the format-independent fallback.
+
+### `meta` key conventions per kind
+
+Conventions, not schema — unknown keys pass through untouched, and dossier
+never validates an `outcome` (or any other) vocabulary; that belongs to the
+emitter (gate's `pass` / `blocked` / `parked` / `refused`, a driver
+judgment, …). `actor` on the artifact records *who linked the row* (the
+close-out caller); `meta.source` records *who decided* — the two are kept
+distinct so a skill-driven close-out and the gate that produced the verdict
+are both attributable.
+
+| kind      | `meta` keys                                                                 |
+|-----------|-------------------------------------------------------------------------------|
+| `verdict` | `source` (`gate` \| `review-coordinator` \| …), `outcome` (emitter's vocabulary), `pr`, `head_sha`, `grant` (`grt_` id, when one applied), `tier` |
+| `receipt` | `event` (`merge` \| `close-out` \| …), `pr`, `merge_sha`, `verdict` (the `art_` id of the authorizing verdict), `supersedes` (`art_` id, when this row corrects an earlier immutable one) |
+| `run`     | `engine`, `run` (ship run id), `judgment` — existing kind, meta convention enriched here |
+
+Example rows (append-only `artifacts.jsonl`, one line each):
+
+```jsonl
+{"id":"art_01K…","project":"prj_01KRSZ…","task":"tsk_01K…","kind":"verdict","ref":"gate://dossier/pr/93/dec_01K…","label":"gate pass PR #93","linked_at":"2026-07-23T18:00:00Z","actor":"claude-code:michael","meta":{"source":"gate","outcome":"pass","pr":"93","head_sha":"872b472","grant":"grt_01K…","tier":"2"}}
+{"id":"art_01K…","project":"prj_01KRSZ…","task":"tsk_01K…","kind":"receipt","ref":"https://github.com/itsHabib/dossier/pull/93","label":"merged PR #93","linked_at":"2026-07-23T18:05:00Z","actor":"claude-code:michael","meta":{"event":"merge","pr":"93","merge_sha":"a1b2c3d","verdict":"art_01K…"}}
+```
+
+### Supersede convention
+
+`artifacts.jsonl` is append-only with no update path, and `artifact.link`
+rejects a re-link that changes `meta` for an existing `(task, kind, ref)`
+(`"meta is immutable for an existing (task, kind, ref); supersede instead"`).
+Verdicts and receipts are immutable facts — a wrong `meta` (e.g. a
+`meta.verdict` pointing at the wrong `art_` id) is corrected by
+**superseding**, never by mutation:
+
+1. Append a *new* artifact with a **distinct `ref`** (a fresh gate audit ref
+   for a corrected verdict, or the PR URL with a `#v2` fragment for a
+   re-recorded receipt) and `meta.supersedes: <art_id of the row being
+   corrected>`.
+2. **Reader rule:** among artifacts of a given `(kind, logical target)`,
+   ignore any row named by a later row's `meta.supersedes`; the row that is
+   never named as superseded is the current fact.
+
+This gives a deterministic "current" fact without an update path and
+without a fragile "latest `linked_at`" heuristic.
+
+**Lookup under supersession.** The exact-match `ref` lookup on the
+canonical (unfragmented) PR URL / gate audit ref returns the *original*
+row — which, once a correction lands, is the **superseded** one, since the
+replacement carries a distinct `ref`. That exact-ref lookup is the fast
+path for the common, un-superseded case; it cannot by itself surface a
+later supersede. To get the **current** fact when a supersede may have
+occurred, don't rely on it — use the format-independent task-anchor join
+(the §7.2 fallback): `artifact.list { project, task, kind: "receipt" }`
+(or `verdict`), then apply the reader rule above — drop any row named by a
+later row's `meta.supersedes` and take the survivor, disambiguating by
+`meta.pr` when needed. This is exactly why `meta.supersedes` and the
+task-anchor join exist: exact-`ref` is the fast path, the task + `meta.pr`
+join is the correct path under supersession.
 
 ## Slug scope
 
