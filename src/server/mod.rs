@@ -618,6 +618,14 @@ const USER_ERROR_MARKERS: &[&str] = &[
     "note body must not be empty",
     "search query must be non-empty",
     "search: project filter must be non-empty",
+    // artifact `meta` caps + immutability (client mistakes). Substrings
+    // exclude the variable {N}/{key} parts so they stay matched regardless
+    // of the cap numbers or the offending key.
+    "meta key count exceeds",
+    "meta key exceeds",
+    "meta value exceeds",
+    "meta serialized size exceeds",
+    "meta is immutable",
 ];
 
 /// Map an internal error to an MCP `ErrorData`. Generic over `ToString`

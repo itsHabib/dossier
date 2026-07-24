@@ -188,6 +188,7 @@ mod tests {
     };
     use crate::server::ProjectCreateArgs;
     use rmcp::handler::server::wrapper::{Json, Parameters};
+    use rmcp::model::ErrorCode;
 
     #[test]
     #[allow(clippy::too_many_lines)]
@@ -569,5 +570,81 @@ mod tests {
             panic!("expected Invalid, got {err:?}");
         };
         assert!(msg.contains("meta is immutable"), "got: {msg}");
+    }
+
+    // Regression: the MCP tool method (`artifact_link`, returning
+    // `Result<Json<_>, ErrorData>`) must map meta cap + immutability
+    // violations to `invalid_params` — not `internal_error`. The inner
+    // `link_artifact` returning `StoreError::Invalid` isn't enough; the
+    // classification happens in `store_err_to_invalid` against
+    // `USER_ERROR_MARKERS`, so this exercises the real MCP surface.
+    fn link_args_with_meta(
+        project: &str,
+        kind: &str,
+        reference: &str,
+        meta: BTreeMap<String, String>,
+    ) -> ArtifactLinkArgs {
+        ArtifactLinkArgs {
+            project: project.to_owned(),
+            task: None,
+            kind: kind.to_owned(),
+            reference: reference.to_owned(),
+            label: "label".to_owned(),
+            meta,
+            actor: "human:test".to_owned(),
+        }
+    }
+
+    #[test]
+    fn artifact_link_tool_maps_over_cap_meta_to_invalid_params() {
+        let (_tmp, svc) = fresh_service();
+        setup_project(&svc);
+        let mut meta = BTreeMap::new();
+        meta.insert("a".repeat(65), "v".to_owned());
+        // `Json<Artifact>` isn't `Debug`, so drop the Ok payload before asserting.
+        let err = block_on(svc.artifact_link(Parameters(link_args_with_meta(
+            "meta-proj",
+            "verdict",
+            "ref-tool-cap",
+            meta,
+        ))))
+        .map(|_| ())
+        .expect_err("over-cap meta must be rejected");
+        assert_eq!(
+            err.code,
+            ErrorCode::INVALID_PARAMS,
+            "over-cap meta must surface as invalid_params, not internal_error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn artifact_link_tool_maps_immutable_meta_to_invalid_params() {
+        let (_tmp, svc) = fresh_service();
+        setup_project(&svc);
+        let mut meta1 = BTreeMap::new();
+        meta1.insert("outcome".to_owned(), "pass".to_owned());
+        block_on(svc.artifact_link(Parameters(link_args_with_meta(
+            "meta-proj",
+            "verdict",
+            "ref-tool-immut",
+            meta1,
+        ))))
+        .expect("first link");
+
+        let mut meta2 = BTreeMap::new();
+        meta2.insert("outcome".to_owned(), "blocked".to_owned());
+        let err = block_on(svc.artifact_link(Parameters(link_args_with_meta(
+            "meta-proj",
+            "verdict",
+            "ref-tool-immut",
+            meta2,
+        ))))
+        .map(|_| ())
+        .expect_err("differing meta re-link must be rejected");
+        assert_eq!(
+            err.code,
+            ErrorCode::INVALID_PARAMS,
+            "immutable-meta violation must surface as invalid_params, not internal_error: {err:?}"
+        );
     }
 }
