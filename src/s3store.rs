@@ -803,3 +803,64 @@ fn map_sdk_err<E: std::fmt::Debug>(err: SdkError<E, Response>) -> StoreError {
     }
     StoreError::Unavailable
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::missing_panics_doc,
+        clippy::missing_errors_doc,
+        reason = "test module"
+    )]
+
+    use std::collections::BTreeMap;
+
+    use chrono::Utc;
+
+    use super::parse_artifacts_jsonl;
+    use crate::domain::Artifact;
+
+    #[test]
+    fn parse_artifacts_jsonl_meta_less_and_with_meta() {
+        let raw = concat!(
+            r#"{"id":"art_1","project":"prj_1","task":"","kind":"commit","#,
+            r#""ref":"abc","label":"old","linked_at":"2026-05-10T15:05:00Z","actor":"human:test"}"#,
+            "\n",
+            r#"{"id":"art_2","project":"prj_1","task":"","kind":"verdict","#,
+            r#""ref":"gate://x","label":"v","linked_at":"2026-05-10T15:06:00Z","#,
+            r#""actor":"human:test","meta":{"z":"last","a":"first"}}"#
+        );
+        let parsed = parse_artifacts_jsonl(raw).expect("parse");
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed.first().expect("row 0").meta.is_empty());
+        let row1 = parsed.get(1).expect("row 1");
+        assert_eq!(row1.meta.get("a"), Some(&"first".to_owned()));
+        assert_eq!(row1.meta.get("z"), Some(&"last".to_owned()));
+    }
+
+    #[test]
+    fn artifact_jsonl_line_round_trips_meta() {
+        let mut meta = BTreeMap::new();
+        meta.insert("k".to_owned(), "v".to_owned());
+        let artifact = Artifact {
+            id: "art_test".to_owned(),
+            project: "prj_test".to_owned(),
+            task: String::new(),
+            kind: "receipt".to_owned(),
+            reference: "https://example.com/pull/1".to_owned(),
+            label: "lbl".to_owned(),
+            linked_at: Utc::now(),
+            actor: "human:test".to_owned(),
+            meta,
+        };
+        let line = serde_json::to_string(&artifact).expect("serialize");
+        let parsed = parse_artifacts_jsonl(&line).expect("parse");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed.first().expect("row 0").meta, artifact.meta);
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests/common/proptest_artifact_meta_roundtrip.rs"]
+mod proptest_artifact_meta_roundtrip;

@@ -427,6 +427,7 @@ impl MeshService {
                 reference: args.reference,
                 label: args.label,
                 actor: args.actor,
+                meta: args.meta,
             })
             .await
             .map_err(store_err_to_invalid)?;

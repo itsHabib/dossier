@@ -96,6 +96,8 @@ A pointer to something concrete the work produced or depends on.
 | `ref`         | string                                                        | sha / url / path / run id           |
 | `label`       | string                                                        | short human-readable                |
 | `linked_at`   | timestamp                                                     |                                     |
+| `actor`       | string                                                        | who linked the row                  |
+| `meta`        | map string → string, optional                                 | flat denormalized summary; omitted when empty. Caps: ≤16 keys, key ≤64 bytes, value ≤512 bytes, ≤4 KiB total serialized. Unknown keys/values round-trip untouched. Immutable for an existing `(task, kind, ref)` — correction is via supersede (distinct `ref` + `meta.supersedes`), not mutation. |
 
 ## Slug scope
 
@@ -139,8 +141,8 @@ writes are idempotent on `(actor, request_id)` if `request_id` is supplied.
 
 ### Artifact
 
-- `artifact.link` — `{ project, task?, kind, ref, label }` → Artifact
-- `artifact.list` — `{ project?, task?, kind? }` → list of Artifact
+- `artifact.link` — `{ project, task?, kind, ref, label, meta?, actor }` → Artifact. Optional `meta` is a flat string map; cap violations return `invalid_params` naming the failing key. Re-link with the same `(task, kind, ref)` is idempotent when `meta` is byte-identical; differing `meta` is rejected (`"meta is immutable for an existing (task, kind, ref); supersede instead"`).
+- `artifact.list` — `{ project?, task?, kind? }` → list of Artifact (includes `meta` when present)
 
 ## Task state machine
 

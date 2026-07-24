@@ -4,11 +4,22 @@
 //! transition, validation, id minting, and phase-order helpers are pure
 //! functions both `FsStore` and future backends delegate to.
 
+use std::collections::BTreeMap;
+
 use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
+
+/// Maximum number of keys in an artifact `meta` map.
+pub const ARTIFACT_META_MAX_KEYS: usize = 16;
+/// Maximum UTF-8 byte length of a `meta` key.
+pub const ARTIFACT_META_MAX_KEY_LEN: usize = 64;
+/// Maximum UTF-8 byte length of a `meta` value.
+pub const ARTIFACT_META_MAX_VALUE_LEN: usize = 512;
+/// Maximum serialized JSON byte length of the entire `meta` object.
+pub const ARTIFACT_META_MAX_SERIALIZED_LEN: usize = 4096;
 
 /// Lifecycle status of a project (`planning` | `active` | `paused` | `done` | `abandoned`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -203,6 +214,8 @@ pub struct Artifact {
     pub label: String,
     pub linked_at: DateTime<Utc>,
     pub actor: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub meta: BTreeMap<String, String>,
 }
 
 /// Arguments for `task.get` — fetch one task by id without project context.
@@ -600,6 +613,7 @@ pub struct LinkArtifact {
     pub reference: String,
     pub label: String,
     pub actor: String,
+    pub meta: BTreeMap<String, String>,
 }
 
 // --- Pure policy (no `std::fs` / I/O) ---
@@ -627,6 +641,35 @@ pub fn compute_new_phase_order(phases: &[Phase], after_phase: Option<&str>) -> R
         .find(|p| p.slug == after_slug)
         .ok_or_else(|| anyhow::anyhow!("after_phase not found: {after_slug}"))?;
     Ok(after.order + 1)
+}
+
+/// Enforce artifact `meta` caps (key count, key/value length, total serialized size).
+/// Returns an error naming the failing key when a cap is exceeded.
+pub fn validate_artifact_meta(meta: &BTreeMap<String, String>) -> Result<()> {
+    if meta.is_empty() {
+        return Ok(());
+    }
+    if meta.len() > ARTIFACT_META_MAX_KEYS {
+        let key = meta
+            .iter()
+            .nth(ARTIFACT_META_MAX_KEYS)
+            .map_or("?", |(k, _)| k.as_str());
+        bail!("meta key count exceeds {ARTIFACT_META_MAX_KEYS}: {key}");
+    }
+    for (key, value) in meta {
+        if key.len() > ARTIFACT_META_MAX_KEY_LEN {
+            bail!("meta key exceeds {ARTIFACT_META_MAX_KEY_LEN} bytes: {key}");
+        }
+        if value.len() > ARTIFACT_META_MAX_VALUE_LEN {
+            bail!("meta value exceeds {ARTIFACT_META_MAX_VALUE_LEN} bytes: {key}");
+        }
+    }
+    let serialized = serde_json::to_string(meta)?;
+    if serialized.len() > ARTIFACT_META_MAX_SERIALIZED_LEN {
+        let key = meta.iter().last().map_or("?", |(k, _)| k.as_str());
+        bail!("meta serialized size exceeds {ARTIFACT_META_MAX_SERIALIZED_LEN} bytes: {key}");
+    }
+    Ok(())
 }
 
 /// Reject values that would break JSONL grep-ability or note-line parsing.

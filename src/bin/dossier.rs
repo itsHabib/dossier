@@ -373,6 +373,7 @@ async fn run_artifact_link(corpus: &Path, req: ArtifactLinkRequest) -> Result<()
             reference: req.reference,
             label,
             actor: default_actor(req.actor),
+            meta: std::collections::BTreeMap::new(),
         })
         .await
         .map_err(store_error_to_anyhow)?;
