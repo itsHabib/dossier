@@ -70,6 +70,9 @@ pub enum StoreError {
 #[derive(Debug, Clone, Default)]
 pub struct ArtifactListFilter {
     pub project: String,
+    /// exact-match filter on `Artifact::reference` (the canonical `ref`
+    /// value for the kind); `None` = no ref filtering.
+    pub reference: Option<String>,
 }
 
 /// Backend seam — async, object-safe, versioned reads and CAS writes.
@@ -295,7 +298,11 @@ impl Store for FsStore {
         &self,
         filter: ArtifactListFilter,
     ) -> Result<Vec<Artifact>, StoreError> {
-        Self::list_artifacts(self, &filter.project).map_err(store_invalid)
+        let mut artifacts = Self::list_artifacts(self, &filter.project).map_err(store_invalid)?;
+        if let Some(reference) = &filter.reference {
+            artifacts.retain(|a| a.reference == *reference);
+        }
+        Ok(artifacts)
     }
 
     async fn put_project(

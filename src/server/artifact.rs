@@ -28,6 +28,10 @@ pub struct ArtifactListArgs {
     /// if non-empty, only artifacts of this kind (commit, pr, file, url, run, doc)
     #[serde(default)]
     pub kind: String,
+    /// if non-empty, only artifacts whose ref exactly matches (canonical PR
+    /// URL, gate audit ref, etc.) — no substring/prefix matching
+    #[serde(default, rename = "ref")]
+    pub reference: String,
 }
 
 /// Response envelope for `artifact.list`.
@@ -140,6 +144,7 @@ impl MeshService {
             .store
             .list_artifacts(ArtifactListFilter {
                 project: args.project.clone(),
+                reference: None,
             })
             .await?;
         if let Some(artifact) = existing
@@ -276,6 +281,7 @@ mod tests {
             project: "corp".to_owned(),
             task: String::new(),
             kind: String::new(),
+            reference: String::new(),
         });
         all.sort_unstable();
         assert_eq!(all.len(), 3);
@@ -284,6 +290,7 @@ mod tests {
             project: "corp".to_owned(),
             task: tid1.clone(),
             kind: String::new(),
+            reference: String::new(),
         });
         hit.sort_unstable();
         assert_eq!(
@@ -300,10 +307,11 @@ mod tests {
             project: "corp".to_owned(),
             task: String::new(),
             kind: "pr".to_owned(),
+            reference: String::new(),
         });
         hit.sort_unstable();
         assert_eq!(hit, {
-            let mut v = vec![id_a1, id_a2];
+            let mut v = vec![id_a1.clone(), id_a2];
             v.sort_unstable();
             v
         },);
@@ -312,6 +320,7 @@ mod tests {
             project: "corp".to_owned(),
             task: tid1,
             kind: "commit".to_owned(),
+            reference: String::new(),
         });
         assert_eq!(hit, vec![id_a3]);
 
@@ -319,8 +328,48 @@ mod tests {
             project: "corp".to_owned(),
             task: "tsk_does_not_exist".to_owned(),
             kind: String::new(),
+            reference: String::new(),
         });
         assert!(hit.is_empty());
+
+        hit = ids!(ArtifactListArgs {
+            project: "corp".to_owned(),
+            task: String::new(),
+            kind: String::new(),
+            reference: "https://example/pr/1".to_owned(),
+        });
+        assert_eq!(hit, vec![id_a1.clone()], "ref filter hits exact match");
+
+        hit = ids!(ArtifactListArgs {
+            project: "corp".to_owned(),
+            task: String::new(),
+            kind: String::new(),
+            reference: "https://example/pr/does-not-exist".to_owned(),
+        });
+        assert!(hit.is_empty(), "ref filter misses non-matching ref");
+
+        hit = ids!(ArtifactListArgs {
+            project: "corp".to_owned(),
+            task: String::new(),
+            kind: "commit".to_owned(),
+            reference: "https://example/pr/1".to_owned(),
+        });
+        assert!(
+            hit.is_empty(),
+            "ref filter AND-composes with kind: pr's ref under a commit-kind filter is empty"
+        );
+
+        hit = ids!(ArtifactListArgs {
+            project: "corp".to_owned(),
+            task: String::new(),
+            kind: "pr".to_owned(),
+            reference: "https://example/pr/1".to_owned(),
+        });
+        assert_eq!(
+            hit,
+            vec![id_a1],
+            "ref filter AND-composes with kind: matching kind + ref both hit"
+        );
     }
 
     #[test]
@@ -525,6 +574,7 @@ mod tests {
                 project: "meta-proj".to_owned(),
                 task: String::new(),
                 kind: String::new(),
+                reference: String::new(),
             })))
             .expect("list");
         let got = listed
@@ -532,7 +582,20 @@ mod tests {
             .find(|a| a.id == linked.id)
             .expect("artifact present");
         assert_eq!(got.kind, "custom-kind");
-        assert_eq!(got.meta, meta);
+        assert_eq!(got.meta, meta, "meta must round-trip through artifact.list");
+
+        // ref exact-match also surfaces meta, confirming the two filters compose.
+        let Json(ArtifactListResult { artifacts: by_ref }) =
+            block_on(svc.artifact_list(Parameters(ArtifactListArgs {
+                project: "meta-proj".to_owned(),
+                task: String::new(),
+                kind: String::new(),
+                reference: "ref-1".to_owned(),
+            })))
+            .expect("list by ref");
+        assert_eq!(by_ref.len(), 1);
+        assert_eq!(by_ref[0].id, linked.id);
+        assert_eq!(by_ref[0].meta, meta);
     }
 
     #[test]
