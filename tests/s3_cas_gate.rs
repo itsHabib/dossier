@@ -293,6 +293,7 @@ async fn gate_scenario_11_4_mixed_workload() {
                     reference: format!("artref-{run}-{k}"),
                     label: format!("artref-{run}-{k}"),
                     actor: "linker".to_owned(),
+                    meta: std::collections::BTreeMap::new(),
                 })
                 .await
                 .is_ok()

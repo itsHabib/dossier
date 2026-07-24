@@ -1584,6 +1584,72 @@ created_by: human:michael
     }
 
     #[test]
+    fn list_artifacts_parses_meta_less_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".dossier")).unwrap();
+        fs::create_dir_all(dir.path().join("projects/dossier")).unwrap();
+        let line = concat!(
+            r#"{"id":"art_01HFG","project":"prj_01HFG","task":"","kind":"commit","#,
+            r#""ref":"abc","label":"old","linked_at":"2026-05-10T15:05:00Z","actor":"human:test"}"#
+        );
+        fs::write(dir.path().join("projects/dossier/artifacts.jsonl"), line).unwrap();
+        let store = FsStore::open(dir.path()).expect("open");
+        let arts = store.list_artifacts("dossier").expect("list");
+        assert_eq!(arts.len(), 1);
+        assert!(arts[0].meta.is_empty(), "missing meta defaults to empty");
+    }
+
+    #[tokio::test]
+    async fn put_artifact_meta_round_trips() {
+        use std::collections::BTreeMap;
+
+        let (tmp, store) = fresh_corpus();
+        let now = now_utc();
+        let project = Project {
+            id: new_id("prj"),
+            slug: "meta-fs".to_owned(),
+            title: "Meta FS".to_owned(),
+            description: String::new(),
+            status: ProjectStatus::Planning,
+            created_at: now,
+            updated_at: now,
+            created_by: "human:test".to_owned(),
+        };
+        store.put_project(&project, None).await.expect("project");
+
+        let mut meta = BTreeMap::new();
+        meta.insert("b".to_owned(), "two".to_owned());
+        meta.insert("a".to_owned(), "one".to_owned());
+        let artifact = Artifact {
+            id: new_id("art"),
+            project: project.id.clone(),
+            task: String::new(),
+            kind: "verdict".to_owned(),
+            reference: "gate://test".to_owned(),
+            label: "lbl".to_owned(),
+            linked_at: now,
+            actor: "human:test".to_owned(),
+            meta: meta.clone(),
+        };
+        store.put_artifact(&artifact).await.expect("put");
+        let listed = store.list_artifacts(&project.slug).expect("list");
+        let got = listed
+            .into_iter()
+            .find(|a| a.id == artifact.id)
+            .expect("found");
+        assert_eq!(got.meta, meta);
+
+        let path = tmp.path().join("projects/meta-fs/artifacts.jsonl");
+        let raw = fs::read_to_string(path).expect("read jsonl");
+        let line = raw.lines().next().expect("one line");
+        assert!(
+            line.contains(r#""meta":{"a":"one","b":"two"}"#),
+            "BTreeMap order in jsonl: {line}"
+        );
+        assert!(!line.contains(r#""meta":{}"#));
+    }
+
+    #[test]
     fn new_id_format() {
         let id = new_id("prj");
         let parts: Vec<&str> = id.splitn(2, '_').collect();
@@ -3386,3 +3452,7 @@ updated_at: 2026-05-10T14:30:00Z
 #[cfg(test)]
 #[path = "../tests/common/proptest_serialize_roundtrip.rs"]
 mod proptest_serialize_roundtrip;
+
+#[cfg(test)]
+#[path = "../tests/common/proptest_artifact_meta_fs.rs"]
+mod proptest_artifact_meta_fs;

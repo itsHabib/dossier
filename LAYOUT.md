@@ -135,8 +135,12 @@ with no body — files would be wasteful and noisy in git diffs.
 
 ```jsonl
 {"id":"art_01HFG...","project":"prj_01HFG...","task":"tsk_01HFG...","kind":"file","ref":"PROTOCOL.md","label":"v0 spec","linked_at":"2026-05-10T15:05:00Z","actor":"claude-code:michael"}
-{"id":"art_01HFG...","project":"prj_01HFG...","task":"tsk_01HFG...","kind":"commit","ref":"abc123","label":"initial spec commit","linked_at":"2026-05-10T15:06:00Z","actor":"claude-code:michael"}
+{"id":"art_01HFG...","project":"prj_01HFG...","task":"tsk_01HFG...","kind":"commit","ref":"abc123","label":"initial spec commit","linked_at":"2026-05-10T15:06:00Z","actor":"claude-code:michael","meta":{"pr":"42","outcome":"pass"}}
 ```
+
+Optional `meta` is a flat string map (`string → string`); omitted when empty so
+old meta-less rows parse unchanged. Keys sort deterministically in JSON
+(`BTreeMap` on write). Caps enforced at `artifact.link` time (see PROTOCOL.md).
 
 `kind` is one of `commit | pr | file | url | run | doc` (extensible — the
 protocol allows future kinds, the mesh accepts any string and round-trips

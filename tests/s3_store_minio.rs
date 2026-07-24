@@ -305,6 +305,7 @@ async fn artifact_roundtrip() {
         label: "test".to_owned(),
         linked_at: Utc::now(),
         actor: "human:test".to_owned(),
+        meta: std::collections::BTreeMap::new(),
     };
     store.put_artifact(&artifact).await.expect("put artifact");
     let listed = store
