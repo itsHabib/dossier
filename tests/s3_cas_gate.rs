@@ -370,6 +370,7 @@ async fn gate_scenario_11_4_mixed_workload() {
         let arts = store
             .list_artifacts(ArtifactListFilter {
                 project: project.clone(),
+                reference: None,
             })
             .await
             .expect("list artifacts");

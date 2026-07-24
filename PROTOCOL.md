@@ -142,7 +142,7 @@ writes are idempotent on `(actor, request_id)` if `request_id` is supplied.
 ### Artifact
 
 - `artifact.link` — `{ project, task?, kind, ref, label, meta?, actor }` → Artifact. Optional `meta` is a flat string map; cap violations return `invalid_params` naming the failing key. Re-link with the same `(task, kind, ref)` is idempotent when `meta` is byte-identical; differing `meta` is rejected (`"meta is immutable for an existing (task, kind, ref); supersede instead"`).
-- `artifact.list` — `{ project?, task?, kind? }` → list of Artifact (includes `meta` when present)
+- `artifact.list` — `{ project?, task?, kind?, ref? }` → list of Artifact (includes `meta` when present). `ref` is an exact-match filter on the canonical ref (no substring/prefix matching) and AND-composes with `task`/`kind`; absent `ref` = no ref filtering.
 
 ## Task state machine
 

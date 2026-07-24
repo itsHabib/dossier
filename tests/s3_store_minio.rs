@@ -311,10 +311,86 @@ async fn artifact_roundtrip() {
     let listed = store
         .list_artifacts(dossier::store::ArtifactListFilter {
             project: project.slug.clone(),
+            reference: None,
         })
         .await
         .expect("list artifacts");
     assert!(listed.iter().any(|a| a.id == artifact.id));
+}
+
+#[tokio::test]
+async fn artifact_list_ref_filter_hit_miss_absent_unfiltered() {
+    let Some((store, _cfg)) = test_store().await else {
+        return;
+    };
+    let project = sample_project("artifact-ref-filter");
+    store
+        .put_project(&project, None)
+        .await
+        .expect("create project");
+
+    let pr_artifact = Artifact {
+        id: format!("art_{}", Ulid::new()),
+        project: project.id.clone(),
+        task: String::new(),
+        kind: "pr".to_owned(),
+        reference: "https://example/pr/1".to_owned(),
+        label: "pr".to_owned(),
+        linked_at: Utc::now(),
+        actor: "human:test".to_owned(),
+        meta: std::collections::BTreeMap::new(),
+    };
+    store
+        .put_artifact(&pr_artifact)
+        .await
+        .expect("put pr artifact");
+
+    let commit_artifact = Artifact {
+        id: format!("art_{}", Ulid::new()),
+        project: project.id.clone(),
+        task: String::new(),
+        kind: "commit".to_owned(),
+        reference: "deadbeef".to_owned(),
+        label: "commit".to_owned(),
+        linked_at: Utc::now(),
+        actor: "human:test".to_owned(),
+        meta: std::collections::BTreeMap::new(),
+    };
+    store
+        .put_artifact(&commit_artifact)
+        .await
+        .expect("put commit artifact");
+
+    // hit: ref matches exactly one row.
+    let hit = store
+        .list_artifacts(dossier::store::ArtifactListFilter {
+            project: project.slug.clone(),
+            reference: Some("https://example/pr/1".to_owned()),
+        })
+        .await
+        .expect("list by ref");
+    assert_eq!(hit.len(), 1);
+    assert_eq!(hit[0].id, pr_artifact.id);
+
+    // miss: ref matches nothing.
+    let miss = store
+        .list_artifacts(dossier::store::ArtifactListFilter {
+            project: project.slug.clone(),
+            reference: Some("https://example/pr/does-not-exist".to_owned()),
+        })
+        .await
+        .expect("list by missing ref");
+    assert!(miss.is_empty());
+
+    // absent ref = no filtering (today's behavior unchanged).
+    let all = store
+        .list_artifacts(dossier::store::ArtifactListFilter {
+            project: project.slug.clone(),
+            reference: None,
+        })
+        .await
+        .expect("list all");
+    assert_eq!(all.len(), 2);
 }
 
 #[tokio::test]

@@ -189,6 +189,7 @@ impl MeshService {
             .store
             .list_artifacts(ArtifactListFilter {
                 project: args.slug.clone(),
+                reference: None,
             })
             .await
             .map_err(store_err)?;
@@ -244,6 +245,7 @@ impl MeshService {
             .store
             .list_artifacts(ArtifactListFilter {
                 project: args.slug.clone(),
+                reference: None,
             })
             .await
             .map_err(store_err)?
@@ -495,16 +497,18 @@ impl MeshService {
 
     #[tool(
         name = "artifact.list",
-        description = "List the artifacts linked to a project (commits, PRs, files, URLs, runs, docs)."
+        description = "List the artifacts linked to a project (commits, PRs, files, URLs, runs, docs). Optional `task`/`kind`/`ref` filters AND-compose; `ref` is an exact match on the canonical ref (no substring/prefix matching)."
     )]
     async fn artifact_list(
         &self,
         Parameters(args): Parameters<ArtifactListArgs>,
     ) -> Result<Json<ArtifactListResult>, ErrorData> {
+        let reference = (!args.reference.is_empty()).then(|| args.reference.clone());
         let all = self
             .store
             .list_artifacts(ArtifactListFilter {
                 project: args.project.clone(),
+                reference,
             })
             .await
             .map_err(store_err)?;

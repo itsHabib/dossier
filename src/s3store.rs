@@ -567,7 +567,11 @@ impl Store for S3Store {
         &self,
         filter: ArtifactListFilter,
     ) -> Result<Vec<Artifact>, StoreError> {
-        self.read_artifacts(&filter.project).await
+        let mut artifacts = self.read_artifacts(&filter.project).await?;
+        if let Some(reference) = &filter.reference {
+            artifacts.retain(|a| a.reference == *reference);
+        }
+        Ok(artifacts)
     }
 
     async fn put_project(
