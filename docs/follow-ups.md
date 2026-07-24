@@ -26,3 +26,12 @@ deleted (commit history is the record).
   idempotency key for link identity, or CAS a small index. (`artifact.link` isn't shipped yet
   — capture before it lands sharded.) (codex, [PR #59](https://github.com/itsHabib/dossier/pull/59))
 
+
+## state-substrate
+
+- **`artifact.get` (fetch by `art_` id).** The `verdict`/`receipt` FK is `meta.verdict` = an
+  `art_` id, but `artifact.list` filters only `project`/`task`/`kind`/`ref` — there is no
+  by-id fetch, so resolving the FK means listing verdicts for the anchor and matching the id
+  (or `meta.pr`). Works, but the §7.2 "fast path → the verdict directly" only becomes literal
+  one-hop with a small `artifact.get { project, id }` verb. Low priority — surfaced by the
+  Phase B dogfood read; the `meta.pr` join covers the need today. (state-substrate Phase B)

@@ -159,7 +159,10 @@ Rust surface (`src/domain.rs`): `Artifact.meta: BTreeMap<String, String>` with `
 ```
 1. artifact.list { project, kind: "receipt", ref: <canonical PR URL> }   → merge receipt
 2. receipt → verdict, two joins (the second is the fallback for an unenforced FK):
-   FAST PATH:  receipt.meta.verdict (an art_ id) → the verdict artifact directly.
+   FAST PATH:  receipt.meta.verdict (an art_ id) names the verdict; resolve it by
+               listing verdicts for the same anchor and matching the id —
+               artifact.list has no by-id fetch (a future artifact.get would
+               collapse this to one hop).
    FALLBACK:   when meta.verdict is missing or dangles (it is a hand-maintained
                foreign key with no referential integrity), join on the shared task
                anchor: artifact.list { project, task: <receipt.task>, kind: "verdict" },

@@ -119,11 +119,22 @@ ways:
 | kind      | canonical `ref` form                                                | notes |
 |-----------|-----------------------------------------------------------------------|-------|
 | `receipt` | the canonical GitHub PR URL: `https://github.com/<owner>/<repo>/pull/<n>` | no trailing slash, no `.git`, lowercase host |
-| `verdict` | the gate audit ref, e.g. `gate://<repo>/pr/<n>/<dec_id>`              | gate's opaque decision identifier, stable per decision |
+| `verdict` | the gate audit ref, e.g. `gate://<repo>/pr/<n>/<gate_run_id>`         | gate's opaque per-evaluation id — a `run_…` id today (not `dec_…`); `<repo>` is the short repo name gate emits (`dossier`), stable per decision |
 
-Readers that don't want to depend on exact `ref` formatting can instead join
-on the task anchor + `kind` + `meta.pr` — the `ref` exact-match is the fast
-path, the task+`meta.pr` join is the format-independent fallback.
+**Starting from just a PR number.** You will usually hold only "PR #N", not
+the full canonical URL, the `owner/repo` slug, or the task id. The exact-`ref`
+lookup needs the full URL and the task-anchor join needs the task id, so
+neither is the entry point. The format-independent entry is: list the project's
+rows of the kind you want and filter client-side on `meta.pr` —
+`artifact.list { project, kind: "receipt" }` then keep the row whose
+`meta.pr == "N"`. From that receipt, `meta.verdict` (an `art_` id) names the
+authorizing verdict. There is no by-id fetch (`artifact.list` filters only
+`project`/`task`/`kind`/`ref`), so resolve that pointer by listing verdicts for
+the same anchor — `artifact.list { project, task, kind: "verdict" }`, or
+project-wide when the row has no task — and matching on the `art_` id (or,
+equivalently, on `meta.pr`). The exact-`ref` match is the fast path *once you
+have the URL*; the `meta.pr` filter is the format-independent one that always
+works.
 
 ### `meta` key conventions per kind
 
@@ -137,14 +148,14 @@ are both attributable.
 
 | kind      | `meta` keys                                                                 |
 |-----------|-------------------------------------------------------------------------------|
-| `verdict` | `source` (`gate` \| `review-coordinator` \| …), `outcome` (emitter's vocabulary), `pr`, `head_sha`, `grant` (`grt_` id, when one applied), `tier` |
+| `verdict` | `source` (`gate` \| `review-coordinator` \| …), `outcome` (emitter's vocabulary, e.g. gate's `pass` \| `blocked` \| `parked` \| `refused`), `pr`, `head_sha`, `grant` (`grt_` id, when one applied), `tier` (emitter's vocabulary — gate emits `T0`–`T3`, *not* a bare `0`–`3`) |
 | `receipt` | `event` (`merge` \| `close-out` \| …), `pr`, `merge_sha`, `verdict` (the `art_` id of the authorizing verdict), `supersedes` (`art_` id, when this row corrects an earlier immutable one) |
 | `run`     | `engine`, `run` (ship run id), `judgment` — existing kind, meta convention enriched here |
 
 Example rows (append-only `artifacts.jsonl`, one line each):
 
 ```jsonl
-{"id":"art_01K…","project":"prj_01KRSZ…","task":"tsk_01K…","kind":"verdict","ref":"gate://dossier/pr/93/dec_01K…","label":"gate pass PR #93","linked_at":"2026-07-23T18:00:00Z","actor":"claude-code:michael","meta":{"source":"gate","outcome":"pass","pr":"93","head_sha":"872b472","grant":"grt_01K…","tier":"2"}}
+{"id":"art_01K…","project":"prj_01KRSZ…","task":"tsk_01K…","kind":"verdict","ref":"gate://dossier/pr/93/run_9ce4b19af24974c5","label":"gate pass PR #93","linked_at":"2026-07-23T18:00:00Z","actor":"claude-code:michael","meta":{"source":"gate","outcome":"pass","pr":"93","head_sha":"872b472","grant":"grt_01K…","tier":"T1"}}
 {"id":"art_01K…","project":"prj_01KRSZ…","task":"tsk_01K…","kind":"receipt","ref":"https://github.com/itsHabib/dossier/pull/93","label":"merged PR #93","linked_at":"2026-07-23T18:05:00Z","actor":"claude-code:michael","meta":{"event":"merge","pr":"93","merge_sha":"a1b2c3d","verdict":"art_01K…"}}
 ```
 
