@@ -23,6 +23,19 @@ runtime-guarded, atomic writes route through helpers, slug validation
 is enforced on every create path. List verbs are live-by-default (see
 [docs/vision.md](docs/vision.md)).
 
+The **verdict/receipt substrate** (state-substrate TDD, Phase A) is live:
+`Artifact` carries an optional flat `meta` map (caps enforced, immutable
+per `(task, kind, ref)` — correct via supersede, not mutation);
+`verdict` and `receipt` are well-known `kind`s with documented canonical
+`ref` forms and `meta`-key conventions (PROTOCOL.md); `artifact.list`
+filters on `ref`. This is the substrate `/wip`, `/shipped`, and flare
+join against instead of each reaching into gate's audit chain or ship's
+ledger directly — see PROTOCOL.md's "Artifact kind conventions" and
+LAYOUT.md's `artifacts.jsonl` section for the exact shapes. Emitting is
+still by convention (skills call `artifact.link` at close-out);
+auto-wiring the driver loop to write these automatically is a separate,
+not-yet-built initiative (Phase D of the TDD).
+
 What's not here yet: auto-wiring writes into the ship/driver loop (so
 merges/close-outs update the corpus without a human remembering to);
 richer retrieval (indexing the `## Notes` journal, a cross-corpus
