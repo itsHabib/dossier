@@ -410,6 +410,93 @@ fn cli_json_matches_store_for_write_verbs() {
 }
 
 #[test]
+fn cli_artifact_list_filters_match_store() {
+    let (tmp, svc) = fresh_service();
+    let store = FsStore::open(tmp.path()).expect("reopen for reads");
+    seed_project(&svc, "alpha");
+
+    // Seed two artifacts of different kinds + refs via the CLI write verb.
+    for (kind, reference) in [
+        ("pr", "https://example/pr/1"),
+        ("verdict", "gate://alpha/pr/1/run_abc"),
+    ] {
+        let (code, _, stderr) = run_cli(
+            tmp.path(),
+            &[
+                "artifact_link",
+                "--project",
+                "alpha",
+                "--kind",
+                kind,
+                "--ref",
+                reference,
+                "--label",
+                "seed",
+                "--actor",
+                "cli:test",
+            ],
+        );
+        assert_eq!(code, 0, "stderr: {stderr}");
+    }
+
+    // No filter → all rows, byte-for-byte parity with the store read.
+    let (code, stdout, stderr) = run_cli(tmp.path(), &["artifact_list", "--project", "alpha"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let cli_all: Vec<Value> = parse_json(&stdout);
+    let store_all = store.list_artifacts("alpha").expect("store list");
+    assert_eq!(cli_all.len(), 2);
+    assert_eq!(cli_all.len(), store_all.len());
+    assert_eq!(
+        serde_json::to_value(&store_all).expect("store json"),
+        Value::Array(cli_all),
+        "cli read matches the store"
+    );
+
+    // kind filter.
+    let (code, stdout, _) = run_cli(
+        tmp.path(),
+        &["artifact_list", "--project", "alpha", "--kind", "verdict"],
+    );
+    assert_eq!(code, 0);
+    let cli_verdict: Vec<Value> = parse_json(&stdout);
+    assert_eq!(cli_verdict.len(), 1);
+    assert_eq!(cli_verdict[0]["kind"], Value::String("verdict".to_owned()));
+
+    // ref filter is exact-match.
+    let (code, stdout, _) = run_cli(
+        tmp.path(),
+        &[
+            "artifact_list",
+            "--project",
+            "alpha",
+            "--ref",
+            "https://example/pr/1",
+        ],
+    );
+    assert_eq!(code, 0);
+    let cli_ref: Vec<Value> = parse_json(&stdout);
+    assert_eq!(cli_ref.len(), 1);
+    assert_eq!(cli_ref[0]["kind"], Value::String("pr".to_owned()));
+
+    // kind AND ref that don't co-occur → empty (AND-composition).
+    let (code, stdout, _) = run_cli(
+        tmp.path(),
+        &[
+            "artifact_list",
+            "--project",
+            "alpha",
+            "--kind",
+            "verdict",
+            "--ref",
+            "https://example/pr/1",
+        ],
+    );
+    assert_eq!(code, 0);
+    let cli_none: Vec<Value> = parse_json(&stdout);
+    assert!(cli_none.is_empty(), "kind+ref AND-compose to empty");
+}
+
+#[test]
 fn cli_task_list_rejects_phase_without_project() {
     let (tmp, _store) = common::fresh_corpus();
     let (code, _, stderr) = run_cli(tmp.path(), &["task_list", "--phase", "integration-layer"]);
