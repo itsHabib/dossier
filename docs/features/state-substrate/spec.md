@@ -91,7 +91,7 @@ Nothing new structurally: the Artifact primitive, `artifacts.jsonl`, and the two
 **Canonical `ref` form per kind** (the `ref` filter is exact-match — §6 — so the form must be pinned, not spelled three ways). PROTOCOL.md fixes one canonical `ref` per well-known kind:
 
 - `kind: receipt` — `ref` = the canonical GitHub PR URL `https://github.com/<owner>/<repo>/pull/<n>` (no trailing slash, no `.git`, lowercase host). This is the form `artifact.list { ref }` matches.
-- `kind: verdict` — `ref` = the gate audit ref (gate's opaque decision identifier, e.g. `gate://<repo>/pr/<n>/<dec_id>`), stable per decision.
+- `kind: verdict` — `ref` = the gate audit ref (gate's opaque per-evaluation id, a `run_…` id today, e.g. `gate://<repo>/pr/<n>/<gate_run_id>`), stable per decision.
 - Readers that don't want to depend on exact `ref` formatting can instead join on the task anchor + `kind` + `meta.pr` (§7.2) — `ref` exact-match is the fast path, the task+`meta.pr` join is the format-independent fallback.
 
 **Documented meta-key conventions** (conventions, not schema — unknown keys pass through; PROTOCOL.md carries this table). `actor` records *who linked the row* (the close-out caller); *who decided* is `meta.source` — the two are kept distinct so a skill-driven close-out and the gate that produced the verdict are both attributable:
@@ -103,7 +103,7 @@ Nothing new structurally: the Artifact primitive, `artifacts.jsonl`, and the two
 **Example rows** (append-only `artifacts.jsonl`, one line each):
 
 ```jsonl
-{"id":"art_01K…","project":"prj_01KRSZ…","task":"tsk_01K…","kind":"verdict","ref":"gate://dossier/pr/93/dec_01K…","label":"gate pass PR #93","linked_at":"2026-07-23T18:00:00Z","actor":"claude-code:michael","meta":{"source":"gate","outcome":"pass","pr":"93","head_sha":"872b472","grant":"grt_01K…","tier":"2"}}
+{"id":"art_01K…","project":"prj_01KRSZ…","task":"tsk_01K…","kind":"verdict","ref":"gate://dossier/pr/93/run_9ce4b19af24974c5","label":"gate pass PR #93","linked_at":"2026-07-23T18:00:00Z","actor":"claude-code:michael","meta":{"source":"gate","outcome":"pass","pr":"93","head_sha":"872b472","grant":"grt_01K…","tier":"T1"}}
 {"id":"art_01K…","project":"prj_01KRSZ…","task":"tsk_01K…","kind":"receipt","ref":"https://github.com/itsHabib/dossier/pull/93","label":"merged PR #93","linked_at":"2026-07-23T18:05:00Z","actor":"claude-code:michael","meta":{"event":"merge","pr":"93","merge_sha":"a1b2c3d","verdict":"art_01K…"}}
 ```
 
@@ -170,9 +170,14 @@ Rust surface (`src/domain.rs`): `Artifact.meta: BTreeMap<String, String>` with `
 3. verdict.meta: outcome, head_sha, grant, tier — the summary answer
 4. full record: follow verdict.ref into gate's audit chain (one hop, by design — D1)
 ```
-The `meta.verdict` FK is an *optimization*, not load-bearing: it saves a list call when
-present and correct, but the task+`meta.pr` join always answers, so a wrong or missing FK
-(including one written before the immutability rule, §7.4) degrades to slower, not broken.
+The `meta.verdict` FK is the **disambiguator**, not a shortcut: until `artifact.get`
+exists both the FK path and the fallback list verdicts, so the FK saves no list call —
+what it provides is *which* verdict authorized the merge when a PR had several evaluations
+(`meta.pr` alone can't tell an earlier `blocked` from the later `pass`). When the FK is
+missing or dangles (including a row written before the immutability rule, §7.4), fall back
+to the task anchor + `meta.pr`, then take the authorizing (`pass`) survivor after the
+supersede reader rule — degraded (ambiguous only if multiple live evaluations remain), not
+broken.
 
 ### 7.3 Read — `/shipped` / `/wip` / flare
 One `artifact.list { project, kind: "receipt" }` (or `verdict`) per project instead of joining ship's ledger + gate's audit + GitHub. Task anchoring gives the join to phases via the task's `phase` field.

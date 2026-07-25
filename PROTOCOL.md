@@ -124,17 +124,18 @@ ways:
 **Starting from just a PR number.** You will usually hold only "PR #N", not
 the full canonical URL, the `owner/repo` slug, or the task id. The exact-`ref`
 lookup needs the full URL and the task-anchor join needs the task id, so
-neither is the entry point. The format-independent entry is: list the project's
-rows of the kind you want and filter client-side on `meta.pr` —
-`artifact.list { project, kind: "receipt" }` then keep the row whose
-`meta.pr == "N"`. From that receipt, `meta.verdict` (an `art_` id) names the
-authorizing verdict. There is no by-id fetch (`artifact.list` filters only
-`project`/`task`/`kind`/`ref`), so resolve that pointer by listing verdicts for
-the same anchor — `artifact.list { project, task, kind: "verdict" }`, or
-project-wide when the row has no task — and matching on the `art_` id (or,
-equivalently, on `meta.pr`). The exact-`ref` match is the fast path *once you
-have the URL*; the `meta.pr` filter is the format-independent one that always
-works.
+neither is the entry point. The format-independent entry is:
+`artifact.list { project, kind: "receipt" }`, keep the rows whose
+`meta.pr == "N"`, and apply the supersede reader rule (drop any row named by a
+later row's `meta.supersedes`) to take the surviving receipt. From that receipt,
+`meta.verdict` (an `art_` id) names the authorizing verdict. There is no by-id
+fetch (`artifact.list` filters only `project`/`task`/`kind`/`ref`), so resolve
+that pointer by listing verdicts for the same anchor —
+`artifact.list { project, task, kind: "verdict" }`, or project-wide when the row
+has no task — and matching the **exact `art_` id**. Match the id, *not* `meta.pr`:
+a PR with several gate evaluations yields several verdicts sharing one `meta.pr`
+(e.g. an earlier `blocked` and a later `pass`), and only the receipt's
+`meta.verdict` names the one that authorized the merge.
 
 ### `meta` key conventions per kind
 

@@ -31,7 +31,8 @@ deleted (commit history is the record).
 
 - **`artifact.get` (fetch by `art_` id).** The `verdict`/`receipt` FK is `meta.verdict` = an
   `art_` id, but `artifact.list` filters only `project`/`task`/`kind`/`ref` — there is no
-  by-id fetch, so resolving the FK means listing verdicts for the anchor and matching the id
-  (or `meta.pr`). Works, but the §7.2 "fast path → the verdict directly" only becomes literal
+  by-id fetch, so resolving the FK means listing verdicts for the anchor and matching the
+  exact `art_` id (not `meta.pr` — a PR with several evaluations has several verdicts sharing
+  one `meta.pr`). Works, but the §7.2 "fast path → the verdict directly" only becomes literal
   one-hop with a small `artifact.get { project, id }` verb. Low priority — surfaced by the
   Phase B dogfood read; the `meta.pr` join covers the need today. (state-substrate Phase B)
