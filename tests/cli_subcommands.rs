@@ -494,6 +494,19 @@ fn cli_artifact_list_filters_match_store() {
     assert_eq!(code, 0);
     let cli_none: Vec<Value> = parse_json(&stdout);
     assert!(cli_none.is_empty(), "kind+ref AND-compose to empty");
+
+    // Empty flag values (a shell-expanded unset var → Clap `Some("")`) are
+    // treated as "no filter", matching the MCP handler — not as a filter for an
+    // impossible empty kind, nor (for --task "") as project-wide-only.
+    for flag in ["--kind", "--task", "--ref"] {
+        let (code, stdout, stderr) = run_cli(
+            tmp.path(),
+            &["artifact_list", "--project", "alpha", flag, ""],
+        );
+        assert_eq!(code, 0, "stderr: {stderr}");
+        let cli_empty: Vec<Value> = parse_json(&stdout);
+        assert_eq!(cli_empty.len(), 2, "empty {flag} is treated as no filter");
+    }
 }
 
 #[test]

@@ -478,14 +478,18 @@ fn run_artifact_list(corpus: &Path, req: ArtifactListRequest) -> Result<()> {
     } = req;
     let store = FsStore::open(corpus)?;
     let mut artifacts = store.list_artifacts(&project)?;
-    if let Some(reference) = &reference {
-        artifacts.retain(|a| a.reference == *reference);
+    // Treat an empty flag value (Clap yields `Some("")` when a shell expands an
+    // unset var, e.g. `--kind "$KIND"`) as "no filter", matching MCP
+    // `artifact.list`, which skips empty task/kind/ref rather than filtering on
+    // the empty string.
+    if let Some(reference) = reference.filter(|value| !value.is_empty()) {
+        artifacts.retain(|a| a.reference == reference);
     }
-    if let Some(task) = &task {
-        artifacts.retain(|a| a.task == *task);
+    if let Some(task) = task.filter(|value| !value.is_empty()) {
+        artifacts.retain(|a| a.task == task);
     }
-    if let Some(kind) = &kind {
-        artifacts.retain(|a| a.kind == *kind);
+    if let Some(kind) = kind.filter(|value| !value.is_empty()) {
+        artifacts.retain(|a| a.kind == kind);
     }
     emit_json(&artifacts)
 }
