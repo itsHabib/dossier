@@ -91,7 +91,7 @@ Nothing new structurally: the Artifact primitive, `artifacts.jsonl`, and the two
 **Canonical `ref` form per kind** (the `ref` filter is exact-match — §6 — so the form must be pinned, not spelled three ways). PROTOCOL.md fixes one canonical `ref` per well-known kind:
 
 - `kind: receipt` — `ref` = the canonical GitHub PR URL `https://github.com/<owner>/<repo>/pull/<n>` (no trailing slash, no `.git`, lowercase host). This is the form `artifact.list { ref }` matches.
-- `kind: verdict` — `ref` = the gate audit ref (gate's opaque decision identifier, e.g. `gate://<repo>/pr/<n>/<dec_id>`), stable per decision.
+- `kind: verdict` — `ref` = the gate audit ref (gate's opaque per-evaluation id, a `run_…` id today, e.g. `gate://<repo>/pr/<n>/<gate_run_id>`), stable per decision.
 - Readers that don't want to depend on exact `ref` formatting can instead join on the task anchor + `kind` + `meta.pr` (§7.2) — `ref` exact-match is the fast path, the task+`meta.pr` join is the format-independent fallback.
 
 **Documented meta-key conventions** (conventions, not schema — unknown keys pass through; PROTOCOL.md carries this table). `actor` records *who linked the row* (the close-out caller); *who decided* is `meta.source` — the two are kept distinct so a skill-driven close-out and the gate that produced the verdict are both attributable:
@@ -103,7 +103,7 @@ Nothing new structurally: the Artifact primitive, `artifacts.jsonl`, and the two
 **Example rows** (append-only `artifacts.jsonl`, one line each):
 
 ```jsonl
-{"id":"art_01K…","project":"prj_01KRSZ…","task":"tsk_01K…","kind":"verdict","ref":"gate://dossier/pr/93/dec_01K…","label":"gate pass PR #93","linked_at":"2026-07-23T18:00:00Z","actor":"claude-code:michael","meta":{"source":"gate","outcome":"pass","pr":"93","head_sha":"872b472","grant":"grt_01K…","tier":"2"}}
+{"id":"art_01K…","project":"prj_01KRSZ…","task":"tsk_01K…","kind":"verdict","ref":"gate://dossier/pr/93/run_9ce4b19af24974c5","label":"gate pass PR #93","linked_at":"2026-07-23T18:00:00Z","actor":"claude-code:michael","meta":{"source":"gate","outcome":"pass","pr":"93","head_sha":"872b472","grant":"grt_01K…","tier":"T1"}}
 {"id":"art_01K…","project":"prj_01KRSZ…","task":"tsk_01K…","kind":"receipt","ref":"https://github.com/itsHabib/dossier/pull/93","label":"merged PR #93","linked_at":"2026-07-23T18:05:00Z","actor":"claude-code:michael","meta":{"event":"merge","pr":"93","merge_sha":"a1b2c3d","verdict":"art_01K…"}}
 ```
 
@@ -159,7 +159,10 @@ Rust surface (`src/domain.rs`): `Artifact.meta: BTreeMap<String, String>` with `
 ```
 1. artifact.list { project, kind: "receipt", ref: <canonical PR URL> }   → merge receipt
 2. receipt → verdict, two joins (the second is the fallback for an unenforced FK):
-   FAST PATH:  receipt.meta.verdict (an art_ id) → the verdict artifact directly.
+   FAST PATH:  receipt.meta.verdict (an art_ id) names the verdict; resolve it by
+               listing verdicts for the same anchor and matching the id —
+               artifact.list has no by-id fetch (a future artifact.get would
+               collapse this to one hop).
    FALLBACK:   when meta.verdict is missing or dangles (it is a hand-maintained
                foreign key with no referential integrity), join on the shared task
                anchor: artifact.list { project, task: <receipt.task>, kind: "verdict" },
@@ -167,9 +170,18 @@ Rust surface (`src/domain.rs`): `Artifact.meta: BTreeMap<String, String>` with `
 3. verdict.meta: outcome, head_sha, grant, tier — the summary answer
 4. full record: follow verdict.ref into gate's audit chain (one hop, by design — D1)
 ```
-The `meta.verdict` FK is an *optimization*, not load-bearing: it saves a list call when
-present and correct, but the task+`meta.pr` join always answers, so a wrong or missing FK
-(including one written before the immutability rule, §7.4) degrades to slower, not broken.
+The `meta.verdict` FK is the **disambiguator**, not a shortcut: until `artifact.get`
+exists both the FK path and the fallback list verdicts, so the FK saves no list call —
+what it provides is *which* verdict authorized the merge when a PR had several evaluations
+(`meta.pr` alone can't tell an earlier `blocked` from the later `pass`). When the FK is
+missing or dangles (including a row written before the immutability rule, §7.4), fall back
+to the task anchor + `meta.pr` and apply the supersede reader rule. If that leaves a single
+live verdict, it's the answer. If it leaves **several live `pass` verdicts** — independent
+evaluations of the same head, none superseding another — the authorizing verdict is
+**unresolvable from the substrate alone** (nothing left to distinguish them); recover it
+from the authoritative gate record via the `ref` hop rather than picking one arbitrarily.
+A correctly-written `meta.verdict` FK exists precisely so this case never arises — it, not
+`meta.pr`, is the definitive identifier.
 
 ### 7.3 Read — `/shipped` / `/wip` / flare
 One `artifact.list { project, kind: "receipt" }` (or `verdict`) per project instead of joining ship's ledger + gate's audit + GitHub. Task anchoring gives the join to phases via the task's `phase` field.

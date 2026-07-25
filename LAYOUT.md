@@ -136,7 +136,7 @@ with no body — files would be wasteful and noisy in git diffs.
 ```jsonl
 {"id":"art_01HFG...","project":"prj_01HFG...","task":"tsk_01HFG...","kind":"file","ref":"PROTOCOL.md","label":"v0 spec","linked_at":"2026-05-10T15:05:00Z","actor":"claude-code:michael"}
 {"id":"art_01HFG...","project":"prj_01HFG...","task":"tsk_01HFG...","kind":"commit","ref":"abc123","label":"initial spec commit","linked_at":"2026-05-10T15:06:00Z","actor":"claude-code:michael","meta":{"pr":"42","outcome":"pass"}}
-{"id":"art_01K…","project":"prj_01KRSZ…","task":"tsk_01K…","kind":"verdict","ref":"gate://dossier/pr/93/dec_01K…","label":"gate pass PR #93","linked_at":"2026-07-23T18:00:00Z","actor":"claude-code:michael","meta":{"source":"gate","outcome":"pass","pr":"93","head_sha":"872b472","grant":"grt_01K…","tier":"2"}}
+{"id":"art_01K…","project":"prj_01KRSZ…","task":"tsk_01K…","kind":"verdict","ref":"gate://dossier/pr/93/run_9ce4b19af24974c5","label":"gate pass PR #93","linked_at":"2026-07-23T18:00:00Z","actor":"claude-code:michael","meta":{"source":"gate","outcome":"pass","pr":"93","head_sha":"872b472","grant":"grt_01K…","tier":"T1"}}
 {"id":"art_01K…","project":"prj_01KRSZ…","task":"tsk_01K…","kind":"receipt","ref":"https://github.com/itsHabib/dossier/pull/93","label":"merged PR #93","linked_at":"2026-07-23T18:05:00Z","actor":"claude-code:michael","meta":{"event":"merge","pr":"93","merge_sha":"a1b2c3d","verdict":"art_01K…"}}
 ```
 
