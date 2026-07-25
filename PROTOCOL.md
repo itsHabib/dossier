@@ -125,9 +125,11 @@ ways:
 the full canonical URL, the `owner/repo` slug, or the task id. The exact-`ref`
 lookup needs the full URL and the task-anchor join needs the task id, so
 neither is the entry point. The format-independent entry is:
-`artifact.list { project, kind: "receipt" }`, keep the rows whose
-`meta.pr == "N"`, and apply the supersede reader rule (drop any row named by a
-later row's `meta.supersedes`) to take the surviving receipt. From that receipt,
+`artifact.list { project, kind: "receipt" }`, apply the supersede reader rule
+**first** — drop any row named by a later row's `meta.supersedes`, across the
+whole set, since a supersede may correct `meta.pr` itself and filtering by `pr`
+first would never see the replacement — **then** keep the surviving row whose
+`meta.pr == "N"`. From that receipt,
 `meta.verdict` (an `art_` id) names the authorizing verdict. There is no by-id
 fetch (`artifact.list` filters only `project`/`task`/`kind`/`ref`), so resolve
 that pointer by listing verdicts for the same anchor —
