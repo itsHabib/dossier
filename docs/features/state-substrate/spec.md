@@ -175,9 +175,13 @@ exists both the FK path and the fallback list verdicts, so the FK saves no list 
 what it provides is *which* verdict authorized the merge when a PR had several evaluations
 (`meta.pr` alone can't tell an earlier `blocked` from the later `pass`). When the FK is
 missing or dangles (including a row written before the immutability rule, §7.4), fall back
-to the task anchor + `meta.pr`, then take the authorizing (`pass`) survivor after the
-supersede reader rule — degraded (ambiguous only if multiple live evaluations remain), not
-broken.
+to the task anchor + `meta.pr` and apply the supersede reader rule. If that leaves a single
+live verdict, it's the answer. If it leaves **several live `pass` verdicts** — independent
+evaluations of the same head, none superseding another — the authorizing verdict is
+**unresolvable from the substrate alone** (nothing left to distinguish them); recover it
+from the authoritative gate record via the `ref` hop rather than picking one arbitrarily.
+A correctly-written `meta.verdict` FK exists precisely so this case never arises — it, not
+`meta.pr`, is the definitive identifier.
 
 ### 7.3 Read — `/shipped` / `/wip` / flare
 One `artifact.list { project, kind: "receipt" }` (or `verdict`) per project instead of joining ship's ledger + gate's audit + GitHub. Task anchoring gives the join to phases via the task's `phase` field.

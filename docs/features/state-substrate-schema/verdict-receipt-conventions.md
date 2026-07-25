@@ -23,7 +23,7 @@ Emitters (gate close-out, driver close-out, skills) need a shared vocabulary for
 Docs-only. From the locked TDD §5:
 
 - Add `verdict` and `receipt` to the well-known kind list in `PROTOCOL.md` + `LAYOUT.md`: `commit | pr | file | url | run | doc | verdict | receipt` — still extensible, unknown kinds still round-trip.
-- Carry the **canonical `ref` form per kind** (TDD §5): `receipt` → canonical GitHub PR URL `https://github.com/<owner>/<repo>/pull/<n>` (no trailing slash, no `.git`, lowercase host); `verdict` → gate audit ref (e.g. `gate://<repo>/pr/<n>/<dec_id>`).
+- Carry the **canonical `ref` form per kind** (TDD §5): `receipt` → canonical GitHub PR URL `https://github.com/<owner>/<repo>/pull/<n>` (no trailing slash, no `.git`, lowercase host); `verdict` → gate audit ref (gate's opaque per-evaluation id, a `run_…` id today, e.g. `gate://<repo>/pr/<n>/<gate_run_id>`).
 - Carry the **meta-key convention tables** (TDD §5) with one example jsonl row each:
   - `verdict`: `source`, `outcome`, `pr`, `head_sha`, `grant`, `tier`.
   - `receipt`: `event`, `pr`, `merge_sha`, `verdict` (art_ id), `supersedes` (art_ id, when correcting an earlier immutable row).
