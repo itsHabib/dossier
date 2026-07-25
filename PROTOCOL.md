@@ -135,7 +135,12 @@ that pointer by listing verdicts for the same anchor —
 has no task — and matching the **exact `art_` id**. Match the id, *not* `meta.pr`:
 a PR with several gate evaluations yields several verdicts sharing one `meta.pr`
 (e.g. an earlier `blocked` and a later `pass`), and only the receipt's
-`meta.verdict` names the one that authorized the merge.
+`meta.verdict` names the one that authorized the merge. If `meta.verdict` is
+missing or dangles (the FK is unenforced), fall back to the task anchor +
+`meta.pr` under the supersede reader rule; when that still leaves several live
+`pass` verdicts for the head, the authorizer is **unresolvable from the
+substrate alone** — recover it from the authoritative gate record via the
+verdict `ref`.
 
 ### `meta` key conventions per kind
 

@@ -35,4 +35,4 @@ deleted (commit history is the record).
   exact `art_` id (not `meta.pr` — a PR with several evaluations has several verdicts sharing
   one `meta.pr`). Works, but the §7.2 "fast path → the verdict directly" only becomes literal
   one-hop with a small `artifact.get { project, id }` verb. Low priority — surfaced by the
-  Phase B dogfood read; the `meta.pr` join covers the need today. (state-substrate Phase B)
+  Phase B dogfood read; a list-then-exact-`art_`-id match covers the need today. (state-substrate Phase B)
