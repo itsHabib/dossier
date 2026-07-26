@@ -25,7 +25,7 @@ Side benefit: dossier becomes usable from CI scripts, ad-hoc shell, and other to
 
 ## Behavior
 
-Add four new subcommands to `dossier.exe`:
+Add four new subcommands to `dossier.exe` (a fifth read verb, `artifact_list`, followed later in PR #101 — item 5):
 
 1. **`dossier task_complete --id <task-id> [--note "<text>"] [--actor <actor>]`**
    - Calls the same logic backing the MCP `task.complete` verb.
@@ -52,6 +52,13 @@ Add four new subcommands to `dossier.exe`:
    - `--phase` requires `--project` (same constraint as the MCP verb).
    - No `--project` → list across all projects.
    - Returns the matching tasks as a JSON array on stdout.
+   - **Idempotency:** read-only, trivially idempotent.
+
+5. **`dossier artifact_list --project <slug> [--task <task-id>] [--kind <kind>] [--ref <ref>]`** *(added later — PR #101, the state-substrate read path)*
+   - Calls the same logic backing the MCP `artifact.list` verb. `--project` is required.
+   - `--ref` is an exact-match filter and AND-composes with `--task` / `--kind`.
+   - Empty flag values are treated as "no filter" (matching the MCP handler), so a shell-expanded `--kind ""` does not filter for an impossible empty kind.
+   - Returns the matching artifacts as a JSON array on stdout.
    - **Idempotency:** read-only, trivially idempotent.
 
 ## Implementation sketch

@@ -13,7 +13,8 @@ and creates the structure as work starts, without you typing in a UI.
 dossier exposes the corpus two ways: an **MCP server** (`dossier serve`) that
 gives any LLM the full read + write verb set over stdio, and a thin **CLI**
 for the handful of verbs worth scripting from a shell or a CI hook
-(`task_complete`, `task_update`, `artifact_link`, `task_list`). The corpus
+(`task_complete`, `task_update`, `artifact_link`, `task_list`,
+`artifact_list`). The corpus
 itself is the source of truth — plain markdown you can grep and edit by hand;
 the server re-reads it on every call.
 
@@ -197,15 +198,16 @@ See [PROTOCOL.md](PROTOCOL.md) for the full spec.
 ### CLI
 
 `dossier serve` is the main surface. For shell / CI use, three writes plus
-`task_list` are exposed as one-shot subcommands that print their result as JSON
-— they share the `--corpus` flag (or `DOSSIER_CORPUS`, or a walk-up search for
-`.dossier/`):
+two reads (`task_list`, `artifact_list`) are exposed as one-shot subcommands
+that print their result as JSON — they share the `--corpus` flag (or
+`DOSSIER_CORPUS`, or a walk-up search for `.dossier/`):
 
 ```sh
 dossier task_list --project tower --status in_progress
 dossier task_update --id tsk_… --note "blocked on review"
 dossier task_complete --id tsk_… --note "merged in #42"
 dossier artifact_link --project tower --kind pr --ref https://github.com/itsHabib/tower/pull/42 --label "PR #42"
+dossier artifact_list --project tower --kind receipt          # verdict/receipt substrate, scriptable
 ```
 
 ## Develop

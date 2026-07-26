@@ -104,6 +104,22 @@ enum Command {
         #[arg(long)]
         include_terminal: bool,
     },
+    /// List artifacts subject to filters (MCP `artifact.list`)
+    #[command(name = "artifact_list")]
+    ArtifactList {
+        /// project slug
+        #[arg(long)]
+        project: String,
+        /// only artifacts linked to this task id
+        #[arg(long)]
+        task: Option<String>,
+        /// only artifacts of this kind (`commit` | `pr` | `verdict` | `receipt` | …)
+        #[arg(long)]
+        kind: Option<String>,
+        /// exact-match filter on the canonical `ref` (no substring/prefix)
+        #[arg(long = "ref")]
+        reference: Option<String>,
+    },
 }
 
 struct ArtifactLinkRequest {
@@ -168,6 +184,20 @@ async fn main() -> Result<()> {
                 assignee,
                 limit,
                 include_terminal,
+            },
+        ),
+        Command::ArtifactList {
+            project,
+            task,
+            kind,
+            reference,
+        } => run_artifact_list(
+            &resolve_corpus(cli.corpus)?,
+            ArtifactListRequest {
+                project,
+                task,
+                kind,
+                reference,
             },
         ),
     }
@@ -426,6 +456,42 @@ fn run_task_list(corpus: &Path, req: TaskListRequest) -> Result<()> {
     let store = FsStore::open(corpus)?;
     let tasks: Vec<Task> = store.list_tasks(&filter)?;
     emit_json(&tasks)
+}
+
+/// Inputs for the `artifact_list` CLI subcommand, bundled to stay within the
+/// argument-count cap (mirrors the `ArtifactLinkRequest` pattern).
+struct ArtifactListRequest {
+    project: String,
+    task: Option<String>,
+    kind: Option<String>,
+    reference: Option<String>,
+}
+
+/// `ref` is an exact-match filter that AND-composes with `task`/`kind`, so the
+/// CLI read surface agrees with MCP `artifact.list` (server/mod.rs).
+fn run_artifact_list(corpus: &Path, req: ArtifactListRequest) -> Result<()> {
+    let ArtifactListRequest {
+        project,
+        task,
+        kind,
+        reference,
+    } = req;
+    let store = FsStore::open(corpus)?;
+    let mut artifacts = store.list_artifacts(&project)?;
+    // Treat an empty flag value (Clap yields `Some("")` when a shell expands an
+    // unset var, e.g. `--kind "$KIND"`) as "no filter", matching MCP
+    // `artifact.list`, which skips empty task/kind/ref rather than filtering on
+    // the empty string.
+    if let Some(reference) = reference.filter(|value| !value.is_empty()) {
+        artifacts.retain(|a| a.reference == reference);
+    }
+    if let Some(task) = task.filter(|value| !value.is_empty()) {
+        artifacts.retain(|a| a.task == task);
+    }
+    if let Some(kind) = kind.filter(|value| !value.is_empty()) {
+        artifacts.retain(|a| a.kind == kind);
+    }
+    emit_json(&artifacts)
 }
 
 #[cfg(test)]
