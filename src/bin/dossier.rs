@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -81,6 +82,9 @@ enum Command {
         /// who's linking the artifact; default `cli:$USER` (or `cli`)
         #[arg(long)]
         actor: Option<String>,
+        /// flat `key=value` metadata; repeatable (mirrors MCP `artifact.link` meta)
+        #[arg(long = "meta", value_name = "KEY=VALUE")]
+        meta: Vec<String>,
     },
     /// List tasks subject to filters (MCP `task.list`)
     #[command(name = "task_list")]
@@ -129,6 +133,7 @@ struct ArtifactLinkRequest {
     task: Option<String>,
     label: Option<String>,
     actor: Option<String>,
+    meta: Vec<String>,
 }
 
 #[tokio::main]
@@ -154,6 +159,7 @@ async fn main() -> Result<()> {
             task,
             label,
             actor,
+            meta,
         } => {
             run_artifact_link(
                 &resolve_corpus(cli.corpus)?,
@@ -164,6 +170,7 @@ async fn main() -> Result<()> {
                     task,
                     label,
                     actor,
+                    meta,
                 },
             )
             .await
@@ -388,10 +395,31 @@ async fn run_task_update(
     emit_json(&task)
 }
 
+/// Parse repeated `--meta key=value` flags into a map. Splits on the first
+/// `=` (the value may itself contain `=`). Rejects a missing `=`, an empty
+/// key, and a duplicate key so a typo can't silently drop or overwrite a
+/// field. Caps and immutability are enforced downstream by the service.
+fn parse_meta(pairs: Vec<String>) -> Result<BTreeMap<String, String>> {
+    let mut meta = BTreeMap::new();
+    for pair in pairs {
+        let (key, value) = pair
+            .split_once('=')
+            .with_context(|| format!("--meta expects key=value, got: {pair}"))?;
+        if key.is_empty() {
+            bail!("--meta key is empty in: {pair}");
+        }
+        if meta.insert(key.to_owned(), value.to_owned()).is_some() {
+            bail!("--meta key given more than once: {key}");
+        }
+    }
+    Ok(meta)
+}
+
 async fn run_artifact_link(corpus: &Path, req: ArtifactLinkRequest) -> Result<()> {
     if matches!(req.task.as_deref(), Some("")) {
         bail!("task is empty");
     }
+    let meta = parse_meta(req.meta)?;
     let label = req.label.unwrap_or_else(|| req.reference.clone());
     let project_slug = req.project.clone();
     let svc = MeshService::new(FsStore::open(corpus)?);
@@ -403,7 +431,7 @@ async fn run_artifact_link(corpus: &Path, req: ArtifactLinkRequest) -> Result<()
             reference: req.reference,
             label,
             actor: default_actor(req.actor),
-            meta: std::collections::BTreeMap::new(),
+            meta,
         })
         .await
         .map_err(store_error_to_anyhow)?;

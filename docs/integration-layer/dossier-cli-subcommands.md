@@ -39,11 +39,12 @@ Add four new subcommands to `dossier.exe` (a fifth read verb, `artifact_list`, f
    - Notes are append-only — CLI does NOT dedupe. Caller (hooks) responsible for not double-firing on the same event.
    - Returns updated frontmatter as JSON.
 
-3. **`dossier artifact_link --project <slug> --kind <kind> --ref <ref> [--task <task-id>] [--label <text>] [--actor <actor>]`**
+3. **`dossier artifact_link --project <slug> --kind <kind> --ref <ref> [--task <task-id>] [--label <text>] [--actor <actor>] [--meta key=value]...`**
    - Calls the same logic backing the MCP `artifact.link` verb.
    - **Idempotency:** same `(project, task, kind, ref)` already exists → exit 0, stderr message, no duplicate.
    - If today's underlying `FsStore` method doesn't dedupe, ALSO add that property — the MCP verb gets the same fix.
    - Default `--actor` = `cli:$USER`.
+   - `--meta` is repeatable (`--meta source=gate --meta outcome=pass`); splits on the first `=`. Caps + immutability are enforced by the service (same as MCP). This is what lets a shell hook write `verdict`/`receipt` meta.
    - Returns the artifact entry as JSON.
 
 4. **`dossier task_list [--project <slug>] [--phase <slug>] [--status <status>...] [--assignee <actor>] [--limit <N>]`**

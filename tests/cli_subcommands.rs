@@ -510,6 +510,75 @@ fn cli_artifact_list_filters_match_store() {
 }
 
 #[test]
+fn cli_artifact_link_writes_and_reads_meta() {
+    let (tmp, svc) = fresh_service();
+    seed_project(&svc, "alpha");
+
+    // Write a verdict-shaped row with repeated --meta flags.
+    let (code, stdout, stderr) = run_cli(
+        tmp.path(),
+        &[
+            "artifact_link",
+            "--project",
+            "alpha",
+            "--kind",
+            "verdict",
+            "--ref",
+            "gate://alpha/pr/1/run_x",
+            "--label",
+            "gate pass PR #1",
+            "--actor",
+            "cli:test",
+            "--meta",
+            "source=gate",
+            "--meta",
+            "outcome=pass",
+            "--meta",
+            "pr=1",
+        ],
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let art: Value = parse_json(&stdout);
+    assert_eq!(art["meta"]["source"], Value::String("gate".to_owned()));
+    assert_eq!(art["meta"]["outcome"], Value::String("pass".to_owned()));
+    assert_eq!(art["meta"]["pr"], Value::String("1".to_owned()));
+
+    // Meta persists and comes back through the read verb.
+    let (code, stdout, _) = run_cli(
+        tmp.path(),
+        &["artifact_list", "--project", "alpha", "--kind", "verdict"],
+    );
+    assert_eq!(code, 0);
+    let rows: Vec<Value> = parse_json(&stdout);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["meta"]["source"], Value::String("gate".to_owned()));
+}
+
+#[test]
+fn cli_artifact_link_rejects_malformed_meta() {
+    let (tmp, svc) = fresh_service();
+    seed_project(&svc, "alpha");
+    let (code, _, stderr) = run_cli(
+        tmp.path(),
+        &[
+            "artifact_link",
+            "--project",
+            "alpha",
+            "--kind",
+            "pr",
+            "--ref",
+            "https://example/pr/1",
+            "--actor",
+            "cli:test",
+            "--meta",
+            "novalue",
+        ],
+    );
+    assert_ne!(code, 0, "malformed --meta should fail");
+    assert!(stderr.contains("key=value"), "stderr: {stderr}");
+}
+
+#[test]
 fn cli_task_list_rejects_phase_without_project() {
     let (tmp, _store) = common::fresh_corpus();
     let (code, _, stderr) = run_cli(tmp.path(), &["task_list", "--phase", "integration-layer"]);
