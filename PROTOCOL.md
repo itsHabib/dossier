@@ -139,10 +139,16 @@ a PR with several gate evaluations yields several verdicts sharing one `meta.pr`
 (e.g. an earlier `blocked` and a later `pass`), and only the receipt's
 `meta.verdict` names the one that authorized the merge. If `meta.verdict` is
 missing or dangles (the FK is unenforced), fall back to the task anchor +
-`meta.pr` under the supersede reader rule; when that still leaves several live
-`pass` verdicts for the head, the authorizer is **unresolvable from the
-substrate alone** — recover it from the authoritative gate record via the
-verdict `ref`.
+`kind: verdict` and match on **both** `verdict.meta.head_sha ==
+receipt.meta.head_sha` **and** `verdict.meta.pr == receipt.meta.pr`: `head_sha`
+pins the exact head gate judged, `meta.pr` keeps PR identity (the same commit can
+be evaluated under two PRs on one task — e.g. a close-and-reopen — so `head_sha`
+alone could match the other PR's verdict). Then apply the supersede reader rule.
+A **legacy receipt without `head_sha`** degrades to the `meta.pr`-only join —
+coarser, but never empty (FR3: degrade, don't break). Only if several live
+`pass` verdicts share the same `(head_sha, pr)` does the authorizer stay
+**unresolvable from the substrate alone** — recover it from the authoritative
+gate record via the verdict `ref`.
 
 ### `meta` key conventions per kind
 
@@ -157,14 +163,14 @@ are both attributable.
 | kind      | `meta` keys                                                                 |
 |-----------|-------------------------------------------------------------------------------|
 | `verdict` | `source` (`gate` \| `review-coordinator` \| …), `outcome` (emitter's vocabulary, e.g. gate's `pass` \| `blocked` \| `parked` \| `refused`), `pr`, `head_sha`, `grant` (`grt_` id, when one applied), `tier` (emitter's vocabulary — gate emits `T0`–`T3`, *not* a bare `0`–`3`) |
-| `receipt` | `event` (`merge` \| `close-out` \| …), `pr`, `merge_sha`, `verdict` (the `art_` id of the authorizing verdict), `supersedes` (`art_` id, when this row corrects an earlier immutable one) |
+| `receipt` | `event` (`merge` \| `close-out` \| …), `pr`, `merge_sha`, `head_sha` (the merged head — the durable join key back to the `verdict` when `meta.verdict` is absent/dangling; a squash `merge_sha` differs from it, so the receipt must carry `head_sha` to stay joinable), `verdict` (the `art_` id of the authorizing verdict), `merged_at` (RFC3339 merge timestamp, for since-date reads), `supersedes` (`art_` id, when this row corrects an earlier immutable one) |
 | `run`     | `engine`, `run` (ship run id), `judgment` — existing kind, meta convention enriched here |
 
 Example rows (append-only `artifacts.jsonl`, one line each):
 
 ```jsonl
 {"id":"art_01K…","project":"prj_01KRSZ…","task":"tsk_01K…","kind":"verdict","ref":"gate://dossier/pr/93/run_9ce4b19af24974c5","label":"gate pass PR #93","linked_at":"2026-07-23T18:00:00Z","actor":"claude-code:michael","meta":{"source":"gate","outcome":"pass","pr":"93","head_sha":"872b472","grant":"grt_01K…","tier":"T1"}}
-{"id":"art_01K…","project":"prj_01KRSZ…","task":"tsk_01K…","kind":"receipt","ref":"https://github.com/itsHabib/dossier/pull/93","label":"merged PR #93","linked_at":"2026-07-23T18:05:00Z","actor":"claude-code:michael","meta":{"event":"merge","pr":"93","merge_sha":"a1b2c3d","verdict":"art_01K…"}}
+{"id":"art_01K…","project":"prj_01KRSZ…","task":"tsk_01K…","kind":"receipt","ref":"https://github.com/itsHabib/dossier/pull/93","label":"merged PR #93","linked_at":"2026-07-23T18:05:00Z","actor":"claude-code:michael","meta":{"event":"merge","pr":"93","merge_sha":"a1b2c3d","head_sha":"872b472","verdict":"art_01K…","merged_at":"2026-07-23T18:04:55Z"}}
 ```
 
 ### Supersede convention

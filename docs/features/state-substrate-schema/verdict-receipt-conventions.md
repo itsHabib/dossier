@@ -26,7 +26,7 @@ Docs-only. From the locked TDD §5:
 - Carry the **canonical `ref` form per kind** (TDD §5): `receipt` → canonical GitHub PR URL `https://github.com/<owner>/<repo>/pull/<n>` (no trailing slash, no `.git`, lowercase host); `verdict` → gate audit ref (gate's opaque per-evaluation id, a `run_…` id today, e.g. `gate://<repo>/pr/<n>/<gate_run_id>`).
 - Carry the **meta-key convention tables** (TDD §5) with one example jsonl row each:
   - `verdict`: `source`, `outcome`, `pr`, `head_sha`, `grant`, `tier`.
-  - `receipt`: `event`, `pr`, `merge_sha`, `verdict` (art_ id), `supersedes` (art_ id, when correcting an earlier immutable row).
+  - `receipt`: `event`, `pr`, `merge_sha`, `head_sha` (merged head — durable join key to the verdict when the FK is absent/dangling), `verdict` (art_ id), `merged_at` (RFC3339), `supersedes` (art_ id, when correcting an earlier immutable row).
   - `run` (existing, enriched): `engine`, `run`, `judgment`.
 - Carry the **supersede convention** (TDD §7.4): correct an immutable row by appending a new artifact with a distinct `ref` + `meta.supersedes: <art_id>`; readers ignore any row named by a later row's `meta.supersedes`.
 - State explicitly: **conventions, not schema** — unknown keys round-trip; dossier never validates `outcome` vocabularies (TDD §4 D4).

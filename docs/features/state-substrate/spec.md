@@ -97,14 +97,14 @@ Nothing new structurally: the Artifact primitive, `artifacts.jsonl`, and the two
 **Documented meta-key conventions** (conventions, not schema — unknown keys pass through; PROTOCOL.md carries this table). `actor` records *who linked the row* (the close-out caller); *who decided* is `meta.source` — the two are kept distinct so a skill-driven close-out and the gate that produced the verdict are both attributable:
 
 - `kind: verdict` — `source` (`gate` | `review-coordinator` | …), `outcome` (emitter's vocabulary, e.g. gate's `pass`/`blocked`/`parked`/`refused`), `pr`, `head_sha`, `grant` (grt_ id, when one applied), `tier`.
-- `kind: receipt` — `event` (`merge` | `close-out` | …), `pr`, `merge_sha`, `verdict` (the art_ id of the authorizing verdict — the FR2 fast-path join, with a fallback in §7.2), `supersedes` (art_ id, when this row corrects an earlier immutable one — §7.4).
+- `kind: receipt` — `event` (`merge` | `close-out` | …), `pr`, `merge_sha`, `head_sha` (the merged head — the durable join key back to the verdict when `meta.verdict` is absent/dangling; a squash `merge_sha` differs from it), `verdict` (the art_ id of the authorizing verdict — the FR2 fast-path join, with a fallback in §7.2), `merged_at` (RFC3339 merge timestamp, for since-date reads), `supersedes` (art_ id, when this row corrects an earlier immutable one — §7.4).
 - `kind: run` (existing, enriched by convention) — `engine`, `run` (ship run id), `judgment`.
 
 **Example rows** (append-only `artifacts.jsonl`, one line each):
 
 ```jsonl
 {"id":"art_01K…","project":"prj_01KRSZ…","task":"tsk_01K…","kind":"verdict","ref":"gate://dossier/pr/93/run_9ce4b19af24974c5","label":"gate pass PR #93","linked_at":"2026-07-23T18:00:00Z","actor":"claude-code:michael","meta":{"source":"gate","outcome":"pass","pr":"93","head_sha":"872b472","grant":"grt_01K…","tier":"T1"}}
-{"id":"art_01K…","project":"prj_01KRSZ…","task":"tsk_01K…","kind":"receipt","ref":"https://github.com/itsHabib/dossier/pull/93","label":"merged PR #93","linked_at":"2026-07-23T18:05:00Z","actor":"claude-code:michael","meta":{"event":"merge","pr":"93","merge_sha":"a1b2c3d","verdict":"art_01K…"}}
+{"id":"art_01K…","project":"prj_01KRSZ…","task":"tsk_01K…","kind":"receipt","ref":"https://github.com/itsHabib/dossier/pull/93","label":"merged PR #93","linked_at":"2026-07-23T18:05:00Z","actor":"claude-code:michael","meta":{"event":"merge","pr":"93","merge_sha":"a1b2c3d","head_sha":"872b472","verdict":"art_01K…","merged_at":"2026-07-23T18:04:55Z"}}
 ```
 
 `ref` points at the authoritative record (gate audit entry, ship run, PR URL); `meta` is the denormalized summary that makes one-substrate reads possible (D1). On-disk layout, ULIDs, and the append discipline in LAYOUT.md are untouched.
@@ -151,7 +151,7 @@ Rust surface (`src/domain.rs`): `Artifact.meta: BTreeMap<String, String>` with `
    artifact.link { project, task, kind: "verdict", ref: <gate decision ref>,
                    label: "gate pass PR #N", meta: { source, outcome, pr, head_sha, grant, tier } }
 3. merge lands → artifact.link { kind: "receipt", ref: <PR URL>,
-                   meta: { event: "merge", pr, merge_sha, verdict: <art_ id from step 2> } }
+                   meta: { event: "merge", pr, merge_sha, head_sha, verdict: <art_ id from step 2>, merged_at } }
 4. both appends: O_APPEND + file lock, one line each (LAYOUT.md, unchanged)
 ```
 
@@ -166,7 +166,9 @@ Rust surface (`src/domain.rs`): `Artifact.meta: BTreeMap<String, String>` with `
    FALLBACK:   when meta.verdict is missing or dangles (it is a hand-maintained
                foreign key with no referential integrity), join on the shared task
                anchor: artifact.list { project, task: <receipt.task>, kind: "verdict" },
-               disambiguated by meta.pr — the format-independent path.
+               matched on BOTH head_sha AND meta.pr (head_sha pins the exact head,
+               meta.pr keeps PR identity); a legacy receipt lacking head_sha
+               degrades to meta.pr alone — the format-independent path.
 3. verdict.meta: outcome, head_sha, grant, tier — the summary answer
 4. full record: follow verdict.ref into gate's audit chain (one hop, by design — D1)
 ```
@@ -175,13 +177,15 @@ exists both the FK path and the fallback list verdicts, so the FK saves no list 
 what it provides is *which* verdict authorized the merge when a PR had several evaluations
 (`meta.pr` alone can't tell an earlier `blocked` from the later `pass`). When the FK is
 missing or dangles (including a row written before the immutability rule, §7.4), fall back
-to the task anchor + `meta.pr` and apply the supersede reader rule. If that leaves a single
-live verdict, it's the answer. If it leaves **several live `pass` verdicts** — independent
-evaluations of the same head, none superseding another — the authorizing verdict is
-**unresolvable from the substrate alone** (nothing left to distinguish them); recover it
-from the authoritative gate record via the `ref` hop rather than picking one arbitrarily.
-A correctly-written `meta.verdict` FK exists precisely so this case never arises — it, not
-`meta.pr`, is the definitive identifier.
+to the task anchor + `kind: verdict`, matching on **both** `head_sha` and `meta.pr`
+(`head_sha` pins the exact head gate judged; `meta.pr` keeps PR identity, since the same
+commit can be evaluated under two PRs on one task). A **legacy receipt without `head_sha`**
+degrades to the `meta.pr`-only join — coarser, never empty (FR3). Apply the supersede reader
+rule. Only if **several live `pass` verdicts share the same `(head_sha, pr)`** — independent
+re-evaluations, none superseding another — is the authorizing verdict **unresolvable from
+the substrate alone**; recover it from the authoritative gate record via the `ref` hop rather
+than picking one arbitrarily. A correctly-written `meta.verdict` FK exists precisely so even
+that never arises — it, not `head_sha`/`meta.pr`, is the definitive identifier.
 
 ### 7.3 Read — `/shipped` / `/wip` / flare
 One `artifact.list { project, kind: "receipt" }` (or `verdict`) per project instead of joining ship's ledger + gate's audit + GitHub. Task anchoring gives the join to phases via the task's `phase` field.
