@@ -139,14 +139,16 @@ a PR with several gate evaluations yields several verdicts sharing one `meta.pr`
 (e.g. an earlier `blocked` and a later `pass`), and only the receipt's
 `meta.verdict` names the one that authorized the merge. If `meta.verdict` is
 missing or dangles (the FK is unenforced), fall back to the task anchor +
-`kind: verdict` and match the receipt's `meta.head_sha` against each
-`verdict.meta.head_sha` — the exact head gate judged, far more precise than
-`meta.pr` (which spans *every* evaluation of the PR, across heads) — then apply
-the supersede reader rule. Only if several live `pass` verdicts share that same
-head does the authorizer stay **unresolvable from the substrate alone** —
-recover it from the authoritative gate record via the verdict `ref`. (This is
-why the receipt carries `head_sha`: without it the fallback can only join on
-`meta.pr` and cannot tell one head's verdict from another's.)
+`kind: verdict` and match on **both** `verdict.meta.head_sha ==
+receipt.meta.head_sha` **and** `verdict.meta.pr == receipt.meta.pr`: `head_sha`
+pins the exact head gate judged, `meta.pr` keeps PR identity (the same commit can
+be evaluated under two PRs on one task — e.g. a close-and-reopen — so `head_sha`
+alone could match the other PR's verdict). Then apply the supersede reader rule.
+A **legacy receipt without `head_sha`** degrades to the `meta.pr`-only join —
+coarser, but never empty (FR3: degrade, don't break). Only if several live
+`pass` verdicts share the same `(head_sha, pr)` does the authorizer stay
+**unresolvable from the substrate alone** — recover it from the authoritative
+gate record via the verdict `ref`.
 
 ### `meta` key conventions per kind
 

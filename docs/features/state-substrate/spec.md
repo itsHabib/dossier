@@ -166,9 +166,9 @@ Rust surface (`src/domain.rs`): `Artifact.meta: BTreeMap<String, String>` with `
    FALLBACK:   when meta.verdict is missing or dangles (it is a hand-maintained
                foreign key with no referential integrity), join on the shared task
                anchor: artifact.list { project, task: <receipt.task>, kind: "verdict" },
-               matched on receipt.meta.head_sha == verdict.meta.head_sha (the exact
-               head gate judged; meta.pr only as a coarse filter) — the
-               format-independent path.
+               matched on BOTH head_sha AND meta.pr (head_sha pins the exact head,
+               meta.pr keeps PR identity); a legacy receipt lacking head_sha
+               degrades to meta.pr alone — the format-independent path.
 3. verdict.meta: outcome, head_sha, grant, tier — the summary answer
 4. full record: follow verdict.ref into gate's audit chain (one hop, by design — D1)
 ```
@@ -177,15 +177,15 @@ exists both the FK path and the fallback list verdicts, so the FK saves no list 
 what it provides is *which* verdict authorized the merge when a PR had several evaluations
 (`meta.pr` alone can't tell an earlier `blocked` from the later `pass`). When the FK is
 missing or dangles (including a row written before the immutability rule, §7.4), fall back
-to the task anchor + `kind: verdict`, matching the receipt's `meta.head_sha` against each
-`verdict.meta.head_sha` (the exact head gate judged — far tighter than `meta.pr`, which
-spans every evaluation across heads), then apply the supersede reader rule. If that leaves a
-single live verdict, it's the answer. Only if **several live `pass` verdicts share that same
-head** — independent re-evaluations, none superseding another — is the authorizing verdict
-**unresolvable from the substrate alone**; recover it from the authoritative gate record via
-the `ref` hop rather than picking one arbitrarily. A correctly-written `meta.verdict` FK
-exists precisely so even that never arises — it, not `head_sha` or `meta.pr`, is the
-definitive identifier.
+to the task anchor + `kind: verdict`, matching on **both** `head_sha` and `meta.pr`
+(`head_sha` pins the exact head gate judged; `meta.pr` keeps PR identity, since the same
+commit can be evaluated under two PRs on one task). A **legacy receipt without `head_sha`**
+degrades to the `meta.pr`-only join — coarser, never empty (FR3). Apply the supersede reader
+rule. Only if **several live `pass` verdicts share the same `(head_sha, pr)`** — independent
+re-evaluations, none superseding another — is the authorizing verdict **unresolvable from
+the substrate alone**; recover it from the authoritative gate record via the `ref` hop rather
+than picking one arbitrarily. A correctly-written `meta.verdict` FK exists precisely so even
+that never arises — it, not `head_sha`/`meta.pr`, is the definitive identifier.
 
 ### 7.3 Read — `/shipped` / `/wip` / flare
 One `artifact.list { project, kind: "receipt" }` (or `verdict`) per project instead of joining ship's ledger + gate's audit + GitHub. Task anchoring gives the join to phases via the task's `phase` field.
