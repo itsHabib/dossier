@@ -207,6 +207,7 @@ dossier task_list --project tower --status in_progress
 dossier task_update --id tsk_… --note "blocked on review"
 dossier task_complete --id tsk_… --note "merged in #42"
 dossier artifact_link --project tower --kind pr --ref https://github.com/itsHabib/tower/pull/42 --label "PR #42"
+dossier artifact_link --project tower --kind verdict --ref gate://tower/pr/42/run_x --meta source=gate --meta outcome=pass
 dossier artifact_list --project tower --kind receipt          # verdict/receipt substrate, scriptable
 ```
 
