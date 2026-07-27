@@ -36,3 +36,8 @@ deleted (commit history is the record).
   one `meta.pr`). Works, but the §7.2 "fast path → the verdict directly" only becomes literal
   one-hop with a small `artifact.get { project, id }` verb. Low priority — surfaced by the
   Phase B dogfood read; a list-then-exact-`art_`-id match covers the need today. (state-substrate Phase B)
+
+- **Emit `merged_at` from the receipt hook.** The receipt meta convention now lists `merged_at`
+  (RFC3339, for `/shipped` since-date reads), but `posttool-gh-pr-merge.sh` doesn't emit it yet
+  (it has `merge_sha`/`head_sha`). Small: `gh pr view --json mergedAt` → `--meta merged_at=…`.
+  Optional key, so absence degrades gracefully. (substrate-autowiring follow-up)

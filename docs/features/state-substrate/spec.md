@@ -97,14 +97,14 @@ Nothing new structurally: the Artifact primitive, `artifacts.jsonl`, and the two
 **Documented meta-key conventions** (conventions, not schema — unknown keys pass through; PROTOCOL.md carries this table). `actor` records *who linked the row* (the close-out caller); *who decided* is `meta.source` — the two are kept distinct so a skill-driven close-out and the gate that produced the verdict are both attributable:
 
 - `kind: verdict` — `source` (`gate` | `review-coordinator` | …), `outcome` (emitter's vocabulary, e.g. gate's `pass`/`blocked`/`parked`/`refused`), `pr`, `head_sha`, `grant` (grt_ id, when one applied), `tier`.
-- `kind: receipt` — `event` (`merge` | `close-out` | …), `pr`, `merge_sha`, `verdict` (the art_ id of the authorizing verdict — the FR2 fast-path join, with a fallback in §7.2), `supersedes` (art_ id, when this row corrects an earlier immutable one — §7.4).
+- `kind: receipt` — `event` (`merge` | `close-out` | …), `pr`, `merge_sha`, `head_sha` (the merged head — the durable join key back to the verdict when `meta.verdict` is absent/dangling; a squash `merge_sha` differs from it), `verdict` (the art_ id of the authorizing verdict — the FR2 fast-path join, with a fallback in §7.2), `merged_at` (RFC3339 merge timestamp, for since-date reads), `supersedes` (art_ id, when this row corrects an earlier immutable one — §7.4).
 - `kind: run` (existing, enriched by convention) — `engine`, `run` (ship run id), `judgment`.
 
 **Example rows** (append-only `artifacts.jsonl`, one line each):
 
 ```jsonl
 {"id":"art_01K…","project":"prj_01KRSZ…","task":"tsk_01K…","kind":"verdict","ref":"gate://dossier/pr/93/run_9ce4b19af24974c5","label":"gate pass PR #93","linked_at":"2026-07-23T18:00:00Z","actor":"claude-code:michael","meta":{"source":"gate","outcome":"pass","pr":"93","head_sha":"872b472","grant":"grt_01K…","tier":"T1"}}
-{"id":"art_01K…","project":"prj_01KRSZ…","task":"tsk_01K…","kind":"receipt","ref":"https://github.com/itsHabib/dossier/pull/93","label":"merged PR #93","linked_at":"2026-07-23T18:05:00Z","actor":"claude-code:michael","meta":{"event":"merge","pr":"93","merge_sha":"a1b2c3d","verdict":"art_01K…"}}
+{"id":"art_01K…","project":"prj_01KRSZ…","task":"tsk_01K…","kind":"receipt","ref":"https://github.com/itsHabib/dossier/pull/93","label":"merged PR #93","linked_at":"2026-07-23T18:05:00Z","actor":"claude-code:michael","meta":{"event":"merge","pr":"93","merge_sha":"a1b2c3d","head_sha":"872b472","verdict":"art_01K…","merged_at":"2026-07-23T18:04:55Z"}}
 ```
 
 `ref` points at the authoritative record (gate audit entry, ship run, PR URL); `meta` is the denormalized summary that makes one-substrate reads possible (D1). On-disk layout, ULIDs, and the append discipline in LAYOUT.md are untouched.
@@ -151,7 +151,7 @@ Rust surface (`src/domain.rs`): `Artifact.meta: BTreeMap<String, String>` with `
    artifact.link { project, task, kind: "verdict", ref: <gate decision ref>,
                    label: "gate pass PR #N", meta: { source, outcome, pr, head_sha, grant, tier } }
 3. merge lands → artifact.link { kind: "receipt", ref: <PR URL>,
-                   meta: { event: "merge", pr, merge_sha, verdict: <art_ id from step 2> } }
+                   meta: { event: "merge", pr, merge_sha, head_sha, verdict: <art_ id from step 2>, merged_at } }
 4. both appends: O_APPEND + file lock, one line each (LAYOUT.md, unchanged)
 ```
 
