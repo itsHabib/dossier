@@ -23,8 +23,8 @@ batches:
         branch_name: external-blockers-primitive
         runtime: local
         provider: claude
-        model: sonnet
-        model_id: claude-sonnet-4-6
+        model: opus
+        model_id: claude-opus-4-8
         effort: max
         touches:
           - src/domain.rs
