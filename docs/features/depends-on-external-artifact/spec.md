@@ -36,6 +36,23 @@ Values are trimmed, unique, order-preserving, and validated at every write
 boundary. Task IDs and arbitrary prose are rejected. Unknown reference schemes
 fail closed; adding one later is an explicit protocol change.
 
+**One referent, one spelling.** The two schemes must not overlap, because the
+`blocked_by` predicate is exact-match: if `pr:itsHabib/ship#203` and
+`url:https://github.com/itsHabib/ship/pull/203` were both legal, they would be
+distinct keys naming the same PR, and a task stored under one spelling would be
+invisible to a query using the other — losing exactly the "which tasks are
+blocked by this PR?" guarantee this feature exists to provide. So `pr:` is
+reserved as the sole spelling for a GitHub pull request, and a `url:` value
+whose target is a GitHub pull request is **rejected at every write boundary**
+with a stable validation error naming the canonical `pr:` form.
+
+Rejecting is deliberate, not normalizing. Canonicalizing `url:` into `pr:` on
+write would put a rewrite rule on the write path that the filter path has to
+reproduce exactly and forever; the moment the two drift, the predicate silently
+under-returns — the same bug, harder to see. A closed door needs no symmetry.
+This is a syntactic check on the reference itself; nothing is fetched or
+resolved, consistent with the non-goals.
+
 ## Behavior
 
 - Persist `blocked_by` in task frontmatter, omitting it when empty. Missing fields
@@ -60,11 +77,18 @@ fail closed; adding one later is an explicit protocol change.
 - Missing/empty fields remain backward compatible and are omitted on write.
 - Duplicate, malformed, non-HTTPS, task-ID, and unknown-scheme references are
   rejected with a stable validation error.
+- A `url:` reference whose target is a GitHub pull request — in any equivalent
+  spelling GitHub honors (`/pull/203`, a trailing slash, `#issuecomment-…`, a
+  `?w=1` query) — is rejected with a stable error naming the `pr:` form, so one
+  PR can never be stored under two keys. Non-PR GitHub URLs (an issue, a commit,
+  a release) remain valid `url:` values.
 - Existing `depends_on` behavior and task state transitions are unchanged.
 
 ## Test plan
 
-- Table tests for the blocker-ref grammar and create/update validation.
+- Table tests for the blocker-ref grammar and create/update validation,
+  including the PR-URL rejection across its equivalent spellings and the
+  non-PR GitHub URLs that must stay valid.
 - Store/frontmatter and property round trips for missing, empty, and populated
   `blocked_by`.
 - Task-list exact-match and composed-filter tests.
