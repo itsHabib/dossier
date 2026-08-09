@@ -48,7 +48,7 @@ These land when a real workflow needs them, in the right order (see
 <!-- BEGIN dev-workbench (managed by /dev-workbench skill - re-run to refresh; hand-edits inside this block will be overwritten) -->
 ## Dev workbench
 
-These MCPs, planes, and skills are available in Claude and Codex sessions on this machine; each harness injects tool signatures, so this is the map of how they compose, not a second verb manual. When the signal matches, call the verb. Knowledge questions about another portfolio repo go to `/consult`; authority questions - direction, spend, credentials, irreversible actions - go to the operator.
+These MCPs, planes, and skills are available in Claude and Codex sessions on this machine; each harness injects tool signatures, so this is the map of how they compose, not a second verb manual. **This is dossier - the State plane work-item store - so dossier verbs are most directly relevant here.** When the signal matches, call the verb. Knowledge questions about another portfolio repo go to `/consult`; authority questions - direction, spend, credentials, irreversible actions - go to the operator.
 
 **MCPs (in-session):**
 - **dossier** - durable project memory: projects -> phases -> tasks -> artifacts.
@@ -80,6 +80,8 @@ dossier task -> /worktree-add -> spec -> ship driver (dispatch -> poll -> judgme
        \-> 2: park -> console / gate next -> human decision -> escalate -> gate resolve -> gate next
        \-> attention or terminal receipt -> flare -> Slack (best effort; never gates)
 ```
+
+`/work-driver` coordinates dispatch -> poll -> land and runs its own review triage inline. `/pr-risk` and `/review-coordinator` are explicit steps; the driver does not invoke them automatically.
 
 ### Why this shape
 
