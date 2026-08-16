@@ -31,7 +31,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
-  test:
+  test-matrix:
     strategy:
       fail-fast: false
       matrix:
@@ -42,3 +42,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-features
+
+  # Aggregator so branch protection has a stable `test` context to require:
+  # the matrix emits `test-matrix (<os>)`, which changes whenever the OS list does.
+  test:
+    if: always()
+    needs: [test-matrix]
+    runs-on: ubuntu-latest
+    steps:
+      - name: check matrix result
+        run: |
+          if [ "${{ needs.test-matrix.result }}" != "success" ]; then
+            echo "test-matrix result: ${{ needs.test-matrix.result }}"
+            exit 1
+          fi
