@@ -307,7 +307,7 @@ impl MeshService {
 
     #[tool(
         name = "task.create",
-        description = "Create a new task in a project. Slug must be unique within the project and lowercase ASCII. Optionally anchor to a phase by slug. Server stamps id, timestamps, and 'todo' status."
+        description = "Create a new task in a project. Slug must be unique within the project and lowercase ASCII. Optionally anchor to a phase by slug. `blocked_by` accepts canonical external refs (`pr:owner/repo#N` or `url:https://...`); values are trimmed, unique, and validated, and GitHub PR URLs must use the `pr:` form. Server stamps id, timestamps, and 'todo' status."
     )]
     async fn task_create(
         &self,
@@ -322,6 +322,7 @@ impl MeshService {
                 body: args.body,
                 actor: args.actor,
                 depends_on: args.depends_on,
+                blocked_by: args.blocked_by,
             })
             .await
             .map_err(store_err_to_invalid)?;
@@ -348,7 +349,7 @@ impl MeshService {
 
     #[tool(
         name = "task.update",
-        description = "Update a task's body, status, and/or append a note to its progress log. Rejects status=claimed and status=done — use task.claim / task.complete instead. Terminal states reject all transitions."
+        description = "Update a task's body, status, dependencies, external blockers, and/or append a note to its progress log. Omit `blocked_by` to leave it unchanged, supply a list to replace it, or `[]` to clear it. External refs use `pr:owner/repo#N` or `url:https://...`; GitHub PR URLs must use the `pr:` form. Rejects status=claimed and status=done — use task.claim / task.complete instead. Terminal states reject all transitions."
     )]
     async fn task_update(
         &self,
@@ -362,6 +363,7 @@ impl MeshService {
                 note: args.note,
                 actor: args.actor,
                 depends_on: args.depends_on,
+                blocked_by: args.blocked_by,
             })
             .await
             .map_err(store_err_to_invalid)?;
@@ -464,17 +466,22 @@ impl MeshService {
 
     #[tool(
         name = "task.list",
-        description = "List tasks subject to a predicate filter. Filters AND-together.\n\nLIVE BY DEFAULT: with no `status` filter, returns only live (non-terminal) tasks — `done` and `cancelled` are hidden. Pass `include_terminal: true` to get every status (the old default), or an explicit `status` (incl. terminal values like `done`) which always wins verbatim and ignores `include_terminal`. Default sort is `created_at` ASC.\n\nCross-project: `project` is optional — omit it (or pass `null`) to scan every project in the corpus. `phase` is a phase slug and REQUIRES `project` (validation error otherwise — phase slugs are unique per project, not globally).\n\nFilters: `status` is a list (`todo` | `claimed` | `in_progress` | `blocked` | `done` | `cancelled`) — OR-of-statuses. `assignee` is an exact match against the task's `assignee` frontmatter (e.g. `human:michael`, `ship`). `body_contains` is a case-insensitive literal substring against the task body. The four date-range pairs — `created`, `updated`, `completed`, `claimed` — each take `_after` (inclusive, >=) and `_before` (exclusive, <) RFC 3339 timestamps. Filtering on `completed_*` or `claimed_*` drops rows where that timestamp is null. Malformed timestamps are rejected.\n\nOrdering: `order_by` is `created_at` | `updated_at` | `completed_at` | `claimed_at` (default `created_at`); sorting by a nullable field (`completed_at`, `claimed_at`) drops rows where that field is null. `desc: true` reverses (default ascending). `limit` caps the rows. Pass bodies:false to omit task bodies + notes (frontmatter only) — use it when drilling down from project.overview."
+        description = "List tasks subject to a predicate filter. Filters AND-together.\n\nLIVE BY DEFAULT: with no `status` filter, returns only live (non-terminal) tasks — `done` and `cancelled` are hidden. Pass `include_terminal: true` to get every status (the old default), or an explicit `status` (incl. terminal values like `done`) which always wins verbatim and ignores `include_terminal`. Default sort is `created_at` ASC.\n\nCross-project: `project` is optional — omit it (or pass `null`) to scan every project in the corpus. `phase` is a phase slug and REQUIRES `project` (validation error otherwise — phase slugs are unique per project, not globally).\n\nFilters: `status` is a list (`todo` | `claimed` | `in_progress` | `blocked` | `done` | `cancelled`) — OR-of-statuses. `assignee` is an exact match against the task's `assignee` frontmatter (e.g. `human:michael`, `ship`). `blocked_by` is an exact match against one validated canonical external ref (`pr:owner/repo#N` or `url:https://...`). `body_contains` is a case-insensitive literal substring against the task body. The four date-range pairs — `created`, `updated`, `completed`, `claimed` — each take `_after` (inclusive, >=) and `_before` (exclusive, <) RFC 3339 timestamps. Filtering on `completed_*` or `claimed_*` drops rows where that timestamp is null. Malformed timestamps are rejected.\n\nOrdering: `order_by` is `created_at` | `updated_at` | `completed_at` | `claimed_at` (default `created_at`); sorting by a nullable field (`completed_at`, `claimed_at`) drops rows where that field is null. `desc: true` reverses (default ascending). `limit` caps the rows. Pass bodies:false to omit task bodies + notes (frontmatter only) — use it when drilling down from project.overview."
     )]
     async fn task_list(
         &self,
-        Parameters(args): Parameters<TaskListArgs>,
+        Parameters(mut args): Parameters<TaskListArgs>,
     ) -> Result<Json<TaskListResult>, ErrorData> {
         if args.phase.is_some() && args.project.is_none() {
             return Err(ErrorData::invalid_params(
                 "phase requires project (phase slugs are unique per project, not across the corpus)",
                 None,
             ));
+        }
+        if let Some(blocked_by) = &args.blocked_by {
+            let normalized = crate::domain::normalize_blocked_by(std::slice::from_ref(blocked_by))
+                .map_err(|err| ErrorData::invalid_params(err.to_string(), None))?;
+            args.blocked_by = normalized.into_iter().next();
         }
         let with_bodies = args.bodies.unwrap_or(true);
         let filter = TaskListFilter::from(args);

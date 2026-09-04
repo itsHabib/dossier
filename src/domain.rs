@@ -11,6 +11,7 @@ use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
+use url::Url;
 
 /// Maximum number of keys in an artifact `meta` map.
 pub const ARTIFACT_META_MAX_KEYS: usize = 16;
@@ -185,6 +186,9 @@ pub struct Task {
     pub notes: Vec<Note>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
+    /// Canonical external references that currently block this task.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_by: Vec<String>,
 }
 
 /// One append-only entry in a task's `## Notes` section.
@@ -245,6 +249,9 @@ pub struct TaskListFilter {
     pub status: Option<Vec<TaskStatus>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignee: Option<String>,
+    /// Exact match against one canonical external blocker reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body_contains: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -573,6 +580,7 @@ pub struct NewTask {
     pub body: String,
     pub actor: String,
     pub depends_on: Vec<String>,
+    pub blocked_by: Vec<String>,
 }
 
 /// Arguments for `task.claim`. Same-actor re-claim on a non-terminal task
@@ -593,6 +601,7 @@ pub struct UpdateTask {
     pub note: Option<String>,
     pub actor: String,
     pub depends_on: Option<Vec<String>>,
+    pub blocked_by: Option<Vec<String>>,
 }
 
 /// Arguments for `task.complete`. Completes from `in_progress`, or walks
@@ -686,6 +695,120 @@ pub fn validate_task_body(body: &str) -> Result<()> {
         bail!("task body must not contain a `## Notes` heading (reserved as the notes-section delimiter; use a different heading like `### Notes`)");
     }
     Ok(())
+}
+
+/// Validate and trim a task's external blocker references.
+///
+/// The accepted v0 grammar is `pr:<owner>/<repo>#<positive-number>` or
+/// `url:<absolute-https-url>`. GitHub pull-request URLs are rejected in favor
+/// of the `pr:` spelling so exact-match queries cannot split one referent
+/// across two keys. Duplicates are rejected after trimming.
+pub fn normalize_blocked_by(values: &[String]) -> Result<Vec<String>> {
+    let mut normalized = Vec::with_capacity(values.len());
+    for raw in values {
+        let value = raw.trim();
+        validate_blocker_ref(value)?;
+        if normalized.iter().any(|existing| existing == value) {
+            bail!("duplicate blocked_by reference: {value}");
+        }
+        normalized.push(value.to_owned());
+    }
+    Ok(normalized)
+}
+
+fn validate_blocker_ref(value: &str) -> Result<()> {
+    if let Some(reference) = value.strip_prefix("pr:") {
+        return validate_pr_ref(reference, value);
+    }
+    if let Some(reference) = value.strip_prefix("url:") {
+        return validate_url_ref(reference, value);
+    }
+    invalid_blocker_ref(value)
+}
+
+fn validate_pr_ref(reference: &str, value: &str) -> Result<()> {
+    let Some((repository, number)) = reference.split_once('#') else {
+        return invalid_blocker_ref(value);
+    };
+    if number.starts_with('0') || !number.chars().all(|c| c.is_ascii_digit()) {
+        return invalid_blocker_ref(value);
+    }
+    let Ok(number) = number.parse::<u64>() else {
+        return invalid_blocker_ref(value);
+    };
+    if number == 0 {
+        return invalid_blocker_ref(value);
+    }
+    let mut parts = repository.split('/');
+    let (Some(owner), Some(repo), None) = (parts.next(), parts.next(), parts.next()) else {
+        return invalid_blocker_ref(value);
+    };
+    if !valid_github_owner(owner) || !valid_github_repo(repo) {
+        return invalid_blocker_ref(value);
+    }
+    Ok(())
+}
+
+fn valid_github_owner(owner: &str) -> bool {
+    !owner.is_empty()
+        && owner.len() <= 39
+        && !owner.starts_with('-')
+        && !owner.ends_with('-')
+        && owner.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+fn valid_github_repo(repo: &str) -> bool {
+    !repo.is_empty()
+        && repo.len() <= 100
+        && repo
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+fn validate_url_ref(reference: &str, value: &str) -> Result<()> {
+    let Ok(url) = Url::parse(reference) else {
+        return invalid_blocker_ref(value);
+    };
+    if url.scheme() != "https" || url.host_str().is_none() {
+        return invalid_blocker_ref(value);
+    }
+    if let Some(canonical) = github_pull_ref(&url) {
+        bail!("github pull request URL is not allowed in blocked_by; use {canonical}");
+    }
+    Ok(())
+}
+
+fn github_pull_ref(url: &Url) -> Option<String> {
+    let host = url.host_str()?;
+    if !host.eq_ignore_ascii_case("github.com") && !host.eq_ignore_ascii_case("www.github.com") {
+        return None;
+    }
+    let mut segments = url.path_segments()?;
+    let owner = segments.next()?;
+    let repo = segments.next()?;
+    if !segments.next()?.eq_ignore_ascii_case("pull") {
+        return None;
+    }
+    let raw_number = segments.next()?;
+    let number = raw_number
+        .strip_suffix(".diff")
+        .or_else(|| raw_number.strip_suffix(".patch"))
+        .unwrap_or(raw_number);
+    if !valid_github_owner(owner)
+        || !valid_github_repo(repo)
+        || number.starts_with('0')
+        || !number.chars().all(|c| c.is_ascii_digit())
+        || number.parse::<u64>().ok()? == 0
+    {
+        return None;
+    }
+    Some(format!("pr:{owner}/{repo}#{number}"))
+}
+
+fn invalid_blocker_ref<T>(value: &str) -> Result<T> {
+    bail!(
+        "invalid blocked_by reference: {value} (expected pr:<owner>/<repo>#<positive-number> or url:<absolute-https-url>)"
+    )
 }
 
 const fn task_status_str(s: TaskStatus) -> &'static str {
@@ -870,11 +993,85 @@ pub fn apply_task_complete(mut task: Task, actor: &str, now: DateTime<Utc>) -> R
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::panic)]
+    #![allow(
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::unwrap_used,
+        clippy::panic,
+        reason = "unit tests"
+    )]
 
     use super::{
-        truncate_description, PhaseStatus, ProjectStatus, TaskStatus, OVERVIEW_DESCRIPTION_CHARS,
+        normalize_blocked_by, truncate_description, PhaseStatus, ProjectStatus, TaskStatus,
+        OVERVIEW_DESCRIPTION_CHARS,
     };
+
+    #[test]
+    fn blocker_refs_accept_canonical_pr_and_https_url_forms() {
+        let refs = vec![
+            "  pr:itsHabib/ship#203  ".to_owned(),
+            "url:https://example.com/builds/run-42?view=summary#log".to_owned(),
+            "url:https://github.com/itsHabib/ship/issues/203".to_owned(),
+            "url:https://github.com/itsHabib/ship/commit/abc123".to_owned(),
+            "url:https://github.com/itsHabib/ship/releases/tag/v1".to_owned(),
+        ];
+        let got = normalize_blocked_by(&refs).expect("valid blocker refs");
+        assert_eq!(got[0], "pr:itsHabib/ship#203");
+        assert_eq!(got[1], refs[1]);
+        assert_eq!(got[2], refs[2]);
+        assert_eq!(got[3], refs[3]);
+        assert_eq!(got[4], refs[4]);
+    }
+
+    #[test]
+    fn blocker_refs_reject_malformed_and_duplicate_values() {
+        for value in [
+            "",
+            "tsk_01KXEFMW06XGAGHX0WF1616MWZ",
+            "issue:owner/repo#1",
+            "pr:owner/repo#0",
+            "pr:owner/repo#01",
+            "pr:owner/repo",
+            "pr:owner/repo#nope",
+            "pr:owner/another/repo#1",
+            "url:http://example.com/blocker",
+            "url:/relative/path",
+        ] {
+            let err = normalize_blocked_by(&[value.to_owned()]).expect_err("invalid blocker");
+            assert!(
+                err.to_string().contains("invalid blocked_by reference"),
+                "unexpected error for {value}: {err}"
+            );
+        }
+
+        let err =
+            normalize_blocked_by(&["pr:owner/repo#1".to_owned(), " pr:owner/repo#1 ".to_owned()])
+                .expect_err("duplicate blocker");
+        assert_eq!(
+            err.to_string(),
+            "duplicate blocked_by reference: pr:owner/repo#1"
+        );
+    }
+
+    #[test]
+    fn blocker_refs_reject_github_pull_url_aliases_with_canonical_form() {
+        for value in [
+            "url:https://github.com/itsHabib/ship/pull/203",
+            "url:https://github.com/itsHabib/ship/pull/203/",
+            "url:https://github.com/itsHabib/ship/pull/203?w=1",
+            "url:https://github.com/itsHabib/ship/pull/203#issuecomment-1",
+            "url:https://github.com/itsHabib/ship/pull/203/files",
+            "url:https://github.com/itsHabib/ship/pull/203.diff",
+            "url:https://github.com/itsHabib/ship/pull/203.patch",
+            "url:https://www.github.com/itsHabib/ship/pull/203",
+        ] {
+            let err = normalize_blocked_by(&[value.to_owned()]).expect_err("GitHub PR URL");
+            assert_eq!(
+                err.to_string(),
+                "github pull request URL is not allowed in blocked_by; use pr:itsHabib/ship#203"
+            );
+        }
+    }
 
     #[test]
     fn task_is_terminal_matches_table() {

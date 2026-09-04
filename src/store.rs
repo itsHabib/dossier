@@ -13,7 +13,7 @@ use std::sync::Mutex;
 
 // Read-model types + write-verb DTOs — re-exported for callers that reach
 // them through the `store` namespace (backward compat).
-use crate::domain::is_valid_slug;
+use crate::domain::{is_valid_slug, normalize_blocked_by};
 pub use crate::domain::{
     Artifact, ClaimTask, CompleteTask, LinkArtifact, NewPhase, NewProject, NewTask, Phase,
     PhaseListFilter, PhaseOrderField, PhaseStatus, Project, ProjectListFilter, ProjectOrderField,
@@ -352,6 +352,8 @@ impl Store for FsStore {
         task: &Task,
         expected: Option<Version>,
     ) -> Result<Version, StoreError> {
+        let mut task = task.clone();
+        task.blocked_by = normalize_blocked_by(&task.blocked_by).map_err(store_invalid)?;
         let path = self
             .project_dir(&task.project_slug)
             .map_err(store_invalid)?
@@ -366,8 +368,8 @@ impl Store for FsStore {
         // Regenerates the `## Notes` section from the parsed `task.notes`; any raw note
         // lines the in-memory `Task` doesn't carry are not round-tripped, so callers must
         // load the full task (notes included) before mutating to avoid dropping history.
-        let notes_lines = notes_lines_for_task(task);
-        let content = serialize_task_file(task, &notes_lines).map_err(store_invalid)?;
+        let notes_lines = notes_lines_for_task(&task);
+        let content = serialize_task_file(&task, &notes_lines).map_err(store_invalid)?;
         self.cas_write(&path, content.as_bytes(), expected)
     }
 
@@ -825,6 +827,7 @@ pub(crate) fn parse_phase(raw: &str) -> Result<Phase> {
 pub(crate) fn parse_task(raw: &str, project_slug: &str) -> Result<(Task, Vec<String>)> {
     let (front, body) = split_frontmatter(raw)?;
     let mut t: Task = serde_norway::from_str(&front).context("parse task frontmatter")?;
+    t.blocked_by = normalize_blocked_by(&t.blocked_by).context("validate blocked_by")?;
     let (spec, notes_lines) = split_task_body(&body);
     t.body = spec;
     project_slug.clone_into(&mut t.project_slug);
@@ -1112,6 +1115,8 @@ struct TaskFrontmatter<'a> {
     updated_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "<[String]>::is_empty")]
     depends_on: &'a [String],
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    blocked_by: &'a [String],
 }
 
 impl<'a> From<&'a Task> for TaskFrontmatter<'a> {
@@ -1129,6 +1134,7 @@ impl<'a> From<&'a Task> for TaskFrontmatter<'a> {
             created_at: t.created_at,
             updated_at: t.updated_at,
             depends_on: &t.depends_on,
+            blocked_by: &t.blocked_by,
         }
     }
 }
@@ -1138,7 +1144,9 @@ impl<'a> From<&'a Task> for TaskFrontmatter<'a> {
 /// `notes_lines`. Each note line is emitted verbatim with one trailing
 /// newline.
 pub(crate) fn serialize_task_file(task: &Task, notes_lines: &[String]) -> Result<String> {
-    let frontmatter = serde_norway::to_string(&TaskFrontmatter::from(task))
+    let mut normalized_task = task.clone();
+    normalized_task.blocked_by = normalize_blocked_by(&task.blocked_by)?;
+    let frontmatter = serde_norway::to_string(&TaskFrontmatter::from(&normalized_task))
         .context("serialize task frontmatter")?;
     let spec = task.body.trim();
     let mut out = format!("---\n{frontmatter}---\n");
@@ -1276,6 +1284,11 @@ pub(crate) fn task_matches(t: &Task, f: &TaskListFilter, resolved_phase_id: Opti
     }
     if let Some(assignee) = &f.assignee {
         if &t.assignee != assignee {
+            return false;
+        }
+    }
+    if let Some(blocked_by) = &f.blocked_by {
+        if !t.blocked_by.contains(blocked_by) {
             return false;
         }
     }
@@ -1851,6 +1864,7 @@ created_by: human:michael
             updated_at: now,
             notes: Vec::new(),
             depends_on: Vec::new(),
+            blocked_by: Vec::new(),
         };
         block_on_store(Store::put_task(store, &task, None)).expect("seed task");
         task
@@ -1874,15 +1888,16 @@ created_by: human:michael
     }
 
     #[test]
-    fn task_create_defaults_depends_on_empty() {
+    fn task_create_defaults_dependency_fields_empty() {
         let (_tmp, store) = fresh_corpus();
         seed_project(&store, "alpha");
         let task = seed_task(&store, "alpha", "no-deps");
         assert!(task.depends_on.is_empty());
+        assert!(task.blocked_by.is_empty());
     }
 
     #[test]
-    fn read_task_with_missing_depends_on_defaults_empty() {
+    fn read_legacy_task_with_missing_dependency_fields_defaults_empty() {
         let (tmp, store) = fresh_corpus();
         let project = seed_project(&store, "alpha");
         let tsk_id = new_id("tsk");
@@ -1914,10 +1929,11 @@ updated_at: 2026-05-10T14:30:00Z
             .find(|tk| tk.slug == "legacy-deps")
             .expect("legacy task readable");
         assert!(t.depends_on.is_empty());
+        assert!(t.blocked_by.is_empty());
     }
 
     #[test]
-    fn task_with_empty_depends_on_omits_field_on_write() {
+    fn task_with_empty_dependency_fields_omits_them_on_write() {
         let (_tmp, store) = fresh_corpus();
         seed_project(&store, "alpha");
         let task = seed_task(&store, "alpha", "no-dep-field");
@@ -1926,6 +1942,10 @@ updated_at: 2026-05-10T14:30:00Z
         assert!(
             !raw.contains("depends_on:"),
             "empty depends_on must be omitted from frontmatter"
+        );
+        assert!(
+            !raw.contains("blocked_by:"),
+            "empty blocked_by must be omitted from frontmatter"
         );
     }
 
@@ -2154,6 +2174,7 @@ updated_at: 2026-05-10T14:30:00Z
             updated_at: created_at,
             notes: Vec::new(),
             depends_on: Vec::new(),
+            blocked_by: Vec::new(),
         }
     }
 
@@ -3439,6 +3460,7 @@ updated_at: 2026-05-10T14:30:00Z
             updated_at: ts_upd,
             notes: vec![note],
             depends_on: Vec::new(),
+            blocked_by: Vec::new(),
         };
 
         let path = tasks_dir.join(task_filename(&tsk_id, task_slug));

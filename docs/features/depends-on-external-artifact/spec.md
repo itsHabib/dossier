@@ -1,4 +1,4 @@
-**Status**: draft
+**Status**: accepted
 **Owner**: @codex
 **Date**: 2026-07-28
 **Related**: dossier task `depends-on-external-artifact` (id: `tsk_01KXEFMW06XGAGHX0WF1616MWZ`)
@@ -100,4 +100,3 @@ resolved, consistent with the non-goals.
 - Polling GitHub or automatically clearing a blocker when a PR merges.
 - Adding external nodes to the task-to-task dependency DAG.
 - Proxy tasks, artifact mutation, wildcard blocker searches, or URL dereferencing.
-
