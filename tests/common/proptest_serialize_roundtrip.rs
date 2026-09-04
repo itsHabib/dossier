@@ -194,6 +194,7 @@ fn task_strategy() -> impl Strategy<Value = Task> {
                 updated_at,
                 notes: notes.unwrap_or_default(),
                 depends_on: Vec::new(),
+                blocked_by: Vec::new(),
             },
         )
 }

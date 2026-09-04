@@ -6,6 +6,7 @@
     clippy::missing_const_for_fn,
     clippy::missing_panics_doc,
     clippy::missing_errors_doc,
+    clippy::too_many_lines,
     reason = "integration tests"
 )]
 
@@ -126,6 +127,131 @@ async fn mcp_stdio_project_create_then_get_round_trips() {
         Value::String("MCP stdio E2E".to_owned())
     );
     assert_eq!(fetched["project"]["id"], created["id"]);
+
+    client.cancel().await.expect("shutdown dossier serve");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_stdio_external_blockers_round_trip_filter_replace_and_clear() {
+    let (tmp, _store) = fresh_corpus();
+    let client = connect_mcp(tmp.path()).await;
+
+    let project_args = json!({
+        "slug": "external-blockers",
+        "title": "External blockers",
+        "actor": "test:mcp-stdio"
+    })
+    .as_object()
+    .expect("project args object")
+    .clone();
+    client
+        .call_tool(CallToolRequestParams::new("project.create").with_arguments(project_args))
+        .await
+        .expect("project.create");
+
+    let create_args = json!({
+        "project": "external-blockers",
+        "slug": "waiting-on-pr",
+        "title": "Waiting on PR",
+        "actor": "test:mcp-stdio",
+        "depends_on": ["tsk_existing_dependency"],
+        "blocked_by": [" pr:itsHabib/ship#203 ", "url:https://example.com/build/42"]
+    })
+    .as_object()
+    .expect("task create args object")
+    .clone();
+    let created = client
+        .call_tool(CallToolRequestParams::new("task.create").with_arguments(create_args))
+        .await
+        .expect("task.create");
+    let created = tool_result_value(created);
+    assert_eq!(created["blocked_by"][0], "pr:itsHabib/ship#203");
+    let task_id = created["id"].as_str().expect("task id").to_owned();
+
+    let get_args = json!({ "id": task_id.clone() })
+        .as_object()
+        .expect("task get args object")
+        .clone();
+    let fetched = client
+        .call_tool(CallToolRequestParams::new("task.get").with_arguments(get_args))
+        .await
+        .expect("task.get");
+    let fetched = tool_result_value(fetched);
+    assert_eq!(
+        fetched["blocked_by"],
+        json!(["pr:itsHabib/ship#203", "url:https://example.com/build/42"])
+    );
+
+    let project_get_args = json!({ "slug": "external-blockers" })
+        .as_object()
+        .expect("project get args object")
+        .clone();
+    let project = client
+        .call_tool(CallToolRequestParams::new("project.get").with_arguments(project_get_args))
+        .await
+        .expect("project.get");
+    let project = tool_result_value(project);
+    assert_eq!(project["tasks"][0]["blocked_by"], fetched["blocked_by"]);
+
+    let list_args = json!({
+        "project": "external-blockers",
+        "blocked_by": "pr:itsHabib/ship#203"
+    })
+    .as_object()
+    .expect("task list args object")
+    .clone();
+    let listed = client
+        .call_tool(CallToolRequestParams::new("task.list").with_arguments(list_args))
+        .await
+        .expect("task.list");
+    let listed = tool_result_value(listed);
+    assert_eq!(listed["tasks"].as_array().expect("tasks").len(), 1);
+    assert_eq!(listed["tasks"][0]["id"], task_id);
+
+    let update_args = json!({
+        "id": task_id,
+        "actor": "test:mcp-stdio",
+        "blocked_by": ["pr:owner/repo#9"]
+    })
+    .as_object()
+    .expect("task update args object")
+    .clone();
+    let updated = client
+        .call_tool(CallToolRequestParams::new("task.update").with_arguments(update_args))
+        .await
+        .expect("task.update");
+    let updated = tool_result_value(updated);
+    assert_eq!(updated["blocked_by"], json!(["pr:owner/repo#9"]));
+    assert_eq!(updated["depends_on"], json!(["tsk_existing_dependency"]));
+
+    let clear_args = json!({
+        "id": updated["id"],
+        "actor": "test:mcp-stdio",
+        "blocked_by": []
+    })
+    .as_object()
+    .expect("task clear args object")
+    .clone();
+    let cleared = client
+        .call_tool(CallToolRequestParams::new("task.update").with_arguments(clear_args))
+        .await
+        .expect("task.update clear");
+    let cleared = tool_result_value(cleared);
+    assert!(cleared.get("blocked_by").is_none());
+
+    let project_get_args = json!({ "slug": "external-blockers" })
+        .as_object()
+        .expect("project get args object")
+        .clone();
+    let project = client
+        .call_tool(CallToolRequestParams::new("project.get").with_arguments(project_get_args))
+        .await
+        .expect("project.get");
+    let project = tool_result_value(project);
+    assert_eq!(
+        project["tasks"][0]["depends_on"],
+        json!(["tsk_existing_dependency"])
+    );
 
     client.cancel().await.expect("shutdown dossier serve");
 }

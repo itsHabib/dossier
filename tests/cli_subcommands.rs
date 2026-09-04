@@ -63,6 +63,7 @@ fn seed_task(svc: &MeshService, project: &str, slug: &str) -> Task {
         body: "spec body".to_owned(),
         actor: "human:test".to_owned(),
         depends_on: Vec::new(),
+        blocked_by: Vec::new(),
     }))
     .expect("create task")
 }
@@ -331,6 +332,89 @@ fn cli_task_list_filters_match_store() {
     let cli_ids: Vec<_> = cli_tasks.iter().map(|t| t.id.as_str()).collect();
     assert!(cli_ids.contains(&todo.id.as_str()));
     assert!(cli_ids.contains(&active.id.as_str()));
+}
+
+#[test]
+fn cli_updates_lists_and_clears_external_blockers() {
+    let (tmp, svc) = fresh_service();
+    seed_project(&svc, "alpha");
+    let task = seed_task(&svc, "alpha", "external-blocker");
+
+    let (code, stdout, stderr) = run_cli(
+        tmp.path(),
+        &[
+            "task_update",
+            "--id",
+            &task.id,
+            "--blocked-by",
+            " pr:itsHabib/ship#203 ",
+            "--blocked-by",
+            "url:https://example.com/build/42",
+            "--actor",
+            "cli:test",
+        ],
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let updated: Task = parse_json(&stdout);
+    assert_eq!(
+        updated.blocked_by,
+        vec![
+            "pr:itsHabib/ship#203".to_owned(),
+            "url:https://example.com/build/42".to_owned(),
+        ]
+    );
+
+    let (code, stdout, stderr) = run_cli(
+        tmp.path(),
+        &[
+            "task_list",
+            "--project",
+            "alpha",
+            "--blocked-by",
+            "pr:itsHabib/ship#203",
+        ],
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let listed: Vec<Task> = parse_json(&stdout);
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, task.id);
+
+    let (code, stdout, stderr) = run_cli(
+        tmp.path(),
+        &[
+            "task_update",
+            "--id",
+            &task.id,
+            "--clear-blocked-by",
+            "--actor",
+            "cli:test",
+        ],
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let cleared: Task = parse_json(&stdout);
+    assert!(cleared.blocked_by.is_empty());
+}
+
+#[test]
+fn cli_rejects_malformed_external_blocker() {
+    let (tmp, svc) = fresh_service();
+    seed_project(&svc, "alpha");
+    let task = seed_task(&svc, "alpha", "bad-blocker");
+
+    let (code, _, stderr) = run_cli(
+        tmp.path(),
+        &[
+            "task_update",
+            "--id",
+            &task.id,
+            "--blocked-by",
+            "tsk_not_external",
+            "--actor",
+            "cli:test",
+        ],
+    );
+    assert_ne!(code, 0);
+    assert!(stderr.contains("invalid blocked_by reference"));
 }
 
 #[test]

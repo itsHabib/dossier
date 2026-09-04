@@ -114,6 +114,7 @@ proptest! {
             body: String::new(),
             actor: "human:michael".into(),
             depends_on: Vec::new(),
+            blocked_by: Vec::new(),
         }))
         .expect("create_task on valid slug");
         prop_assert_eq!(task.slug, task_slug);
@@ -189,6 +190,7 @@ proptest! {
             body: String::new(),
             actor: "human:michael".into(),
             depends_on: Vec::new(),
+            blocked_by: Vec::new(),
         }));
         prop_assert!(result.is_err());
     }

@@ -82,6 +82,21 @@ A discrete piece of work an implementer can claim and complete.
 | `claimed_at`   | timestamp \| null                                                 |                               |
 | `completed_at` | timestamp \| null                                                 |                               |
 | `notes`        | array of `{ actor, body, posted_at }`                             | append-only progress log      |
+| `depends_on`   | array of task ids                                                | task-to-task dependencies; empty when omitted |
+| `blocked_by`   | array of external blocker refs                                   | validated, order-preserving; empty when omitted |
+
+`blocked_by` references use a closed v0 grammar:
+
+- `pr:<owner>/<repo>#<positive-number>`
+- `url:<absolute-https-url>`
+
+Inputs are trimmed. Duplicate values, task ids, non-HTTPS URLs, malformed
+values, and unknown schemes are rejected. A GitHub pull-request URL is also
+rejected, including trailing-slash, query, fragment, and PR-subpage variants;
+GitHub PRs have one canonical spelling, `pr:<owner>/<repo>#<number>`. Other
+GitHub URLs such as issues, commits, and releases remain valid `url:` values.
+References are opaque after validation: dossier never fetches or resolves the
+external system.
 
 ### Artifact
 
@@ -236,12 +251,12 @@ writes are idempotent on `(actor, request_id)` if `request_id` is supplied.
 
 ### Task
 
-- `task.create` — `{ project, phase?, title, body }` → Task (status=`todo`)
+- `task.create` — `{ project, phase?, title, body, depends_on?, blocked_by? }` → Task (status=`todo`). `blocked_by` accepts the validated external-reference grammar above.
 - `task.claim` — `{ id, actor }` → Task (status=`claimed`, assignee=actor). Fails if already claimed by another actor.
-- `task.update` — `{ id, body?, status?, note? }` → Task. `note` appends to log.
+- `task.update` — `{ id, body?, status?, note?, depends_on?, blocked_by? }` → Task. `note` appends to log. Omitted `blocked_by` is unchanged; a supplied list replaces it; `[]` clears it.
 - `task.complete` — `{ id, actor, note? }` → Task (status=`done`, completed_at=now). From `in_progress`, completes directly. From `todo` or `claimed` (same actor), performs claim → in_progress → done as one compound transition (assignee=`actor`, `claimed_at` and `completed_at` stamped). Cross-actor `claimed` rejects.
 - `task.get` — `{ id }` → Task. Walks every project; no project slug required. Malformed id → `invalid_params("invalid id format")`; well-formed but absent → `invalid_params("task not found: ")` followed by the queried ULID.
-- `task.list` — `{ project?, phase?, status?, assignee?, body_contains?, created_after?, created_before?, updated_after?, updated_before?, completed_after?, completed_before?, claimed_after?, claimed_before?, order_by?, desc?, limit? }` → list of Task. `project` is optional (omit / `null` = cross-corpus); `phase` is a slug and requires `project`. `status` is a list (OR-of-statuses). `body_contains` is a case-insensitive literal substring. Date params are RFC 3339; `_after` is inclusive, `_before` is exclusive. `order_by` on a nullable field (`completed_at`, `claimed_at`) drops rows where that field is null.
+- `task.list` — `{ project?, phase?, status?, assignee?, blocked_by?, body_contains?, created_after?, created_before?, updated_after?, updated_before?, completed_after?, completed_before?, claimed_after?, claimed_before?, order_by?, desc?, limit? }` → list of Task. `project` is optional (omit / `null` = cross-corpus); `phase` is a slug and requires `project`. `status` is a list (OR-of-statuses). `blocked_by` is an exact match against one validated external ref and AND-composes with every other predicate. `body_contains` is a case-insensitive literal substring. Date params are RFC 3339; `_after` is inclusive, `_before` is exclusive. `order_by` on a nullable field (`completed_at`, `claimed_at`) drops rows where that field is null.
 
 ### Search
 

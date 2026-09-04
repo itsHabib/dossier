@@ -361,6 +361,7 @@ mod tests {
             body: String::new(),
             actor: "t".to_owned(),
             depends_on: Vec::new(),
+            blocked_by: Vec::new(),
         }))
         .expect("seed alpha task");
         block_on(svc.create_task(NewTask {
@@ -371,6 +372,7 @@ mod tests {
             body: String::new(),
             actor: "t".to_owned(),
             depends_on: Vec::new(),
+            blocked_by: Vec::new(),
         }))
         .expect("seed beta task");
 
@@ -454,6 +456,7 @@ mod tests {
             body: "BODYKEY-epsilon in spec".to_owned(),
             actor: "t".to_owned(),
             depends_on: Vec::new(),
+            blocked_by: Vec::new(),
         }))
         .expect("seed task");
 
@@ -620,6 +623,7 @@ mod tests {
             note: Some("note about zzzuniquezzz term".to_owned()),
             actor: "t".to_owned(),
             depends_on: None,
+            blocked_by: None,
         }))
         .expect("append note");
         let hits = search_hits(
@@ -658,6 +662,7 @@ mod tests {
             status: None,
             note: None,
             depends_on: None,
+            blocked_by: None,
             actor: "human:test".to_owned(),
         })))
         .expect("body live");
@@ -667,6 +672,7 @@ mod tests {
             status: None,
             note: None,
             depends_on: None,
+            blocked_by: None,
             actor: "human:test".to_owned(),
         })))
         .expect("body term");
