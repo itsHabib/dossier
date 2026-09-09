@@ -99,6 +99,11 @@ GitHub URLs such as issues, commits, and releases remain valid `url:` values.
 References are opaque after validation: dossier never fetches or resolves the
 external system.
 
+
+HTTPS blocker references containing a username or password are rejected before
+persistence with an error that does not echo the URL or credentials. URLs are
+otherwise opaque; this is not a general secret scanner for paths or queries.
+
 ### Artifact
 
 A pointer to something concrete the work produced or depends on.

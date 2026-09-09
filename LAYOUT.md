@@ -137,6 +137,11 @@ and `url:<absolute-https-url>`; GitHub pull-request URLs are rejected in favor
 of their canonical `pr:` form. This is syntax-only metadata: the storage layer
 does not dereference or poll the target.
 
+
+HTTPS blocker references containing a username or password are rejected before
+persistence with an error that does not echo the URL or credentials. URLs are
+otherwise opaque; this is not a general secret scanner for paths or queries.
+
 ## artifacts.jsonl
 
 One JSON object per line, append-only. Artifacts are dense small records

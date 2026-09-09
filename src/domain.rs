@@ -706,11 +706,12 @@ pub fn validate_task_body(body: &str) -> Result<()> {
 /// URL references retain their case-sensitive paths and query strings.
 pub fn normalize_blocked_by(values: &[String]) -> Result<Vec<String>> {
     let mut normalized = Vec::with_capacity(values.len());
+    let mut seen = std::collections::HashSet::with_capacity(values.len());
     for raw in values {
         let value = raw.trim();
         validate_blocker_ref(value)?;
         let value = canonical_blocker_ref(value);
-        if normalized.contains(&value) {
+        if !seen.insert(value.clone()) {
             bail!("duplicate blocked_by reference: {value}");
         }
         normalized.push(value);
@@ -778,6 +779,9 @@ fn validate_url_ref(reference: &str, value: &str) -> Result<()> {
     let Ok(url) = Url::parse(reference) else {
         return invalid_blocker_ref(value);
     };
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("credential-bearing URLs are not allowed in blocked_by");
+    }
     if url.scheme() != "https" || url.host_str().is_none() {
         return invalid_blocker_ref(value);
     }
@@ -1050,6 +1054,22 @@ mod tests {
             "url:https://example.com/build?key=a".to_owned(),
         ];
         assert_eq!(normalize_blocked_by(&refs).expect("distinct URLs"), refs);
+    }
+
+    #[test]
+    fn blocker_refs_reject_url_credentials_without_echoing_them() {
+        for value in [
+            "url:https://username:secret@example.com/build/42",
+            "url:https://username@example.com/build/42",
+            "url:https://:secret@example.com/build/42",
+            "url:https://us%65r:sec%72et@example.com/build/42",
+        ] {
+            let err = normalize_blocked_by(&[value.to_owned()]).expect_err("credentials");
+            assert_eq!(
+                err.to_string(),
+                "credential-bearing URLs are not allowed in blocked_by"
+            );
+        }
     }
 
     #[test]

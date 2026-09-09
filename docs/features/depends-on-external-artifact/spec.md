@@ -56,6 +56,11 @@ under-returns — the same bug, harder to see. A closed door needs no symmetry.
 This is a syntactic check on the reference itself; nothing is fetched or
 resolved, consistent with the non-goals.
 
+
+HTTPS blocker references containing a username or password are rejected before
+persistence with an error that does not echo the URL or credentials. URLs are
+otherwise opaque; this is not a general secret scanner for paths or queries.
+
 ## Behavior
 
 - Persist `blocked_by` in task frontmatter, omitting it when empty. Missing fields
