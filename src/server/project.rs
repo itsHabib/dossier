@@ -481,6 +481,7 @@ mod tests {
             body: String::new(),
             actor: "human:test".to_owned(),
             depends_on: Vec::new(),
+            blocked_by: Vec::new(),
         })))
         .expect("alpha task");
 
@@ -492,6 +493,7 @@ mod tests {
             body: String::new(),
             actor: "human:test".to_owned(),
             depends_on: Vec::new(),
+            blocked_by: Vec::new(),
         })))
         .expect("beta task");
 
@@ -532,6 +534,7 @@ mod tests {
             body: String::new(),
             actor: "human:test".to_owned(),
             depends_on: Vec::new(),
+            blocked_by: Vec::new(),
         })))
         .expect("task.create");
         t
@@ -596,6 +599,7 @@ mod tests {
             status: Some(TaskStatus::InProgress),
             note: None,
             depends_on: None,
+            blocked_by: None,
             actor: "human:test".to_owned(),
         })))
         .expect("t-prog in_progress");

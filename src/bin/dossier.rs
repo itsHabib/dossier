@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 use rmcp::{transport::stdio, ServiceExt};
 use serde::Serialize;
 
-use dossier::domain::{resolve_status, Task, TaskListFilter, TaskStatus};
+use dossier::domain::{normalize_blocked_by, resolve_status, Task, TaskListFilter, TaskStatus};
 use dossier::server::MeshService;
 use dossier::store::{
     store_error_to_anyhow, CompleteTask, FsStore, LinkArtifact, Store, UpdateTask,
@@ -48,15 +48,21 @@ enum Command {
         #[arg(long)]
         actor: Option<String>,
     },
-    /// Append a note to a task (MCP `task.update`)
+    /// Update a task note and/or external blockers (MCP `task.update`)
     #[command(name = "task_update")]
     TaskUpdate {
         /// task id (`tsk_` + ULID)
         #[arg(long)]
         id: String,
-        /// note line appended to the task's `## Notes` log
+        /// optional note line appended to the task's `## Notes` log
         #[arg(long)]
-        note: String,
+        note: Option<String>,
+        /// replace external blockers; repeat for multiple refs
+        #[arg(long = "blocked-by", conflicts_with = "clear_blocked_by")]
+        blocked_by: Vec<String>,
+        /// clear every external blocker
+        #[arg(long, conflicts_with = "blocked_by")]
+        clear_blocked_by: bool,
         /// who's making the update; default `cli:$USER` (or `cli`)
         #[arg(long)]
         actor: Option<String>,
@@ -101,6 +107,9 @@ enum Command {
         /// exact match against assignee frontmatter
         #[arg(long)]
         assignee: Option<String>,
+        /// exact match against a canonical external blocker ref
+        #[arg(long = "blocked-by")]
+        blocked_by: Option<String>,
         /// cap the number of returned rows
         #[arg(long)]
         limit: Option<usize>,
@@ -149,8 +158,21 @@ async fn main() -> Result<()> {
         Command::TaskComplete { id, note, actor } => {
             run_task_complete(&resolve_corpus(cli.corpus)?, id, note, actor).await
         }
-        Command::TaskUpdate { id, note, actor } => {
-            run_task_update(&resolve_corpus(cli.corpus)?, id, note, actor).await
+        Command::TaskUpdate {
+            id,
+            note,
+            blocked_by,
+            clear_blocked_by,
+            actor,
+        } => {
+            let blocked_by = if clear_blocked_by {
+                Some(Vec::new())
+            } else if blocked_by.is_empty() {
+                None
+            } else {
+                Some(blocked_by)
+            };
+            run_task_update(&resolve_corpus(cli.corpus)?, id, note, blocked_by, actor).await
         }
         Command::ArtifactLink {
             project,
@@ -180,6 +202,7 @@ async fn main() -> Result<()> {
             phase,
             status,
             assignee,
+            blocked_by,
             limit,
             include_terminal,
         } => run_task_list(
@@ -189,6 +212,7 @@ async fn main() -> Result<()> {
                 phase,
                 status,
                 assignee,
+                blocked_by,
                 limit,
                 include_terminal,
             },
@@ -377,18 +401,23 @@ async fn run_task_complete(
 async fn run_task_update(
     corpus: &Path,
     id: String,
-    note: String,
+    note: Option<String>,
+    blocked_by: Option<Vec<String>>,
     actor: Option<String>,
 ) -> Result<()> {
+    if note.is_none() && blocked_by.is_none() {
+        bail!("task_update requires --note, --blocked-by, or --clear-blocked-by");
+    }
     let svc = MeshService::new(FsStore::open(corpus)?);
     let task = svc
         .update_task(UpdateTask {
             id,
             body: None,
             status: None,
-            note: Some(note),
+            note,
             actor: default_actor(actor),
             depends_on: None,
+            blocked_by,
         })
         .await
         .map_err(store_error_to_anyhow)?;
@@ -451,6 +480,7 @@ struct TaskListRequest {
     phase: Option<String>,
     status: Vec<String>,
     assignee: Option<String>,
+    blocked_by: Option<String>,
     limit: Option<usize>,
     include_terminal: bool,
 }
@@ -461,12 +491,17 @@ fn run_task_list(corpus: &Path, req: TaskListRequest) -> Result<()> {
         phase,
         status,
         assignee,
+        blocked_by,
         limit,
         include_terminal,
     } = req;
     if phase.is_some() && project.is_none() {
         bail!("phase requires project (phase slugs are unique per project, not across the corpus)");
     }
+    let blocked_by = blocked_by
+        .map(|value| normalize_blocked_by(&[value]))
+        .transpose()?
+        .and_then(|values| values.into_iter().next());
     // Same live-by-default policy as MCP `task.list` (shared `resolve_status`)
     // so the CLI and MCP task-list surfaces agree.
     let filter = TaskListFilter {
@@ -478,6 +513,7 @@ fn run_task_list(corpus: &Path, req: TaskListRequest) -> Result<()> {
             TaskStatus::live_statuses,
         ),
         assignee,
+        blocked_by,
         limit,
         ..TaskListFilter::default()
     };

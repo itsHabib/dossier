@@ -148,6 +148,8 @@ proptest! {
         body in body(),
         use_deps in any::<bool>(),
         dep_id in dep_id(),
+        blocker_number in 1_u64..1_000_000,
+        use_pr_blocker in any::<bool>(),
     ) {
         prop_assume!(proj_slug != task_slug);
         let (tmp, svc) = fresh_service();
@@ -166,6 +168,11 @@ proptest! {
         } else {
             vec![]
         };
+        let blocked_by = if use_pr_blocker {
+            vec![format!("pr:owner/repo#{blocker_number}")]
+        } else {
+            vec![format!("url:https://example.com/builds/{blocker_number}")]
+        };
         let created = block_on(svc.create_task(NewTask {
             project: proj_slug.clone(),
             phase: None,
@@ -174,6 +181,7 @@ proptest! {
             body: body.clone(),
             actor: "human:michael".into(),
             depends_on: depends_on.clone(),
+            blocked_by: blocked_by.clone(),
         }))
         .expect("create_task");
         let tasks = store
@@ -192,6 +200,7 @@ proptest! {
         prop_assert_eq!(&fetched.id, &created.id);
         prop_assert_eq!(fetched.status, created.status);
         prop_assert_eq!(&fetched.depends_on, &depends_on);
+        prop_assert_eq!(&fetched.blocked_by, &blocked_by);
     }
 }
 

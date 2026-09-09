@@ -13,8 +13,8 @@ use anyhow::Error as AnyhowError;
 
 use crate::domain::{
     append_task_note, apply_claim_task, apply_task_body_update, apply_task_complete,
-    apply_task_status_update, is_valid_slug, new_id, resolve_status, validate_task_body,
-    PhaseListFilter, Task, TaskListFilter, TaskOrderField, TaskStatus,
+    apply_task_status_update, is_valid_slug, new_id, normalize_blocked_by, resolve_status,
+    validate_task_body, PhaseListFilter, Task, TaskListFilter, TaskOrderField, TaskStatus,
 };
 use crate::store::{now_utc, ClaimTask, CompleteTask, NewTask, StoreError, UpdateTask, Versioned};
 
@@ -49,6 +49,9 @@ pub struct TaskListArgs {
     /// exact match against the task's `assignee` frontmatter field
     #[serde(default)]
     pub assignee: Option<String>,
+    /// exact match against one canonical external blocker reference
+    #[serde(default)]
+    pub blocked_by: Option<String>,
     /// case-insensitive literal substring matched against the task spec
     /// body only — the appended `## Notes` section is not searched
     #[serde(default)]
@@ -111,6 +114,7 @@ impl From<TaskListArgs> for TaskListFilter {
             phase: a.phase,
             status: resolve_status(a.status, a.include_terminal, TaskStatus::live_statuses),
             assignee: a.assignee,
+            blocked_by: a.blocked_by,
             body_contains: a.body_contains,
             created_after: a.created_after,
             created_before: a.created_before,
@@ -148,6 +152,9 @@ pub struct TaskCreateArgs {
     /// task IDs or slugs this task depends on; omit for none
     #[serde(default)]
     pub depends_on: Vec<String>,
+    /// canonical external blocker refs (`pr:owner/repo#N` or `url:https://...`)
+    #[serde(default)]
+    pub blocked_by: Vec<String>,
 }
 
 /// Arguments for `task.claim`. Same-actor re-claim on a non-terminal task is a no-op.
@@ -182,6 +189,9 @@ pub struct TaskUpdateArgs {
     /// replace dependency list; omit to leave unchanged; pass `[]` to clear
     #[serde(default)]
     pub depends_on: Option<Vec<String>>,
+    /// replace external blockers; omit to leave unchanged; pass `[]` to clear
+    #[serde(default)]
+    pub blocked_by: Option<Vec<String>>,
     /// who's making the update
     pub actor: String,
 }
@@ -213,6 +223,7 @@ fn task_logical_eq(a: &Task, b: &Task) -> bool {
         && a.completed_at == b.completed_at
         && a.notes == b.notes
         && a.depends_on == b.depends_on
+        && a.blocked_by == b.blocked_by
 }
 
 impl MeshService {
@@ -250,6 +261,7 @@ impl MeshService {
             )));
         }
         validate_task_body(&args.body).map_err(|e| domain_err(&e))?;
+        let blocked_by = normalize_blocked_by(&args.blocked_by).map_err(|e| domain_err(&e))?;
 
         for attempt in 0..CAS_MAX_ATTEMPTS {
             let Versioned {
@@ -358,6 +370,7 @@ impl MeshService {
                 updated_at: now,
                 notes: Vec::new(),
                 depends_on: args.depends_on.clone(),
+                blocked_by: blocked_by.clone(),
             };
             match self.store.put_task(&task, None).await {
                 Ok(_) => return Ok(task),
@@ -393,11 +406,16 @@ impl MeshService {
             note,
             actor,
             depends_on,
+            blocked_by,
         } = args;
         let body = body.clone();
         let note = note.clone();
         let depends_on = depends_on.clone();
         let actor = actor.clone();
+        let blocked_by = blocked_by
+            .map(|values| normalize_blocked_by(&values))
+            .transpose()
+            .map_err(|e| domain_err(&e))?;
         self.cas_mutate_task(&id, move |mut task| {
             let now = now_utc();
             if let Some(target) = status {
@@ -408,6 +426,9 @@ impl MeshService {
             }
             if let Some(depends_on) = depends_on.clone() {
                 task.depends_on = depends_on;
+            }
+            if let Some(blocked_by) = blocked_by.clone() {
+                task.blocked_by = blocked_by;
             }
             if let Some(note) = note.clone() {
                 append_task_note(&mut task, now, &actor, &note)?;
@@ -515,6 +536,7 @@ mod tests {
             note: None,
             actor: "human:test".to_owned(),
             depends_on: None,
+            blocked_by: None,
         }))) {
             Err(err) => {
                 assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
@@ -579,6 +601,7 @@ mod tests {
             body: String::new(),
             actor: "human:test".to_owned(),
             depends_on: Vec::new(),
+            blocked_by: Vec::new(),
         })))
         .expect("task.create");
         let Json(done) = block_on(svc.task_complete(Parameters(TaskCompleteArgs {
@@ -611,6 +634,7 @@ mod tests {
             body: String::new(),
             actor: "human:test".to_owned(),
             depends_on: Vec::new(),
+            blocked_by: Vec::new(),
         })))
         .expect("task.create");
         block_on(svc.claim_task(&ClaimTask {
@@ -653,6 +677,7 @@ mod tests {
             body: String::new(),
             actor: "human:test".to_owned(),
             depends_on: Vec::new(),
+            blocked_by: Vec::new(),
         })))
         .expect("task.create");
         match block_on(svc.task_update(Parameters(TaskUpdateArgs {
@@ -662,6 +687,7 @@ mod tests {
             note: None,
             actor: "human:test".to_owned(),
             depends_on: None,
+            blocked_by: None,
         }))) {
             Err(err) => assert_eq!(err.code, ErrorCode::INVALID_PARAMS),
             Ok(_) => panic!("done via update must be rejected"),
@@ -803,6 +829,7 @@ mod tests {
             body: "secret task body".to_owned(),
             actor: "human:test".to_owned(),
             depends_on: Vec::new(),
+            blocked_by: Vec::new(),
         })))
         .expect("task.create");
         block_on(svc.task_update(Parameters(TaskUpdateArgs {
@@ -811,6 +838,7 @@ mod tests {
             status: None,
             note: Some("a progress note".to_owned()),
             depends_on: None,
+            blocked_by: None,
             actor: "human:test".to_owned(),
         })))
         .expect("note");
@@ -869,6 +897,7 @@ mod tests {
             status: Some(vec![TaskStatus::Todo, TaskStatus::Blocked]),
             include_terminal: None,
             assignee: Some("ship".to_owned()),
+            blocked_by: Some("pr:owner/repo#7".to_owned()),
             body_contains: Some("fixture".to_owned()),
             created_after: Some(created_after),
             created_before: Some(created_before),
@@ -888,6 +917,7 @@ mod tests {
         assert_eq!(f.phase.as_deref(), Some("implement"));
         assert_eq!(f.status, Some(vec![TaskStatus::Todo, TaskStatus::Blocked]));
         assert_eq!(f.assignee.as_deref(), Some("ship"));
+        assert_eq!(f.blocked_by.as_deref(), Some("pr:owner/repo#7"));
         assert_eq!(f.body_contains.as_deref(), Some("fixture"));
         assert_eq!(f.created_after, Some(created_after));
         assert_eq!(f.created_before, Some(created_before));
@@ -917,6 +947,7 @@ mod tests {
             body: String::new(),
             actor: "human:test".to_owned(),
             depends_on: vec!["tsk_a".into(), "tsk_b".into()],
+            blocked_by: Vec::new(),
         }))
         .expect("create task with depends_on");
 
@@ -959,6 +990,7 @@ mod tests {
             body: String::new(),
             actor: "human:test".to_owned(),
             depends_on: vec!["tsk_a".into(), "tsk_b".into()],
+            blocked_by: Vec::new(),
         }))
         .expect("create task");
 
@@ -969,6 +1001,7 @@ mod tests {
             note: None,
             actor: "human:test".to_owned(),
             depends_on: Some(vec!["tsk_c".into()]),
+            blocked_by: None,
         }))
         .expect("update depends_on");
 
@@ -989,6 +1022,7 @@ mod tests {
             body: String::new(),
             actor: "human:test".to_owned(),
             depends_on: vec!["tsk_a".into()],
+            blocked_by: Vec::new(),
         }))
         .expect("create task");
 
@@ -999,6 +1033,7 @@ mod tests {
             note: None,
             actor: "human:test".to_owned(),
             depends_on: Some(vec![]),
+            blocked_by: None,
         }))
         .expect("clear depends_on");
 
@@ -1019,6 +1054,7 @@ mod tests {
             body: String::new(),
             actor: "human:test".to_owned(),
             depends_on: vec!["tsk_a".into(), "tsk_b".into()],
+            blocked_by: Vec::new(),
         }))
         .expect("create task");
 
@@ -1029,6 +1065,7 @@ mod tests {
             note: Some("progress note".to_owned()),
             actor: "human:test".to_owned(),
             depends_on: None,
+            blocked_by: None,
         }))
         .expect("update note only");
 
@@ -1087,6 +1124,7 @@ mod tests {
                 body: String::new(),
                 actor: "human:test".to_owned(),
                 depends_on: Vec::new(),
+                blocked_by: Vec::new(),
             };
             block_on(svc.create_task(args.clone())).expect("first create wins");
             let err =
@@ -1126,6 +1164,7 @@ mod tests {
             status: Some(TaskStatus::Cancelled),
             note: None,
             depends_on: None,
+            blocked_by: None,
             actor: "human:test".to_owned(),
         })))
         .expect("cancel task");

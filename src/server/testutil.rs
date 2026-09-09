@@ -44,6 +44,7 @@ pub fn seed_task(svc: &MeshService, project: &str, slug: &str) -> Task {
         body: String::new(),
         actor: "human:test".to_owned(),
         depends_on: Vec::new(),
+        blocked_by: Vec::new(),
     }))
     .expect("seed task")
 }

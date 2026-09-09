@@ -101,6 +101,7 @@ fn apply_service(svc: &MeshService, op: Op, task_id: &str) {
             note: None,
             actor,
             depends_on: None,
+            blocked_by: None,
         })),
         Op::Complete { actor } => block_on(svc.complete_task(CompleteTask {
             id: task_id.to_owned(),
@@ -114,6 +115,7 @@ fn apply_service(svc: &MeshService, op: Op, task_id: &str) {
             note: None,
             actor,
             depends_on: None,
+            blocked_by: None,
         })),
     };
 }
@@ -136,6 +138,7 @@ fn fresh_task() -> Task {
         updated_at: now,
         notes: Vec::new(),
         depends_on: Vec::new(),
+        blocked_by: Vec::new(),
     }
 }
 
@@ -304,6 +307,7 @@ proptest! {
             body: String::new(),
             actor: "human:michael".into(),
             depends_on: Vec::new(),
+            blocked_by: Vec::new(),
         })).expect("create_task");
         let task_id = task.id.clone();
 
@@ -325,6 +329,7 @@ proptest! {
                         note: None,
                         actor,
                         depends_on: None,
+                        blocked_by: None,
                     }));
                     prop_assert!(result.is_err(), "invariant 3 violated: update accepted {:?}", to);
                     let post = current_state(&store);
@@ -438,6 +443,7 @@ proptest! {
             body: String::new(),
             actor: "human:michael".into(),
             depends_on: Vec::new(),
+            blocked_by: Vec::new(),
         })).expect("create_task");
 
         let first = block_on(svc.claim_task(&ClaimTask {

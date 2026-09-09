@@ -143,6 +143,7 @@ async fn seed_task(store: &S3Store, project: &Project, slug: &str) -> Task {
         updated_at: now,
         notes: Vec::new(),
         depends_on: Vec::new(),
+        blocked_by: Vec::new(),
     };
     store.put_task(&task, None).await.expect("seed task");
     task

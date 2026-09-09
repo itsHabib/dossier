@@ -111,6 +111,7 @@ completed_at: 2026-05-10T15:05:00Z
 created_at: 2026-05-10T14:30:00Z
 updated_at: 2026-05-10T15:05:00Z
 depends_on: [tsk_01KSDVQST4YP73CYV9K7G7GZ8G]   # optional; empty / absent means no deps
+blocked_by: [pr:itshabib/ship#203, 'url:https://example.com/build/42'] # optional; empty / absent means no external blockers
 ---
 
 ## Spec
@@ -127,6 +128,19 @@ Strict-not-permissive on unknown fields.
 
 The mesh appends to `## Notes` with a single line per write. If `## Notes`
 is missing, it appends the heading then the line.
+
+`blocked_by` is omitted on write when empty and defaults to an empty list when
+missing, so legacy task files remain valid. Values are trimmed, unique, and
+order-preserving. PR owner and repository names are stored in lowercase; URL
+paths and queries retain their case. The accepted forms are `pr:<owner>/<repo>#<positive-number>`
+and `url:<absolute-https-url>`; GitHub pull-request URLs are rejected in favor
+of their canonical `pr:` form. This is syntax-only metadata: the storage layer
+does not dereference or poll the target.
+
+
+HTTPS blocker references containing a username or password are rejected before
+persistence with an error that does not echo the URL or credentials. URLs are
+otherwise opaque; this is not a general secret scanner for paths or queries.
 
 ## artifacts.jsonl
 

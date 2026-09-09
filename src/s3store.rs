@@ -15,8 +15,8 @@ use futures::stream::{self, StreamExt};
 use futures::TryStreamExt;
 
 use crate::domain::{
-    is_valid_slug, Artifact, Phase, PhaseListFilter, Project, ProjectListFilter, Task,
-    TaskListFilter,
+    is_valid_slug, normalize_blocked_by, Artifact, Phase, PhaseListFilter, Project,
+    ProjectListFilter, Task, TaskListFilter,
 };
 use crate::store::{
     notes_lines_for_task, parse_phase, parse_project, parse_task, phase_filename, phase_matches,
@@ -612,6 +612,8 @@ impl Store for S3Store {
         task: &Task,
         expected: Option<Version>,
     ) -> Result<Version, StoreError> {
+        let mut task = task.clone();
+        task.blocked_by = normalize_blocked_by(&task.blocked_by).map_err(invalid_err)?;
         Self::validate_slug(&task.project_slug)?;
         Self::validate_slug(&task.slug)?;
         let key = self.join_key(&[
@@ -620,8 +622,8 @@ impl Store for S3Store {
             "tasks",
             &task_filename(&task.id, &task.slug),
         ]);
-        let notes_lines = notes_lines_for_task(task);
-        let content = serialize_task_file(task, &notes_lines).map_err(invalid_err)?;
+        let notes_lines = notes_lines_for_task(&task);
+        let content = serialize_task_file(&task, &notes_lines).map_err(invalid_err)?;
         self.cas_put(&key, content.as_bytes(), expected.as_ref())
             .await
     }

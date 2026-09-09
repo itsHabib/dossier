@@ -216,6 +216,7 @@ mod tests {
             body: String::new(),
             actor: "human:test".to_owned(),
             depends_on: Vec::new(),
+            blocked_by: Vec::new(),
         })))
         .expect("t1");
 
@@ -227,6 +228,7 @@ mod tests {
             body: String::new(),
             actor: "human:test".to_owned(),
             depends_on: Vec::new(),
+            blocked_by: Vec::new(),
         })))
         .expect("t2");
 

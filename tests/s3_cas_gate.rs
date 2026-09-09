@@ -124,6 +124,7 @@ async fn seed_task(svc: &MeshService, project: &str, slug: &str) -> String {
         body: String::new(),
         actor: "stress".to_owned(),
         depends_on: Vec::new(),
+        blocked_by: Vec::new(),
     })
     .await
     .expect("seed task")
