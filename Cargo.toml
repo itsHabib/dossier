@@ -12,7 +12,9 @@ readme = "README.md"
 [dependencies]
 aws-config = "1"
 aws-credential-types = "1"
-aws-sdk-s3 = "1"
+# Use the default HTTPS client without also enabling the legacy Hyper 0.14
+# connector, whose h2 0.3 dependency has no RUSTSEC-2026-0258 patch.
+aws-sdk-s3 = { version = "1", default-features = false, features = ["default-https-client", "http-1x", "rt-tokio", "sigv4a"] }
 aws-smithy-runtime-api = "1"
 futures = "0.3"
 rmcp = { version = "1", features = ["server", "transport-io", "macros"] }

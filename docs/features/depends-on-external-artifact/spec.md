@@ -33,11 +33,14 @@ External blocker references use a small version-zero grammar:
 - `url:<absolute-https-url>`
 
 Values are trimmed, unique, order-preserving, and validated at every write
-boundary. Task IDs and arbitrary prose are rejected. Unknown reference schemes
-fail closed; adding one later is an explicit protocol change.
+boundary. PR owner and repository names are ASCII-lowercased before uniqueness
+checks, using the same normalization on write, read, and CLI/MCP filter input.
+URL paths and queries retain their case. Task IDs and arbitrary prose are
+rejected. Unknown reference schemes fail closed; adding one later is an explicit
+protocol change.
 
 **One referent, one spelling.** The two schemes must not overlap, because the
-`blocked_by` predicate is exact-match: if `pr:itsHabib/ship#203` and
+`blocked_by` predicate is exact-match: if `pr:itshabib/ship#203` and
 `url:https://github.com/itsHabib/ship/pull/203` were both legal, they would be
 distinct keys naming the same PR, and a task stored under one spelling would be
 invisible to a query using the other — losing exactly the "which tasks are
@@ -70,13 +73,15 @@ resolved, consistent with the non-goals.
 ## Acceptance
 
 - A task can be created with `blocked_by:
-  ["pr:itsHabib/ship#203"]`; get/list/project/CLI/MCP reads return it unchanged.
-- `task.list { blocked_by: "pr:itsHabib/ship#203" }` finds every live task carrying
+  ["pr:itshabib/ship#203"]`; get/list/project/CLI/MCP reads return it unchanged.
+- `task.list { blocked_by: "pr:itshabib/ship#203" }` finds every live task carrying
   that blocker and composes with project/status filters.
 - Update replaces or clears blockers without changing `depends_on`.
 - Missing/empty fields remain backward compatible and are omitted on write.
 - Duplicate, malformed, non-HTTPS, task-ID, and unknown-scheme references are
-  rejected with a stable validation error.
+  rejected with a stable validation error. PR references that differ only in
+  owner/repository case count as duplicates; mixed-case CLI/MCP queries find
+  the same lowercase stored reference.
 - A `url:` reference whose target is a GitHub pull request — in any equivalent
   spelling GitHub honors (`/pull/203`, a trailing slash, `#issuecomment-…`, a
   `?w=1` query) — is rejected with a stable error naming the `pr:` form, so one

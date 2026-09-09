@@ -359,7 +359,7 @@ fn cli_updates_lists_and_clears_external_blockers() {
     assert_eq!(
         updated.blocked_by,
         vec![
-            "pr:itsHabib/ship#203".to_owned(),
+            "pr:itshabib/ship#203".to_owned(),
             "url:https://example.com/build/42".to_owned(),
         ]
     );
@@ -371,7 +371,7 @@ fn cli_updates_lists_and_clears_external_blockers() {
             "--project",
             "alpha",
             "--blocked-by",
-            "pr:itsHabib/ship#203",
+            "pr:itshabib/ship#203",
         ],
     );
     assert_eq!(code, 0, "stderr: {stderr}");

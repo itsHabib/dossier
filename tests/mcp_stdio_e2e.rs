@@ -165,7 +165,7 @@ async fn mcp_stdio_external_blockers_round_trip_filter_replace_and_clear() {
         .await
         .expect("task.create");
     let created = tool_result_value(created);
-    assert_eq!(created["blocked_by"][0], "pr:itsHabib/ship#203");
+    assert_eq!(created["blocked_by"][0], "pr:itshabib/ship#203");
     let task_id = created["id"].as_str().expect("task id").to_owned();
 
     let get_args = json!({ "id": task_id.clone() })
@@ -179,7 +179,7 @@ async fn mcp_stdio_external_blockers_round_trip_filter_replace_and_clear() {
     let fetched = tool_result_value(fetched);
     assert_eq!(
         fetched["blocked_by"],
-        json!(["pr:itsHabib/ship#203", "url:https://example.com/build/42"])
+        json!(["pr:itshabib/ship#203", "url:https://example.com/build/42"])
     );
 
     let project_get_args = json!({ "slug": "external-blockers" })
@@ -195,7 +195,7 @@ async fn mcp_stdio_external_blockers_round_trip_filter_replace_and_clear() {
 
     let list_args = json!({
         "project": "external-blockers",
-        "blocked_by": "pr:itsHabib/ship#203"
+        "blocked_by": "pr:ITSHABIB/SHIP#203"
     })
     .as_object()
     .expect("task list args object")

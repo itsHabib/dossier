@@ -61,7 +61,7 @@ fn create_update_and_clear_round_trip_without_changing_depends_on() {
     assert_eq!(
         created.blocked_by,
         vec![
-            "pr:itsHabib/ship#203".to_owned(),
+            "pr:itshabib/ship#203".to_owned(),
             "url:https://example.com/build/42".to_owned(),
         ]
     );

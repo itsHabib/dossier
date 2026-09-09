@@ -702,18 +702,27 @@ pub fn validate_task_body(body: &str) -> Result<()> {
 /// The accepted v0 grammar is `pr:<owner>/<repo>#<positive-number>` or
 /// `url:<absolute-https-url>`. GitHub pull-request URLs are rejected in favor
 /// of the `pr:` spelling so exact-match queries cannot split one referent
-/// across two keys. Duplicates are rejected after trimming.
+/// across two keys. PR references are ASCII-lowercased before duplicate checks.
+/// URL references retain their case-sensitive paths and query strings.
 pub fn normalize_blocked_by(values: &[String]) -> Result<Vec<String>> {
     let mut normalized = Vec::with_capacity(values.len());
     for raw in values {
         let value = raw.trim();
         validate_blocker_ref(value)?;
-        if normalized.iter().any(|existing| existing == value) {
+        let value = canonical_blocker_ref(value);
+        if normalized.contains(&value) {
             bail!("duplicate blocked_by reference: {value}");
         }
-        normalized.push(value.to_owned());
+        normalized.push(value);
     }
     Ok(normalized)
+}
+
+fn canonical_blocker_ref(value: &str) -> String {
+    if value.starts_with("pr:") {
+        return value.to_ascii_lowercase();
+    }
+    value.to_owned()
 }
 
 fn validate_blocker_ref(value: &str) -> Result<()> {
@@ -802,7 +811,9 @@ fn github_pull_ref(url: &Url) -> Option<String> {
     {
         return None;
     }
-    Some(format!("pr:{owner}/{repo}#{number}"))
+    Some(canonical_blocker_ref(&format!(
+        "pr:{owner}/{repo}#{number}"
+    )))
 }
 
 fn invalid_blocker_ref<T>(value: &str) -> Result<T> {
@@ -1016,11 +1027,29 @@ mod tests {
             "url:https://github.com/itsHabib/ship/releases/tag/v1".to_owned(),
         ];
         let got = normalize_blocked_by(&refs).expect("valid blocker refs");
-        assert_eq!(got[0], "pr:itsHabib/ship#203");
+        assert_eq!(got[0], "pr:itshabib/ship#203");
         assert_eq!(got[1], refs[1]);
         assert_eq!(got[2], refs[2]);
         assert_eq!(got[3], refs[3]);
         assert_eq!(got[4], refs[4]);
+    }
+
+    #[test]
+    fn blocker_refs_reject_case_aliases_without_folding_url_paths() {
+        let err = normalize_blocked_by(&[
+            "pr:itsHabib/ship#203".to_owned(),
+            " pr:itshabib/SHIP#203 ".to_owned(),
+        ])
+        .expect_err("same GitHub PR");
+        assert_eq!(
+            err.to_string(),
+            "duplicate blocked_by reference: pr:itshabib/ship#203"
+        );
+        let refs = vec![
+            "url:https://example.com/Build?key=A".to_owned(),
+            "url:https://example.com/build?key=a".to_owned(),
+        ];
+        assert_eq!(normalize_blocked_by(&refs).expect("distinct URLs"), refs);
     }
 
     #[test]
@@ -1068,7 +1097,7 @@ mod tests {
             let err = normalize_blocked_by(&[value.to_owned()]).expect_err("GitHub PR URL");
             assert_eq!(
                 err.to_string(),
-                "github pull request URL is not allowed in blocked_by; use pr:itsHabib/ship#203"
+                "github pull request URL is not allowed in blocked_by; use pr:itshabib/ship#203"
             );
         }
     }

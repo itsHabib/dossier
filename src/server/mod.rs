@@ -77,7 +77,26 @@ impl MeshService {
     }
 }
 
-#[tool_router(server_handler)]
+// Keep synchronous tool enumeration as a ready future; the generated async
+// implementation triggers Clippy's unused_async_trait_impl on Rust 1.98.
+#[rmcp::tool_handler(router = Self::tool_router())]
+impl rmcp::ServerHandler for MeshService {
+    fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> impl std::future::Future<Output = Result<rmcp::model::ListToolsResult, ErrorData>>
+           + rmcp::service::MaybeSendFuture
+           + '_ {
+        std::future::ready(Ok(rmcp::model::ListToolsResult {
+            tools: Self::tool_router().list_all(),
+            meta: None,
+            next_cursor: None,
+        }))
+    }
+}
+
+#[tool_router]
 impl MeshService {
     #[tool(
         name = "project.list",

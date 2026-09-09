@@ -90,7 +90,8 @@ A discrete piece of work an implementer can claim and complete.
 - `pr:<owner>/<repo>#<positive-number>`
 - `url:<absolute-https-url>`
 
-Inputs are trimmed. Duplicate values, task ids, non-HTTPS URLs, malformed
+Inputs are trimmed; PR owner and repository names are ASCII-lowercased on writes
+and queries before duplicate checks. URL paths and queries retain their case. Duplicate values, task ids, non-HTTPS URLs, malformed
 values, and unknown schemes are rejected. A GitHub pull-request URL is also
 rejected, including trailing-slash, query, fragment, and PR-subpage variants;
 GitHub PRs have one canonical spelling, `pr:<owner>/<repo>#<number>`. Other
